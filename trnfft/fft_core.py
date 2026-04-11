@@ -15,6 +15,7 @@ from typing import Optional
 
 from .complex import ComplexTensor
 from .plan import FFTPlan, FFTAlgorithm, create_plan
+from .nki.dispatch import _use_nki, HAS_NKI
 
 
 def fft_core(x: ComplexTensor, inverse: bool = False, plan: Optional[FFTPlan] = None) -> ComplexTensor:
@@ -42,7 +43,12 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     1. Bit-reversal permutation
     2. log2(N) butterfly stages
     3. For inverse: divide by N at the end
+
+    Dispatches to NKI butterfly kernel when running on Trainium hardware.
     """
+    if _use_nki():
+        return _cooley_tukey_nki(x, inverse)
+
     n = x.shape[-1]
     log2n = int(math.log2(n))
     assert 1 << log2n == n, f"Not power of 2: {n}"
@@ -88,6 +94,43 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool) -> ComplexTensor:
             im[..., even_idx] = e_im + prod_im
             re[..., odd_idx] = e_re - prod_re
             im[..., odd_idx] = e_im - prod_im
+
+    result = ComplexTensor(re, im)
+    if inverse:
+        result = result * (1.0 / n)
+    return result
+
+
+def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """Cooley-Tukey FFT using NKI butterfly kernel on Trainium."""
+    from .nki.butterfly import butterfly_stage_kernel
+
+    n = x.shape[-1]
+    log2n = int(math.log2(n))
+    assert 1 << log2n == n, f"Not power of 2: {n}"
+
+    sign = 1.0 if inverse else -1.0
+
+    # Bit-reversal permutation
+    indices = _bit_reverse_indices(n, log2n)
+    re = x.real[..., indices].clone()
+    im = x.imag[..., indices].clone()
+
+    # Run butterfly stages via NKI kernel
+    for s in range(log2n):
+        m = 1 << (s + 1)
+        half = m >> 1
+
+        # Precompute twiddle factors for this stage
+        angles = sign * 2.0 * math.pi * torch.arange(half, dtype=re.dtype) / m
+        tw_re = torch.cos(angles)
+        tw_im = torch.sin(angles)
+
+        out_re = re.clone()
+        out_im = im.clone()
+        butterfly_stage_kernel(re, im, tw_re, tw_im, out_re, out_im, n, s)
+        re = out_re
+        im = out_im
 
     result = ComplexTensor(re, im)
     if inverse:

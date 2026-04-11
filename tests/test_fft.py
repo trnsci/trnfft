@@ -178,3 +178,25 @@ class TestFFTnD:
         expected = np.fft.fftn(x_np, axes=(0,))
         np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-3)
         np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3)
+
+
+@pytest.mark.neuron
+class TestNKIFFT:
+
+    def test_fft_nki_vs_numpy(self, nki_backend):
+        for n in [16, 64, 256, 1024]:
+            torch.manual_seed(42)
+            x = torch.randn(n)
+            result = trnfft.fft(x)
+            expected = np.fft.fft(x.numpy())
+            np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-4, rtol=1e-4)
+            np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-4, rtol=1e-4)
+
+    def test_fft_nki_roundtrip(self, nki_backend):
+        for n in [16, 64, 256]:
+            torch.manual_seed(42)
+            x = torch.randn(n)
+            X = trnfft.fft(x)
+            recovered = trnfft.ifft(X)
+            np.testing.assert_allclose(recovered.real.numpy(), x.numpy(), atol=1e-4)
+            np.testing.assert_allclose(recovered.imag.numpy(), np.zeros(n), atol=1e-4)
