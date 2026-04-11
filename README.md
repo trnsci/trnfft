@@ -1,5 +1,7 @@
 # trnfft
 
+[![CI](https://github.com/scttfrdmn/trnfft/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/trnfft/actions/workflows/ci.yml)
+
 FFT and complex-valued tensor operations for AWS Trainium via NKI.
 
 Trainium has no native complex number support and ships no FFT library. `trnfft` fills that gap with split real/imaginary representation, complex neural network layers, and NKI kernels optimized for the NeuronCore architecture.
