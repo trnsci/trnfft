@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- NKI complex GEMM kernel with stationary tile reuse (ported from neuron-complex-ops).
+- NKI fused element-wise complex multiply kernel.
+- NKI butterfly kernel wired into Cooley-Tukey FFT path.
+- `nki_backend` test fixture and 4 neuron-marked tests for on-hardware validation.
+
+### Changed
+
+- `_cooley_tukey()` now dispatches to NKI butterfly kernel when running on Trainium.
+- `_nki_complex_gemm()` and `_nki_complex_mask()` call real NKI kernels instead of PyTorch fallback.
+
 ## [0.2.0] - 2026-04-11
 
 ### Added
