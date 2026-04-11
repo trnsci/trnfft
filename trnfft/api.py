@@ -70,29 +70,65 @@ def irfft(input: ComplexTensor, n: Optional[int] = None) -> torch.Tensor:
 
 def fft2(input: torch.Tensor | ComplexTensor, s: Optional[tuple[int, int]] = None) -> ComplexTensor:
     """2-D FFT along last two dimensions."""
+    s_arg = None if s is None else tuple(s)
+    return fftn(input, s=s_arg, dim=(-2, -1))
+
+
+def fftn(
+    input: torch.Tensor | ComplexTensor,
+    s: Optional[tuple[int, ...]] = None,
+    dim: Optional[tuple[int, ...]] = None,
+) -> ComplexTensor:
+    """N-D FFT along specified dimensions (default: all)."""
     x = _to_complex(input)
+    ndim = len(x.shape)
+
+    if dim is None:
+        if s is not None:
+            dim = tuple(range(-len(s), 0))
+        else:
+            dim = tuple(range(-ndim, 0))
+
+    # Normalize negative dims
+    dim = tuple(d % ndim for d in dim)
+
+    # Resize if s is provided
+    if s is not None:
+        assert len(s) == len(dim), f"len(s)={len(s)} must match len(dim)={len(dim)}"
+        for size, d in zip(s, dim):
+            x = _resize_dim(x, d, size)
+
+    # Apply 1D FFT along each dimension
+    for d in dim:
+        x = _fft_along_dim(x, d, inverse=False)
+
+    return x
+
+
+def ifftn(
+    input: torch.Tensor | ComplexTensor,
+    s: Optional[tuple[int, ...]] = None,
+    dim: Optional[tuple[int, ...]] = None,
+) -> ComplexTensor:
+    """N-D inverse FFT along specified dimensions (default: all)."""
+    x = _to_complex(input)
+    ndim = len(x.shape)
+
+    if dim is None:
+        if s is not None:
+            dim = tuple(range(-len(s), 0))
+        else:
+            dim = tuple(range(-ndim, 0))
+
+    dim = tuple(d % ndim for d in dim)
 
     if s is not None:
-        x = _resize_last(x, s[1])
-        x = x.transpose(-2, -1)
-        x = _resize_last(x, s[0])
-        x = x.transpose(-2, -1)
+        assert len(s) == len(dim), f"len(s)={len(s)} must match len(dim)={len(dim)}"
+        for size, d in zip(s, dim):
+            x = _resize_dim(x, d, size)
 
-    # FFT along last dim (columns)
-    shape = x.shape
-    n_cols = shape[-1]
-    flat = ComplexTensor(x.real.reshape(-1, n_cols), x.imag.reshape(-1, n_cols))
-    result = fft_core(flat, inverse=False)
-    x = ComplexTensor(result.real.reshape(shape), result.imag.reshape(shape))
-
-    # FFT along second-to-last dim (rows) — transpose, FFT, transpose back
-    x = x.transpose(-2, -1)
-    shape = x.shape
-    n_rows = shape[-1]
-    flat = ComplexTensor(x.real.reshape(-1, n_rows), x.imag.reshape(-1, n_rows))
-    result = fft_core(flat, inverse=False)
-    x = ComplexTensor(result.real.reshape(shape), result.imag.reshape(shape))
-    x = x.transpose(-2, -1)
+    for d in dim:
+        x = _fft_along_dim(x, d, inverse=True)
 
     return x
 
@@ -287,6 +323,41 @@ def _resize_last(x: ComplexTensor, n: int) -> ComplexTensor:
             torch.cat([x.imag, pad_im], dim=-1),
         )
     return ComplexTensor(x.real[..., :n], x.imag[..., :n])
+
+
+def _fft_along_dim(x: ComplexTensor, dim: int, inverse: bool) -> ComplexTensor:
+    """Apply 1D FFT along a specific dimension by moving it to the last position."""
+    ndim = len(x.shape)
+    dim = dim % ndim
+
+    # Move target dim to last position
+    if dim != ndim - 1:
+        x = x.transpose(dim, -1)
+
+    # Flatten to 2D, FFT, reshape back
+    shape = x.shape
+    n = shape[-1]
+    flat = ComplexTensor(x.real.reshape(-1, n), x.imag.reshape(-1, n))
+    result = fft_core(flat, inverse=inverse)
+    x = ComplexTensor(result.real.reshape(shape), result.imag.reshape(shape))
+
+    # Move back
+    if dim != ndim - 1:
+        x = x.transpose(dim, -1)
+
+    return x
+
+
+def _resize_dim(x: ComplexTensor, dim: int, n: int) -> ComplexTensor:
+    """Resize ComplexTensor along a specific dimension."""
+    ndim = len(x.shape)
+    dim = dim % ndim
+    if dim != ndim - 1:
+        x = x.transpose(dim, -1)
+    x = _resize_last(x, n)
+    if dim != ndim - 1:
+        x = x.transpose(dim, -1)
+    return x
 
 
 def _resize_real(x: torch.Tensor, n: int) -> torch.Tensor:

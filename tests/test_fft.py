@@ -137,3 +137,44 @@ class TestFFT2D:
         expected = np.fft.fft2(x_np)
         np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-3)
         np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3)
+
+
+class TestFFTnD:
+
+    def test_fftn_3d(self):
+        rng = np.random.default_rng(42)
+        x_np = rng.standard_normal((4, 8, 8)).astype(np.float32)
+        x = torch.tensor(x_np)
+        result = trnfft.fftn(x)
+        expected = np.fft.fftn(x_np)
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-3)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3)
+
+    def test_fftn_subset_dims(self):
+        rng = np.random.default_rng(42)
+        x_np = rng.standard_normal((4, 8, 16)).astype(np.float32)
+        x = torch.tensor(x_np)
+        # FFT along last two dims only (equivalent to fft2)
+        result = trnfft.fftn(x, dim=(-2, -1))
+        expected = np.fft.fftn(x_np, axes=(-2, -1))
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-3)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3)
+
+    def test_ifftn_roundtrip(self):
+        rng = np.random.default_rng(42)
+        x_np = rng.standard_normal((4, 8, 8)).astype(np.float32)
+        x = torch.tensor(x_np)
+        X = trnfft.fftn(x)
+        recovered = trnfft.ifftn(X)
+        np.testing.assert_allclose(recovered.real.numpy(), x_np, atol=1e-3)
+        np.testing.assert_allclose(recovered.imag.numpy(), np.zeros_like(x_np), atol=1e-3)
+
+    def test_fftn_single_dim(self):
+        rng = np.random.default_rng(42)
+        x_np = rng.standard_normal((4, 8)).astype(np.float32)
+        x = torch.tensor(x_np)
+        # FFT along dim 0 only
+        result = trnfft.fftn(x, dim=(0,))
+        expected = np.fft.fftn(x_np, axes=(0,))
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-3)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3)
