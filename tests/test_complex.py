@@ -106,3 +106,49 @@ class TestComplexMatmul:
         b = ComplexTensor(torch.ones(3, 3), torch.ones(3, 3))
         c = a @ b
         np.testing.assert_allclose(c.real.numpy(), b.real.numpy(), atol=1e-5)
+
+
+@pytest.mark.neuron
+class TestNKIKernels:
+
+    def test_gemm_nki_vs_pytorch(self, nki_backend):
+        from trnfft.nki import complex_gemm
+        rng = np.random.default_rng(42)
+        for shape in [(128, 128), (256, 512)]:
+            m, n = shape
+            a = ComplexTensor(
+                torch.tensor(rng.standard_normal((m, n)), dtype=torch.float32),
+                torch.tensor(rng.standard_normal((m, n)), dtype=torch.float32),
+            )
+            b = ComplexTensor(
+                torch.tensor(rng.standard_normal((n, m)), dtype=torch.float32),
+                torch.tensor(rng.standard_normal((n, m)), dtype=torch.float32),
+            )
+            nki_result = complex_gemm(a, b)
+            pytorch_result = complex_matmul(a, b)
+            np.testing.assert_allclose(
+                nki_result.real.numpy(), pytorch_result.real.numpy(), atol=1e-3
+            )
+            np.testing.assert_allclose(
+                nki_result.imag.numpy(), pytorch_result.imag.numpy(), atol=1e-3
+            )
+
+    def test_mask_apply_nki_vs_pytorch(self, nki_backend):
+        from trnfft.nki import complex_mask_apply
+        rng = np.random.default_rng(42)
+        mask = ComplexTensor(
+            torch.tensor(rng.standard_normal((64, 32)), dtype=torch.float32),
+            torch.tensor(rng.standard_normal((64, 32)), dtype=torch.float32),
+        )
+        spec = ComplexTensor(
+            torch.tensor(rng.standard_normal((64, 32)), dtype=torch.float32),
+            torch.tensor(rng.standard_normal((64, 32)), dtype=torch.float32),
+        )
+        nki_result = complex_mask_apply(mask, spec)
+        pytorch_result = mask * spec
+        np.testing.assert_allclose(
+            nki_result.real.numpy(), pytorch_result.real.numpy(), atol=1e-5
+        )
+        np.testing.assert_allclose(
+            nki_result.imag.numpy(), pytorch_result.imag.numpy(), atol=1e-5
+        )

@@ -32,6 +32,16 @@ def random_real_signal(rng):
 
 
 @pytest.fixture
+def nki_backend():
+    """Temporarily set backend to NKI for a test."""
+    from trnfft import set_backend, get_backend
+    old = get_backend()
+    set_backend("nki")
+    yield
+    set_backend(old)
+
+
+@pytest.fixture
 def random_complex_signal(rng):
     def _make(n, batch=None):
         from trnfft import ComplexTensor
