@@ -33,10 +33,13 @@ dev = [
     "pytest>=7.0",
     "pytest-benchmark>=4.0",
     "scipy>=1.11",
+    "mkdocs>=1.5",
+    "mkdocs-material>=9.0",
 ]
 
 [project.urls]
 Homepage = "https://github.com/scttfrdmn/trnfft"
+Documentation = "https://scttfrdmn.github.io/trnfft/"
 Repository = "https://github.com/scttfrdmn/trnfft"
 Issues = "https://github.com/scttfrdmn/trnfft/issues"
 

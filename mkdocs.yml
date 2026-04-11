@@ -1,0 +1,32 @@
+site_name: trnfft
+site_description: FFT and complex-valued tensor operations for AWS Trainium via NKI
+site_url: https://scttfrdmn.github.io/trnfft/
+repo_url: https://github.com/scttfrdmn/trnfft
+repo_name: scttfrdmn/trnfft
+
+theme:
+  name: material
+  palette:
+    scheme: default
+    primary: indigo
+  features:
+    - content.code.copy
+    - navigation.sections
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Quickstart: quickstart.md
+  - API Reference:
+      - FFT Operations: api/fft.md
+      - ComplexTensor: api/complex.md
+      - Neural Network Layers: api/nn.md
+      - NKI Backend: api/nki.md
+  - Architecture: architecture.md
+
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - admonition
+  - toc:
+      permalink: true
