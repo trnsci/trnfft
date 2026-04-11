@@ -164,6 +164,109 @@ def stft(
     return ComplexTensor(result_re, result_im)
 
 
+def istft(
+    input: ComplexTensor,
+    n_fft: int,
+    hop_length: Optional[int] = None,
+    win_length: Optional[int] = None,
+    window: Optional[torch.Tensor] = None,
+    center: bool = True,
+    normalized: bool = False,
+    onesided: bool = True,
+    length: Optional[int] = None,
+) -> torch.Tensor:
+    """Inverse Short-time Fourier Transform. Reconstructs signal via overlap-add."""
+    if hop_length is None:
+        hop_length = n_fft // 4
+    if win_length is None:
+        win_length = n_fft
+    if window is None:
+        window = torch.hann_window(win_length, dtype=input.dtype)
+
+    # Undo normalization
+    if normalized:
+        scale = math.sqrt(n_fft)
+        input = ComplexTensor(input.real * scale, input.imag * scale)
+
+    # Input is (..., freq, time) — transpose to (..., time, freq)
+    spec_re = input.real.transpose(-2, -1)
+    spec_im = input.imag.transpose(-2, -1)
+
+    # Reconstruct full spectrum if onesided
+    if onesided:
+        freq_bins = spec_re.shape[-1]
+        full_n = n_fft
+        full_re = torch.zeros(*spec_re.shape[:-1], full_n, dtype=spec_re.dtype)
+        full_im = torch.zeros(*spec_im.shape[:-1], full_n, dtype=spec_im.dtype)
+        full_re[..., :freq_bins] = spec_re
+        full_im[..., :freq_bins] = spec_im
+        if full_n > 1:
+            num_neg = full_n - freq_bins
+            full_re[..., freq_bins:] = torch.flip(spec_re[..., 1:1 + num_neg], dims=[-1])
+            full_im[..., freq_bins:] = -torch.flip(spec_im[..., 1:1 + num_neg], dims=[-1])
+        spec_re = full_re
+        spec_im = full_im
+
+    # IFFT each frame
+    num_frames = spec_re.shape[-2]
+    flat_re = spec_re.reshape(-1, n_fft)
+    flat_im = spec_im.reshape(-1, n_fft)
+    flat = ComplexTensor(flat_re, flat_im)
+    ifft_result = fft_core(flat, inverse=True)
+    frames = ifft_result.real.reshape(*spec_re.shape[:-1], n_fft)
+
+    # Build the window for overlap-add
+    if win_length < n_fft:
+        padded_window = torch.zeros(n_fft, dtype=window.dtype)
+        offset = (n_fft - win_length) // 2
+        padded_window[offset:offset + win_length] = window
+        window = padded_window
+
+    # Overlap-add with window normalization
+    # The analysis window was applied in stft(). For perfect reconstruction,
+    # we apply the synthesis window and divide by the sum of squared windows.
+    # At boundaries where window_sum is near zero, we use the unnormalized
+    # IFFT output directly (no window weighting can recover those samples).
+    expected_len = n_fft + (num_frames - 1) * hop_length
+    batch_shape = frames.shape[:-2]
+    output = torch.zeros(*batch_shape, expected_len, dtype=frames.dtype)
+    window_sum = torch.zeros(expected_len, dtype=frames.dtype)
+
+    for t in range(num_frames):
+        start = t * hop_length
+        output[..., start:start + n_fft] += frames[..., t, :] * window
+        window_sum[start:start + n_fft] += window ** 2
+
+    # Where the window sum is large enough, normalize. Where it's near zero
+    # (boundary samples), fall back to the raw overlap-add of IFFT frames.
+    raw_output = torch.zeros(*batch_shape, expected_len, dtype=frames.dtype)
+    for t in range(num_frames):
+        start = t * hop_length
+        raw_output[..., start:start + n_fft] += frames[..., t, :]
+
+    mask = window_sum > 1e-8
+    output[..., mask] = output[..., mask] / window_sum[mask]
+    output[..., ~mask] = raw_output[..., ~mask]
+
+    # Remove center padding
+    if center:
+        pad_amount = n_fft // 2
+        output = output[..., pad_amount:]
+        if output.shape[-1] > pad_amount:
+            output = output[..., :-pad_amount] if length is None else output
+
+    # Trim or pad to requested length
+    if length is not None:
+        current = output.shape[-1]
+        if current > length:
+            output = output[..., :length]
+        elif current < length:
+            pad = torch.zeros(*batch_shape, length - current, dtype=output.dtype)
+            output = torch.cat([output, pad], dim=-1)
+
+    return output
+
+
 # --- Helpers ---
 
 def _to_complex(x) -> ComplexTensor:
