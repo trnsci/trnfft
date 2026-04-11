@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trnfft"
+version = "0.1.0"
+description = "FFT and complex-valued tensor operations for AWS Trainium via NKI"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Scott Friedman", email = "scott@playgroundlogic.co" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+neuron = [
+    "neuronxcc>=2.15",
+    "torch-neuronx>=2.1",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-benchmark>=4.0",
+    "scipy>=1.11",
+]
+
+[project.urls]
+Homepage = "https://github.com/scttfrdmn/trnfft"
+Repository = "https://github.com/scttfrdmn/trnfft"
+Issues = "https://github.com/scttfrdmn/trnfft/issues"
+
+[tool.setuptools.packages.find]
+include = ["trnfft*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "neuron: requires Neuron hardware (trn1/trn2 instance)",
+]
+testpaths = ["tests"]
