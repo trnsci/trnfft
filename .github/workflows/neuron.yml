@@ -1,0 +1,50 @@
+name: Neuron Hardware Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_type:
+        description: "Instance type"
+        required: true
+        default: "trn1"
+        type: choice
+        options:
+          - trn1
+          - trn2
+          - inf2
+
+env:
+  AWS_PROFILE: aws
+
+jobs:
+  neuron-test:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      # TODO: Wire to actual Trainium instance via SSM or SSH.
+      # The steps below are a scaffold — replace with your instance access method.
+      #
+      # Example with SSM:
+      #   - name: Run tests on ${{ inputs.instance_type }}
+      #     run: |
+      #       INSTANCE_ID=$(aws ec2 describe-instances \
+      #         --filters "Name=tag:Name,Values=trnfft-ci-${{ inputs.instance_type }}" \
+      #         --query 'Reservations[0].Instances[0].InstanceId' --output text)
+      #       aws ssm send-command --instance-ids $INSTANCE_ID \
+      #         --document-name "AWS-RunShellScript" \
+      #         --parameters 'commands=["cd /home/ubuntu/trnfft && git pull && pip install -e \".[neuron,dev]\" && pytest tests/ -v -m neuron --tb=short"]'
+      - name: Run neuron tests on ${{ inputs.instance_type }}
+        run: |
+          echo "Neuron hardware CI scaffold"
+          echo "Instance type: ${{ inputs.instance_type }}"
+          echo "TODO: Wire to actual ${{ inputs.instance_type }} instance"
+          echo "Expected command: pytest tests/ -v -m neuron --tb=short"
