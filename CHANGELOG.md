@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `istft()` — inverse STFT with overlap-add reconstruction, matching `torch.istft` signature.
+- `fftn()` and `ifftn()` — N-dimensional FFT along arbitrary dimensions.
+- GitHub Actions CI (Python 3.10, 3.11, 3.12).
+- Neuron hardware CI workflow (manual `workflow_dispatch` scaffold).
+- Issue and PR templates.
+
+### Changed
+
+- `fft2()` now delegates to `fftn()` internally.
+- `neuron-complex-ops` repo archived with pointer to trnfft.
+
 ## [0.1.0] - 2026-04-11
 
 ### Added
