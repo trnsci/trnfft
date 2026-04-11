@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-11
+
 ### Added
 
 - `istft()` — inverse STFT with overlap-add reconstruction, matching `torch.istft` signature.
@@ -38,5 +40,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Speech enhancement example using complex ideal ratio mask (cIRM).
 - 83 tests covering arithmetic, FFT correctness, STFT, NN layers, and gradients.
 
-[Unreleased]: https://github.com/scttfrdmn/trnfft/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/trnfft/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/scttfrdmn/trnfft/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/scttfrdmn/trnfft/releases/tag/v0.1.0
