@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- MkDocs documentation site with pages for installation, quickstart, API reference, and architecture.
+- GitHub Pages deployment workflow.
+- PyPI publishing workflow (OIDC trusted publishers, sdist + wheel on release).
+- Benchmark suite (`benchmarks/bench_fft.py`) for 1D/2D FFT, STFT, and complex GEMM.
+- Multi-NeuronCore parallelism scaffold (`trnfft.nki.multicore`) with data-parallel batch split.
+- PyPI, Python version, license, and docs badges in README.
+
+### Changed
+
+- LICENSE replaced with full Apache 2.0 text (Copyright 2026 Scott Friedman).
+- `pyproject.toml` dev deps now include mkdocs and mkdocs-material.
+
 ## [0.3.0] - 2026-04-11
 
 ### Added
