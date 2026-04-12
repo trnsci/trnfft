@@ -45,6 +45,9 @@ provider "aws" {
 # Deep Learning AMI with Neuron SDK pre-installed
 # ---------------------------------------------------------------------------
 
+# NKI kernels are validated against neuronxcc 2.24.x shipped on
+# Deep Learning AMI Neuron PyTorch 2.9 (Ubuntu 24.04) — version 20260410
+# or later. See docs/installation.md for the compatibility matrix.
 data "aws_ami" "neuron" {
   most_recent = true
   owners      = ["amazon"]

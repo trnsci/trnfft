@@ -26,8 +26,12 @@ dependencies = [
 
 [project.optional-dependencies]
 neuron = [
-    "neuronxcc>=2.15",
-    "torch-neuronx>=2.1",
+    # neuronxcc is not on public PyPI; it ships with the Deep Learning AMI Neuron.
+    # We pin >=2.24 because the NKI kernels use the 2.24+ nc_matmul calling
+    # convention and partition-dim tile layout. See docs/installation.md for the
+    # validated AMI/SDK versions.
+    "neuronxcc>=2.24",
+    "torch-neuronx>=2.9",
 ]
 dev = [
     "pytest>=7.0",

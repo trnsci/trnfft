@@ -9,13 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Terraform module (`infra/terraform/`) for provisioning a Trainium CI instance with SSM access and GitHub Actions OIDC role.
-- `docs/aws_setup.md` covering AWS deployment, GitHub secrets/variables, and cost estimates.
+- Terraform module (`infra/terraform/`) for provisioning a Trainium CI instance with SSM access.
+- `docs/aws_setup.md` and `scripts/run_neuron_tests.sh` for running neuron-marked tests locally via `AWS_PROFILE=aws`.
+- Hardware compatibility matrix in `docs/installation.md` documenting validated Neuron SDK and AMI versions.
 
 ### Changed
 
-- NKI butterfly kernel rewritten to use Vector Engine batched ops across all groups instead of scalar per-butterfly loop.
-- `neuron.yml` workflow now starts/stops the CI instance via `aws ec2 start-instances` + `ssm send-command` + `aws ec2 stop-instances` in an `always()` block. Replaces the scaffold.
+- NKI butterfly kernel rewritten with 2D `(num_groups, m)` partition-dim tile layout, satisfying NKI 2.24+ constraints.
+- `_complex_gemm_kernel` updated to use the NKI 2.24 calling convention (`psum[...] += nisa.nc_matmul(stationary, moving)` returning a PSUM tile) and `nl.load_transpose2d` for the stationary A tile.
+- `_complex_mul_kernel` reshapes inputs to `(128, free)` to satisfy the partition-dim ≤ 128 constraint; falls back to PyTorch for inputs whose total size isn't divisible by 128.
+- Pinned `neuronxcc>=2.24` and `torch-neuronx>=2.9` in the `neuron` extra. Kernels do not compile against older Neuron SDKs.
+- `neuron.yml` GitHub Actions workflow removed; AWS access is now local-only via `scripts/run_neuron_tests.sh` with `AWS_PROFILE=aws`.
 
 ## [0.4.0] - 2026-04-11
 

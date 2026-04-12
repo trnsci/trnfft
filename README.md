@@ -98,6 +98,10 @@ y = layer(x)
 
 **NKI complex GEMM** uses stationary tile reuse (2 SBUF loads instead of 8) and PSUM accumulation, overlapping Vector Engine negation with Tensor Engine matmul.
 
+## Hardware compatibility
+
+NKI kernels are validated against **Neuron SDK 2.24+** on the **Deep Learning AMI Neuron PyTorch 2.9 (Ubuntu 24.04)** AMI (20260410 or later). See [docs/installation.md](https://scttfrdmn.github.io/trnfft/installation/#hardware-compatibility) for the full compatibility matrix.
+
 ## Status
 
 **v0.1.0** — CPU fallback works, NKI kernels scaffolded for on-hardware validation.
