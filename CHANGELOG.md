@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Terraform module (`infra/terraform/`) for provisioning a Trainium CI instance with SSM access and GitHub Actions OIDC role.
+- `docs/aws_setup.md` covering AWS deployment, GitHub secrets/variables, and cost estimates.
+
+### Changed
+
+- NKI butterfly kernel rewritten to use Vector Engine batched ops across all groups instead of scalar per-butterfly loop.
+- `neuron.yml` workflow now starts/stops the CI instance via `aws ec2 start-instances` + `ssm send-command` + `aws ec2 stop-instances` in an `always()` block. Replaces the scaffold.
+
 ## [0.4.0] - 2026-04-11
 
 ### Added
