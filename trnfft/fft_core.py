@@ -108,7 +108,7 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     are moved back to the original device.
     """
     from .nki.butterfly import butterfly_stage_kernel
-    import torch_xla.core.xla_model as xm
+    import torch_xla
 
     n = x.shape[-1]
     log2n = int(math.log2(n))
@@ -116,7 +116,7 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
     sign = 1.0 if inverse else -1.0
 
-    device = xm.xla_device()
+    device = torch_xla.device()
     orig_device = x.real.device
 
     # Bit-reversal permutation

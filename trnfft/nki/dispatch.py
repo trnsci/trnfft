@@ -207,8 +207,8 @@ if HAS_NKI:
 
 def _to_xla(*tensors):
     """Move a list of tensors to the XLA device."""
-    import torch_xla.core.xla_model as xm
-    device = xm.xla_device()
+    import torch_xla
+    device = torch_xla.device()
     return [t.to(device) for t in tensors], tensors[0].device
 
 
