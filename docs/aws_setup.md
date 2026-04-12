@@ -1,83 +1,58 @@
-# AWS Setup for Neuron CI
+# AWS Setup for Neuron Tests
 
-To run the neuron-marked tests (`pytest -m neuron`) on real Trainium hardware via GitHub Actions, you need:
+To run `pytest -m neuron` against real Trainium hardware, we use a local workflow:
 
-1. An AWS account with access to trn1/trn2/inf2 instances
-2. A Terraform-provisioned CI instance (see `infra/terraform/`)
-3. GitHub repo secrets + variables configured
+- Provision a Trainium EC2 instance with Terraform (stays stopped when not testing)
+- Run the test script locally from your machine, using `AWS_PROFILE=aws`
+- The script starts the instance, runs pytest via SSM, prints output, stops the instance
+
+GitHub Actions does **not** touch AWS. All AWS interaction is human-initiated.
 
 ## One-time setup
 
-### 1. Deploy the Terraform module
+### 1. Provision the CI instance
 
-Pick a VPC and subnet. A private subnet with NAT egress is fine (SSM works without public IP). A public subnet also works.
+Pick a VPC + subnet in a region with trn1/trn2/inf2 capacity. `trn1.2xlarge` is cheapest for basic validation.
 
 ```bash
 cd infra/terraform
 
-terraform init
-
-terraform apply \
+AWS_PROFILE=aws terraform init
+AWS_PROFILE=aws terraform apply \
   -var="vpc_id=vpc-xxxxxx" \
   -var="subnet_id=subnet-xxxxxx" \
-  -var="instance_type=trn1.2xlarge" \
-  -var="instance_tag=trnfft-ci-trn1"
+  -var="instance_type=trn1.2xlarge"
 ```
 
-Capture the outputs:
+Capture `instance_id` from the outputs. User-data takes ~5 minutes to install the Neuron SDK and clone trnfft.
 
-```
-instance_id   = "i-0abc..."
-instance_tag  = "trnfft-ci-trn1"
-aws_role_arn  = "arn:aws:iam::123456789012:role/trnfft-ci-trn1-gh-actions"
-aws_region    = "us-east-1"
-```
-
-### 2. Configure GitHub Actions
-
-In the repo settings (`Settings → Secrets and variables → Actions`):
-
-- **Secret** `AWS_ROLE_ARN` — value from Terraform output
-- **Variable** `AWS_REGION` — value from Terraform output
-
-### 3. Verify the instance is ready
-
-Wait ~5 minutes after `terraform apply` for user-data to finish (clones trnfft, installs deps). Check SSM connectivity:
+Stop the instance once ready:
 
 ```bash
-aws ssm describe-instance-information \
-  --filters "Key=tag:Name,Values=trnfft-ci-trn1"
+AWS_PROFILE=aws aws ec2 stop-instances --instance-ids $(terraform output -raw instance_id)
 ```
 
-The instance should appear with `PingStatus: Online`. Then stop it — the workflow will start it on demand:
+## Running neuron tests
 
 ```bash
-aws ec2 stop-instances --instance-ids $(terraform output -raw instance_id)
+AWS_PROFILE=aws ./scripts/run_neuron_tests.sh
+# or for trn2 / inf2:
+AWS_PROFILE=aws ./scripts/run_neuron_tests.sh trn2
 ```
 
-## Running the workflow
+The script will:
 
-Via GitHub CLI:
+1. Look up the tagged instance (`Name=trnfft-ci-trn1` by default)
+2. Start it if stopped; wait for SSM agent
+3. Send the pytest command over SSM
+4. Print stdout/stderr
+5. **Stop the instance in a trap** (even if pytest fails or you Ctrl-C)
 
-```bash
-gh workflow run neuron.yml -R scttfrdmn/trnfft -f instance_type=trn1
-```
-
-Or the Actions tab → "Neuron Hardware Tests" → "Run workflow".
-
-The workflow will:
-
-1. Start the tagged instance
-2. Wait for it to be running and SSM-addressable
-3. Run `pytest tests/ -v -m neuron` via `aws ssm send-command`
-4. Collect stdout/stderr into the job log
-5. Stop the instance (even on failure)
+It exits non-zero if any test fails.
 
 ## Cost
 
-Stopped instances only cost EBS storage (~$10/mo for 100 GB gp3).
-
-When running, on-demand pricing (us-east-1 as of 2026):
+Stopped = EBS only (~$10/mo for 100 GB gp3). Running:
 
 | Type | Hourly | Typical run (10 min) |
 |------|-------:|---------------------:|
@@ -87,14 +62,18 @@ When running, on-demand pricing (us-east-1 as of 2026):
 
 ## Troubleshooting
 
-**Workflow fails at "Start instance" with "No instance found"**
-— The tag doesn't match. Check `aws ec2 describe-instances --filters "Name=tag:Name,Values=trnfft-ci-trn1"`.
+**"No instance found with Name=trnfft-ci-trn1"**
+— Run `terraform apply` first, or check that the tag matches.
 
-**Workflow fails at "Run neuron tests" with SSM error**
-— Instance may not have SSM agent running. Check `aws ssm describe-instance-information`. User-data may still be running if you triggered the workflow too soon after `terraform apply`.
+**SSM `InvalidInstanceId` error**
+— Instance hasn't finished booting/registering. Wait 1-2 minutes and retry.
 
-**Tests fail with "neuronxcc not found"**
-— The user-data script didn't complete. SSH in (via SSM session) and re-run `pip install -e '.[neuron,dev]'` in `/home/ubuntu/trnfft`.
+**User-data didn't finish (`neuronxcc not found`)**
+— SSH in via SSM session and re-run manually:
+```bash
+aws ssm start-session --target $INSTANCE_ID
+cd /home/ubuntu/trnfft && pip install -e '.[neuron,dev]'
+```
 
-**Tests compile but numerical output is off**
-— Expected for FP32 on first validation. Check tolerances in test assertions; tighten after baseline is established.
+**`InsufficientInstanceCapacity` when starting the instance**
+— AWS may temporarily be out of Trainium in that AZ. Wait and retry, or re-provision in a different AZ.

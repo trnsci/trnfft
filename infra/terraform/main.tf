@@ -27,12 +27,6 @@ variable "instance_tag" {
   default     = "trnfft-ci-trn1"
 }
 
-variable "github_repo" {
-  description = "GitHub repo in owner/name format, for OIDC trust"
-  type        = string
-  default     = "scttfrdmn/trnfft"
-}
-
 variable "vpc_id" {
   description = "VPC to place the instance in"
   type        = string
@@ -114,7 +108,7 @@ resource "aws_instance" "ci" {
   subnet_id                   = var.subnet_id
   iam_instance_profile        = aws_iam_instance_profile.instance.name
   vpc_security_group_ids      = [aws_security_group.instance.id]
-  associate_public_ip_address = false
+  associate_public_ip_address = true  # Needed for SSM agent to reach regional endpoint without VPC endpoints
 
   root_block_device {
     volume_size = 100
@@ -125,7 +119,7 @@ resource "aws_instance" "ci" {
     #!/bin/bash
     set -euxo pipefail
     cd /home/ubuntu
-    sudo -u ubuntu git clone https://github.com/${var.github_repo}.git trnfft
+    sudo -u ubuntu git clone https://github.com/scttfrdmn/trnfft.git trnfft
     cd trnfft
     sudo -u ubuntu python3 -m venv .venv
     sudo -u ubuntu .venv/bin/pip install -e '.[neuron,dev]'
@@ -134,76 +128,6 @@ resource "aws_instance" "ci" {
   tags = {
     Name = var.instance_tag
   }
-}
-
-# ---------------------------------------------------------------------------
-# GitHub Actions OIDC role
-# ---------------------------------------------------------------------------
-
-data "aws_caller_identity" "current" {}
-
-resource "aws_iam_openid_connect_provider" "github" {
-  url             = "https://token.actions.githubusercontent.com"
-  client_id_list  = ["sts.amazonaws.com"]
-  thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1"]
-}
-
-resource "aws_iam_role" "github_actions" {
-  name = "${var.instance_tag}-gh-actions"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Federated = aws_iam_openid_connect_provider.github.arn }
-      Action    = "sts:AssumeRoleWithWebIdentity"
-      Condition = {
-        StringEquals = {
-          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-        }
-        StringLike = {
-          "token.actions.githubusercontent.com:sub" = "repo:${var.github_repo}:*"
-        }
-      }
-    }]
-  })
-}
-
-resource "aws_iam_role_policy" "github_actions" {
-  name = "ci-runner"
-  role = aws_iam_role.github_actions.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "ec2:DescribeInstances",
-          "ec2:StartInstances",
-          "ec2:StopInstances",
-        ]
-        Resource = "*"
-        Condition = {
-          StringEquals = {
-            "ec2:ResourceTag/Name" = var.instance_tag
-          }
-        }
-      },
-      {
-        Effect   = "Allow"
-        Action   = "ec2:DescribeInstances"
-        Resource = "*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "ssm:SendCommand",
-          "ssm:GetCommandInvocation",
-          "ssm:DescribeInstanceInformation",
-        ]
-        Resource = "*"
-      },
-    ]
-  })
 }
 
 # ---------------------------------------------------------------------------
@@ -216,15 +140,10 @@ output "instance_id" {
 
 output "instance_tag" {
   value       = var.instance_tag
-  description = "Set as the Name tag for workflow discovery"
-}
-
-output "aws_role_arn" {
-  value       = aws_iam_role.github_actions.arn
-  description = "Add as AWS_ROLE_ARN repo secret in GitHub"
+  description = "Name tag used by scripts/run_neuron_tests.sh"
 }
 
 output "aws_region" {
   value       = var.aws_region
-  description = "Add as AWS_REGION repo variable in GitHub"
+  description = "Region to pass to AWS CLI commands"
 }
