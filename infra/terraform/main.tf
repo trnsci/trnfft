@@ -51,7 +51,7 @@ data "aws_ami" "neuron" {
 
   filter {
     name   = "name"
-    values = ["Deep Learning AMI Neuron PyTorch*Ubuntu 22.04*"]
+    values = ["Deep Learning AMI Neuron PyTorch 2.9*Ubuntu 24.04*"]
   }
 }
 
@@ -120,9 +120,10 @@ resource "aws_instance" "ci" {
     set -euxo pipefail
     cd /home/ubuntu
     sudo -u ubuntu git clone https://github.com/scttfrdmn/trnfft.git trnfft
-    cd trnfft
-    sudo -u ubuntu python3 -m venv .venv
-    sudo -u ubuntu .venv/bin/pip install -e '.[neuron,dev]'
+    # Install into the AMI's pre-built Neuron venv (has neuronxcc preinstalled).
+    # Use [dev] only — [neuron] would try to fetch neuronxcc from PyPI where it doesn't exist.
+    NEURON_VENV=$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1)
+    sudo -u ubuntu $NEURON_VENV/bin/pip install -e '/home/ubuntu/trnfft[dev]'
   EOF
 
   tags = {

@@ -74,8 +74,9 @@ CMD_ID=$(aws ssm send-command \
     \"cd /home/ubuntu/trnfft\",
     \"git fetch --all\",
     \"git checkout $SHA\",
-    \"pip install -e '.[neuron,dev]' --quiet\",
-    \"pytest tests/ -v -m neuron --tb=short\"
+    \"NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1)\",
+    \"sudo -u ubuntu \$NEURON_VENV/bin/pip install -e '/home/ubuntu/trnfft[dev]' --quiet\",
+    \"sudo -u ubuntu \$NEURON_VENV/bin/pytest /home/ubuntu/trnfft/tests/ -v -m neuron --tb=short\"
   ]" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
