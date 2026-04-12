@@ -1,7 +1,7 @@
 # trnfft
 
 FFT and complex-valued tensor operations for AWS Trainium via NKI.
-Part of the trn-* scientific computing suite by Playground Logic.
+Part of the trnsci scientific computing suite.
 
 Incorporates neuron-complex-ops (https://github.com/scttfrdmn/neuron-complex-ops).
 
@@ -113,10 +113,10 @@ python examples/speech_stft.py --demo  # Quick STFT demo
 
 ## Naming Convention
 
-This repo is part of the `trn*` suite under Playground Logic:
+This repo is part of the `trn*` suite:
 - `trnfft` — FFT + complex ops (this repo)
-- `trnblas` — BLAS operations (https://github.com/scttfrdmn/trnblas)
+- `trnblas` — BLAS operations (https://github.com/trnsci/trnblas)
 - `trnrand` — Random number generation (https://github.com/trnsci/trnrand)
 - `trnsolver` — Linear solvers, eigendecomposition (planned)
 
-All repos: Python/NKI, Apache 2.0, Playground Logic.
+All repos: Python/NKI, Apache 2.0.

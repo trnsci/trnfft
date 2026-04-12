@@ -10,7 +10,7 @@ FFT and complex-valued tensor operations for AWS Trainium via NKI.
 
 Trainium has no native complex number support and ships no FFT library. `trnfft` fills that gap with split real/imaginary representation, complex neural network layers, and NKI kernels optimized for the NeuronCore architecture.
 
-Incorporates [neuron-complex-ops](https://github.com/scttfrdmn/neuron-complex-ops). Part of the **trn-\*** scientific computing suite by [Playground Logic](https://playgroundlogic.co).
+Incorporates [neuron-complex-ops](https://github.com/scttfrdmn/neuron-complex-ops). Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
 ## Why
 
@@ -132,13 +132,13 @@ NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https
 | Project | What |
 |---------|------|
 | [neuron-complex-ops](https://github.com/scttfrdmn/neuron-complex-ops) | Original proof-of-concept (now folded into this library) |
-| [trnblas](https://github.com/scttfrdmn/trnblas) | BLAS for Trainium (Level 1-3, DF-MP2 use case) |
+| [trnblas](https://github.com/trnsci/trnblas) | BLAS for Trainium (Level 1-3, DF-MP2 use case) |
 | [trnrand](https://github.com/trnsci/trnrand) | Random number generation (Philox/Sobol) for Trainium |
 | trnsolver *(planned)* | Linear solvers and eigendecomposition for Trainium |
 
 ## License
 
-Apache 2.0 — Playground Logic LLC
+Apache 2.0 — Copyright 2026 Scott Friedman
 
 ## Acknowledgments
 
