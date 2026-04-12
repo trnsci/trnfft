@@ -23,6 +23,7 @@ nav:
       - Neural Network Layers: api/nn.md
       - NKI Backend: api/nki.md
   - Architecture: architecture.md
+  - Benchmarks: benchmarks.md
   - Deployment:
       - AWS Setup for Neuron CI: aws_setup.md
 

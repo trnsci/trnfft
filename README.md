@@ -102,6 +102,10 @@ y = layer(x)
 
 NKI kernels are validated against **Neuron SDK 2.24+** on the **Deep Learning AMI Neuron PyTorch 2.9 (Ubuntu 24.04)** AMI (20260410 or later). See [docs/installation.md](https://scttfrdmn.github.io/trnfft/installation/#hardware-compatibility) for the full compatibility matrix.
 
+## Benchmarks
+
+NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https://scttfrdmn.github.io/trnfft/benchmarks/) for the latest numbers.
+
 ## Status
 
 **v0.1.0** — CPU fallback works, NKI kernels scaffolded for on-hardware validation.
