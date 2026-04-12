@@ -119,7 +119,22 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     orig_shape = x.real.shape
     flat_re = x.real.reshape(-1, n).contiguous()
     flat_im = x.imag.reshape(-1, n).contiguous()
-    B = flat_re.shape[0]
+    B_orig = flat_re.shape[0]
+
+    # The NKI kernel's partition tiling uses chunk size PMAX=128 and requires
+    # total_groups = B * num_groups to be divisible by it at every stage. Since
+    # num_groups goes down to 1 at the last stage, B itself must be a multiple
+    # of PMAX. Pad with zeros at the host, strip after the final stage.
+    PMAX = 128
+    if B_orig % PMAX == 0:
+        B = B_orig
+        pad_re = flat_re
+        pad_im = flat_im
+    else:
+        B = ((B_orig + PMAX - 1) // PMAX) * PMAX
+        padding = torch.zeros(B - B_orig, n, dtype=flat_re.dtype)
+        pad_re = torch.cat([flat_re, padding], dim=0)
+        pad_im = torch.cat([flat_im, padding], dim=0)
 
     sign = 1.0 if inverse else -1.0
 
@@ -128,8 +143,8 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
     # Bit-reversal permutation along the last dim.
     indices = _bit_reverse_indices(n, log2n)
-    re = flat_re[..., indices].to(device)
-    im = flat_im[..., indices].to(device)
+    re = pad_re[..., indices].to(device)
+    im = pad_im[..., indices].to(device)
 
     # Run butterfly stages via batched NKI kernel.
     for s in range(log2n):
@@ -148,8 +163,8 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
         re, im = butterfly_stage_kernel(re, im, tw_re_bcast, tw_im_bcast, n, s)
 
-    re = re.to(orig_device).reshape(orig_shape)
-    im = im.to(orig_device).reshape(orig_shape)
+    re = re.to(orig_device)[:B_orig].reshape(orig_shape)
+    im = im.to(orig_device)[:B_orig].reshape(orig_shape)
     result = ComplexTensor(re, im)
     if inverse:
         result = result * (1.0 / n)
