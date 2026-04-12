@@ -322,6 +322,12 @@ def _nki_complex_mask(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTensor
     total = mask.real.numel()
     if total % 128 != 0:
         return mask * spec
-    (mr, mi, sr, si), orig_device = _to_xla(mask.real, mask.imag, spec.real, spec.imag)
+    # Force contiguous layout before the kernel's reshape to (128, free).
+    # Non-contiguous inputs (e.g., from broadcasting or transposed views) break
+    # the reshape at NKI compile time even when the logical shape is fine.
+    (mr, mi, sr, si), orig_device = _to_xla(
+        mask.real.contiguous(), mask.imag.contiguous(),
+        spec.real.contiguous(), spec.imag.contiguous(),
+    )
     c_real, c_imag = _complex_mul_kernel(mr, mi, sr, si)
     return ComplexTensor(c_real.to(orig_device), c_imag.to(orig_device))
