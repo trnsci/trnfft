@@ -104,6 +104,8 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Cooley-Tukey FFT using NKI butterfly kernel on Trainium.
 
+    The NKI butterfly kernel takes a 1D tensor of length n. For batched input
+    (>1D), this wrapper flattens leading dims and iterates row-by-row.
     Inputs are moved to the XLA device for kernel dispatch, then results
     are moved back to the original device.
     """
@@ -113,6 +115,20 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     n = x.shape[-1]
     log2n = int(math.log2(n))
     assert 1 << log2n == n, f"Not power of 2: {n}"
+
+    # Batched input: recurse per row.
+    if x.real.dim() > 1:
+        orig_shape = x.real.shape
+        flat_re = x.real.reshape(-1, n)
+        flat_im = x.imag.reshape(-1, n)
+        out_re = torch.empty_like(flat_re)
+        out_im = torch.empty_like(flat_im)
+        for i in range(flat_re.shape[0]):
+            row = ComplexTensor(flat_re[i].contiguous(), flat_im[i].contiguous())
+            row_result = _cooley_tukey_nki(row, inverse)
+            out_re[i] = row_result.real
+            out_im[i] = row_result.imag
+        return ComplexTensor(out_re.reshape(orig_shape), out_im.reshape(orig_shape))
 
     sign = 1.0 if inverse else -1.0
 
