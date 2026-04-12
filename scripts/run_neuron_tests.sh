@@ -85,21 +85,22 @@ for i in $(seq 1 30); do
 done
 
 echo "Sending test command (SHA=$SHA)..."
-# Use a single bash -c invocation so we can rely on bash semantics (set -e,
-# pipefail, $() substitution). SSM's default shell is sh, which doesn't
-# support pipefail.
+# Run everything as the ubuntu user with the Neuron venv activated INSIDE
+# that user's shell. Activating in root's shell doesn't propagate PATH
+# (libneuronpjrt-path) to a sudo'd subshell. SSM's default shell is sh, so
+# wrap with bash -c to get pipefail and 'source' support.
 TEST_SCRIPT="source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate && \
   cd /home/ubuntu/trnfft && \
-  sudo -u ubuntu git fetch --all && \
-  sudo -u ubuntu git checkout $SHA && \
-  sudo -u ubuntu /opt/aws_neuronx_venv_pytorch_2_9/bin/pip install -e '/home/ubuntu/trnfft[dev]' --quiet && \
-  sudo -u ubuntu /opt/aws_neuronx_venv_pytorch_2_9/bin/pytest tests/ -v -m neuron --tb=short"
+  git fetch --all && \
+  git checkout $SHA && \
+  pip install -e '.[dev]' --quiet && \
+  pytest tests/ -v -m neuron --tb=short"
 
 CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --comment "trnfft neuron tests @ $SHA" \
-  --parameters "{\"commands\":[\"bash -c \\\"$TEST_SCRIPT\\\"\"]}" \
+  --parameters "{\"commands\":[\"sudo -u ubuntu bash -c \\\"$TEST_SCRIPT\\\"\"]}" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 
