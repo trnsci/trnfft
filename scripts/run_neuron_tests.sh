@@ -110,7 +110,7 @@ echo "Waiting for command to complete (this may take several minutes)..."
 # Poll instead of using `aws ssm wait command-executed` (it has a short
 # built-in timeout that often fires before NKI compilation finishes).
 STATUS="InProgress"
-for i in $(seq 1 60); do
+for i in $(seq 1 120); do
   STATUS=$(aws ssm get-command-invocation \
     --command-id "$CMD_ID" \
     --instance-id "$INSTANCE_ID" \
