@@ -30,8 +30,15 @@ class ComplexLinear(nn.Module):
 
     def forward(self, x: ComplexTensor) -> ComplexTensor:
         # (W_re + iW_im)(x_re + ix_im) = (W_re*x_re - W_im*x_im) + i(W_re*x_im + W_im*x_re)
-        re = self.W_re(x.real) - self.W_im(x.imag)
-        im = self.W_re(x.imag) + self.W_im(x.real)
+        from .nki.dispatch import _use_nki
+        if _use_nki():
+            # NKI fused 4-real-matmul kernel reuses x tile across phases.
+            from .nki.dispatch import complex_linear
+            y = complex_linear(x, self.W_re.weight, self.W_im.weight)
+            re, im = y.real, y.imag
+        else:
+            re = self.W_re(x.real) - self.W_im(x.imag)
+            im = self.W_re(x.imag) + self.W_im(x.real)
         if self.bias_re is not None:
             re = re + self.bias_re
             im = im + self.bias_im

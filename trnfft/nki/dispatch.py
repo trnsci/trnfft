@@ -62,6 +62,20 @@ def complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     return complex_matmul(a, b)
 
 
+def complex_linear(x: ComplexTensor, w_real: torch.Tensor, w_imag: torch.Tensor) -> ComplexTensor:
+    """Complex linear forward: y = x @ W^T (complex) with backend dispatch.
+
+    NKI kernel fuses the 4 real matmuls and reuses the activation tile
+    (loaded once, streamed against W_real and W_imag).
+    """
+    if _use_nki():
+        return _nki_complex_linear(x, w_real, w_imag)
+    # PyTorch fallback: 4 real matmuls
+    yr = torch.matmul(x.real, w_real.t()) - torch.matmul(x.imag, w_imag.t())
+    yi = torch.matmul(x.real, w_imag.t()) + torch.matmul(x.imag, w_real.t())
+    return ComplexTensor(yr, yi)
+
+
 def complex_mask_apply(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTensor:
     """Apply complex mask to spectrogram with backend dispatch.
 
@@ -146,6 +160,72 @@ if HAS_NKI:
         return c_real, c_imag
 
     @nki.jit
+    def _complex_linear_kernel(x_real, x_imag, w_real, w_imag):
+        """Complex linear layer: y = x @ W^T where x and W are complex.
+
+        Equivalent to:
+            y_re = x_re @ W_re.T - x_im @ W_im.T
+            y_im = x_re @ W_im.T + x_im @ W_re.T
+
+        Shapes:
+            x_real, x_imag: (M, K_in)         — activations
+            w_real, w_imag: (K_out, K_in)     — weights (stored row-major)
+            returns y_real, y_imag: (M, K_out)
+
+        We treat this as a complex GEMM where W^T is the moving operand.
+        Same calling convention as _complex_gemm_kernel: load x_re/x_im as
+        stationary (transposed so partition dim = K_in), load w as moving.
+        """
+        M, K_in = x_real.shape
+        K_out, _ = w_real.shape
+
+        TILE_M = min(M, 128)
+        TILE_K = min(K_in, 128)
+        TILE_N = min(K_out, 512)
+
+        y_real = nl.ndarray((M, K_out), dtype=x_real.dtype, buffer=nl.shared_hbm)
+        y_imag = nl.ndarray((M, K_out), dtype=x_real.dtype, buffer=nl.shared_hbm)
+
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(K_out // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
+
+                psum_yr = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                psum_yi = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+
+                for k in nl.affine_range(K_in // TILE_K):
+                    k_off = k * TILE_K
+
+                    # Stationary: x tile, transposed so partition dim = K_in.
+                    xr_t = nl.load_transpose2d(x_real[m_off:m_off+TILE_M, k_off:k_off+TILE_K])
+                    xi_t = nl.load_transpose2d(x_imag[m_off:m_off+TILE_M, k_off:k_off+TILE_K])
+
+                    # Moving: W^T columns, partition dim = K_in.
+                    # W is (K_out, K_in) row-major; W^T is (K_in, K_out).
+                    # Slice W[n_off:n_off+TILE_N, k_off:k_off+TILE_K] then transpose:
+                    wr_t = nl.load_transpose2d(w_real[n_off:n_off+TILE_N, k_off:k_off+TILE_K])
+                    wi_t = nl.load_transpose2d(w_imag[n_off:n_off+TILE_N, k_off:k_off+TILE_K])
+
+                    # NKI 2.24 doesn't support `psum -=` in affine_range.
+                    neg_wi_t = nl.negative(wi_t)
+
+                    # y_real += x_real @ W_real^T  +  x_imag @ (-W_imag^T)
+                    psum_yr[...] += nisa.nc_matmul(xr_t, wr_t)
+                    psum_yr[...] += nisa.nc_matmul(xi_t, neg_wi_t)
+
+                    # y_imag += x_real @ W_imag^T  +  x_imag @ W_real^T
+                    psum_yi[...] += nisa.nc_matmul(xr_t, wi_t)
+                    psum_yi[...] += nisa.nc_matmul(xi_t, wr_t)
+
+                yr_sbuf = nl.copy(psum_yr, dtype=x_real.dtype)
+                yi_sbuf = nl.copy(psum_yi, dtype=x_real.dtype)
+                nl.store(y_real[m_off:m_off+TILE_M, n_off:n_off+TILE_N], value=yr_sbuf)
+                nl.store(y_imag[m_off:m_off+TILE_M, n_off:n_off+TILE_N], value=yi_sbuf)
+
+        return y_real, y_imag
+
+    @nki.jit
     def _complex_mul_kernel(a_real, a_imag, b_real, b_imag):
         """Fused element-wise complex multiply.
 
@@ -219,6 +299,15 @@ def _nki_complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     (ar, ai, br, bi), orig_device = _to_xla(a.real, a.imag, b.real, b.imag)
     c_real, c_imag = _complex_gemm_kernel(ar, ai, br, bi)
     return ComplexTensor(c_real.to(orig_device), c_imag.to(orig_device))
+
+
+def _nki_complex_linear(x: ComplexTensor, w_real: torch.Tensor, w_imag: torch.Tensor) -> ComplexTensor:
+    """NKI complex linear: y = x @ W^T (complex) via fused 4-matmul kernel."""
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+    (xr, xi, wr, wi), orig_device = _to_xla(x.real, x.imag, w_real, w_imag)
+    y_real, y_imag = _complex_linear_kernel(xr, xi, wr, wi)
+    return ComplexTensor(y_real.to(orig_device), y_imag.to(orig_device))
 
 
 def _nki_complex_mask(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTensor:

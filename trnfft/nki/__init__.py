@@ -1,6 +1,9 @@
 """NKI kernel implementations and dispatch for Trainium."""
 
-from .dispatch import HAS_NKI, set_backend, get_backend, complex_gemm, complex_mask_apply
+from .dispatch import (
+    HAS_NKI, set_backend, get_backend,
+    complex_gemm, complex_mask_apply, complex_linear,
+)
 from .multicore import set_multicore, get_multicore, multi_core_fft
 
 if HAS_NKI:
@@ -10,7 +13,7 @@ else:
 
 __all__ = [
     "HAS_NKI", "set_backend", "get_backend",
-    "complex_gemm", "complex_mask_apply",
+    "complex_gemm", "complex_mask_apply", "complex_linear",
     "butterfly_stage_kernel",
     "set_multicore", "get_multicore", "multi_core_fft",
 ]
