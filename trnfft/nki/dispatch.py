@@ -128,7 +128,7 @@ if HAS_NKI:
 
                     # NKI 2.24 doesn't support `psum -=` inside affine_range;
                     # use Vector Engine to negate B_imag, then accumulate with +=.
-                    neg_bi = nl.negate(bi)
+                    neg_bi = nl.negative(bi)
 
                     # C_real += A_real @ B_real  +  A_imag @ (-B_imag)
                     psum_cr[...] += nisa.nc_matmul(ar_t, br)
