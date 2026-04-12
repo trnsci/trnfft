@@ -60,42 +60,60 @@ fi
 
 echo "Waiting for instance-running..."
 aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
-echo "Waiting for SSM agent..."
-aws ssm wait instance-information \
-  --filters "Key=InstanceIds,Values=$INSTANCE_ID" --region "$REGION"
+echo "Waiting for SSM agent (polling)..."
+for i in $(seq 1 30); do
+  STATUS=$(aws ssm describe-instance-information \
+    --filters "Key=InstanceIds,Values=$INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'InstanceInformationList[0].PingStatus' \
+    --output text 2>/dev/null || echo "None")
+  if [[ "$STATUS" == "Online" ]]; then
+    echo "SSM agent online."
+    break
+  fi
+  if [[ $i -eq 30 ]]; then
+    echo "ERROR: SSM agent did not come online within 5 minutes" >&2
+    exit 1
+  fi
+  sleep 10
+done
 
 echo "Sending test command (SHA=$SHA)..."
+# Use a single bash -c invocation so we can rely on bash semantics (set -e,
+# pipefail, $() substitution). SSM's default shell is sh, which doesn't
+# support pipefail.
+TEST_SCRIPT="source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate && \
+  cd /home/ubuntu/trnfft && \
+  sudo -u ubuntu git fetch --all && \
+  sudo -u ubuntu git checkout $SHA && \
+  sudo -u ubuntu /opt/aws_neuronx_venv_pytorch_2_9/bin/pip install -e '/home/ubuntu/trnfft[dev]' --quiet && \
+  sudo -u ubuntu /opt/aws_neuronx_venv_pytorch_2_9/bin/pytest tests/ -v -m neuron --tb=short"
+
 CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --comment "trnfft neuron tests @ $SHA" \
-  --parameters "commands=[
-    \"set -euo pipefail\",
-    \"cd /home/ubuntu/trnfft\",
-    \"git fetch --all\",
-    \"git checkout $SHA\",
-    \"NEURON_VENV=\$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1)\",
-    \"sudo -u ubuntu \$NEURON_VENV/bin/pip install -e '/home/ubuntu/trnfft[dev]' --quiet\",
-    \"sudo -u ubuntu \$NEURON_VENV/bin/pytest /home/ubuntu/trnfft/tests/ -v -m neuron --tb=short\"
-  ]" \
+  --parameters "{\"commands\":[\"bash -c \\\"$TEST_SCRIPT\\\"\"]}" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 
 echo "Command ID: $CMD_ID"
 echo "Waiting for command to complete (this may take several minutes)..."
 
-# aws ssm wait command-executed exits 255 if the command fails. We want to
-# capture output even on failure, so don't fail-fast here.
-aws ssm wait command-executed \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" || true
-
-STATUS=$(aws ssm get-command-invocation \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" \
-  --query 'Status' --output text)
+# Poll instead of using `aws ssm wait command-executed` (it has a short
+# built-in timeout that often fires before NKI compilation finishes).
+STATUS="InProgress"
+for i in $(seq 1 60); do
+  STATUS=$(aws ssm get-command-invocation \
+    --command-id "$CMD_ID" \
+    --instance-id "$INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'Status' --output text 2>/dev/null || echo "Unknown")
+  case "$STATUS" in
+    Success|Failed|TimedOut|Cancelled) break ;;
+  esac
+  sleep 15
+done
 
 echo ""
 echo "=== STDOUT ==="
