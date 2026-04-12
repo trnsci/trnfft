@@ -115,8 +115,8 @@ python examples/speech_stft.py --demo  # Quick STFT demo
 
 This repo is part of the `trn*` suite under Playground Logic:
 - `trnfft` — FFT + complex ops (this repo)
-- `trnblas` — BLAS operations (planned)
+- `trnblas` — BLAS operations (https://github.com/scttfrdmn/trnblas)
+- `trnrand` — Random number generation (https://github.com/scttfrdmn/trnrand)
 - `trnsolver` — Linear solvers, eigendecomposition (planned)
-- `trnrand` — Random number generation (planned)
 
 All repos: Python/NKI, Apache 2.0, Playground Logic.
