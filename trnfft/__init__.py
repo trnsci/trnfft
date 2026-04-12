@@ -8,7 +8,7 @@ Part of the trn-* scientific computing suite by Playground Logic.
 Incorporates neuron-complex-ops (ComplexTensor, NKI dispatch, complex NN layers).
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .api import fft, ifft, rfft, irfft, fft2, fftn, ifftn, stft, istft
 from .complex import ComplexTensor, complex_matmul
