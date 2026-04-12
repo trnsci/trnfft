@@ -128,13 +128,18 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     for s in range(log2n):
         m = 1 << (s + 1)
         half = m >> 1
+        num_groups = n // m
 
-        # Precompute twiddle factors for this stage
+        # Precompute twiddle factors for this stage and broadcast across groups.
+        # NKI 2.24 element-wise ops require matching partition dims, so we expand
+        # the twiddle from (half,) to (num_groups, half) on the host.
         angles = sign * 2.0 * math.pi * torch.arange(half, dtype=x.real.dtype) / m
-        tw_re = torch.cos(angles).to(device)
-        tw_im = torch.sin(angles).to(device)
+        tw_re_1d = torch.cos(angles)
+        tw_im_1d = torch.sin(angles)
+        tw_re_bcast = tw_re_1d.unsqueeze(0).expand(num_groups, half).contiguous().to(device)
+        tw_im_bcast = tw_im_1d.unsqueeze(0).expand(num_groups, half).contiguous().to(device)
 
-        re, im = butterfly_stage_kernel(re, im, tw_re, tw_im, n, s)
+        re, im = butterfly_stage_kernel(re, im, tw_re_bcast, tw_im_bcast, n, s)
 
     re = re.to(orig_device)
     im = im.to(orig_device)

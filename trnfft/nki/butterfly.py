@@ -25,37 +25,24 @@ if HAS_NKI:
     PMAX = 128
 
     @nki.jit
-    def butterfly_stage_kernel(x_re, x_im, tw_re, tw_im, n: int, stage: int):
+    def butterfly_stage_kernel(x_re, x_im, tw_re_bcast, tw_im_bcast, n: int, stage: int):
         """Batched radix-2 butterfly stage with 2D partition layout.
 
         Parameters
         ----------
-        x_re, x_im     : [n] input real/imag (HBM)
-        tw_re, tw_im   : [half] twiddle factors for this stage (HBM)
-        n              : transform size (power of 2)
-        stage          : stage index in [0, log2(n))
+        x_re, x_im                 : [n] input real/imag (HBM)
+        tw_re_bcast, tw_im_bcast   : [num_groups, half] twiddle factors broadcast
+                                     across the num_groups (partition) dim by the host.
+                                     Row g column k is `cos/sin(±2π·k / m)`. Pre-broadcasting
+                                     is needed because NKI 2.24 element-wise ops require
+                                     matching partition dims and don't auto-broadcast (1,1)
+                                     tiles to (num_groups, 1).
+        n                          : transform size (power of 2)
+        stage                      : stage index in [0, log2(n))
 
         Returns
         -------
         out_re, out_im : [n] output real/imag (HBM, allocated by the kernel)
-
-        NKI 2.24 requires output buffers to be allocated inside the kernel
-        (parameters are immutable). The shape mirrors the input.
-
-        Layout
-        ------
-        Reshape the 1D input as 2D (num_groups, m). Row g column j of this
-        view is element g*m + j of the 1D input — the j-th element of group g.
-
-        For each butterfly position k in [0, half):
-            even column = column k     (one element per group)
-            odd column  = column k+half
-        Twiddle for position k is a scalar across all groups.
-
-        We load the even/odd columns as (num_groups, 1) SBUF tiles. The first
-        dim is the partition dim, satisfying the NKI 2.24 constraint.
-
-        For num_groups > 128, tile the partition dim in chunks of 128.
         """
         m = 1 << (stage + 1)
         half = m >> 1
@@ -79,20 +66,19 @@ if HAS_NKI:
 
             # Process each butterfly position k within this partition tile.
             for k in nl.affine_range(half):
-                # Twiddle is a single complex scalar for all groups at position k.
-                t_re_k = nl.load(tw_re[k:k+1])
-                t_im_k = nl.load(tw_im[k:k+1])
+                # Twiddle for this column, broadcast across the partition (groups) dim.
+                t_re_col = nl.load(tw_re_bcast[p_off:p_end, k:k+1])
+                t_im_col = nl.load(tw_im_bcast[p_off:p_end, k:k+1])
 
-                # Even and odd columns. Each load yields a (groups_chunk, 1) tile
-                # — first dim is partition dim, satisfying NKI constraints.
+                # Even and odd columns.
                 e_re = nl.load(x_re_2d[p_off:p_end, k:k+1])
                 e_im = nl.load(x_im_2d[p_off:p_end, k:k+1])
                 o_re = nl.load(x_re_2d[p_off:p_end, k+half:k+half+1])
                 o_im = nl.load(x_im_2d[p_off:p_end, k+half:k+half+1])
 
                 # Complex multiply: (t_re + i*t_im) * (o_re + i*o_im)
-                prod_re = t_re_k * o_re - t_im_k * o_im
-                prod_im = t_re_k * o_im + t_im_k * o_re
+                prod_re = t_re_col * o_re - t_im_col * o_im
+                prod_im = t_re_col * o_im + t_im_col * o_re
 
                 # Butterfly: even = e + prod, odd = e - prod
                 nl.store(out_re_2d[p_off:p_end, k:k+1], value=e_re + prod_re)
