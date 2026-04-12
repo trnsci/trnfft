@@ -102,12 +102,11 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
 
 def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
-    """Cooley-Tukey FFT using NKI butterfly kernel on Trainium.
+    """Cooley-Tukey FFT using batched NKI butterfly kernel on Trainium.
 
-    The NKI butterfly kernel takes a 1D tensor of length n. For batched input
-    (>1D), this wrapper flattens leading dims and iterates row-by-row.
-    Inputs are moved to the XLA device for kernel dispatch, then results
-    are moved back to the original device.
+    Accepts any shape; leading dims are flattened into a single batch dim B
+    and passed to the kernel as (B, n). The kernel vectorizes across B in a
+    single call per stage — no Python loop over batch rows.
     """
     from .nki.butterfly import butterfly_stage_kernel
     import torch_xla
@@ -116,49 +115,41 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     log2n = int(math.log2(n))
     assert 1 << log2n == n, f"Not power of 2: {n}"
 
-    # Batched input: recurse per row.
-    if x.real.dim() > 1:
-        orig_shape = x.real.shape
-        flat_re = x.real.reshape(-1, n)
-        flat_im = x.imag.reshape(-1, n)
-        out_re = torch.empty_like(flat_re)
-        out_im = torch.empty_like(flat_im)
-        for i in range(flat_re.shape[0]):
-            row = ComplexTensor(flat_re[i].contiguous(), flat_im[i].contiguous())
-            row_result = _cooley_tukey_nki(row, inverse)
-            out_re[i] = row_result.real
-            out_im[i] = row_result.imag
-        return ComplexTensor(out_re.reshape(orig_shape), out_im.reshape(orig_shape))
+    # Normalize to 2D (B, n). Restore original shape at the end.
+    orig_shape = x.real.shape
+    flat_re = x.real.reshape(-1, n).contiguous()
+    flat_im = x.imag.reshape(-1, n).contiguous()
+    B = flat_re.shape[0]
 
     sign = 1.0 if inverse else -1.0
 
     device = torch_xla.device()
     orig_device = x.real.device
 
-    # Bit-reversal permutation
+    # Bit-reversal permutation along the last dim.
     indices = _bit_reverse_indices(n, log2n)
-    re = x.real[..., indices].to(device)
-    im = x.imag[..., indices].to(device)
+    re = flat_re[..., indices].to(device)
+    im = flat_im[..., indices].to(device)
 
-    # Run butterfly stages via NKI kernel
+    # Run butterfly stages via batched NKI kernel.
     for s in range(log2n):
         m = 1 << (s + 1)
         half = m >> 1
         num_groups = n // m
+        total_groups = B * num_groups
 
-        # Precompute twiddle factors for this stage and broadcast across groups.
-        # NKI 2.24 element-wise ops require matching partition dims, so we expand
-        # the twiddle from (half,) to (num_groups, half) on the host.
+        # Precompute twiddle factors for this stage. Expand to (total_groups, half)
+        # so every batch row / group row has matching partition-dim values.
         angles = sign * 2.0 * math.pi * torch.arange(half, dtype=x.real.dtype) / m
         tw_re_1d = torch.cos(angles)
         tw_im_1d = torch.sin(angles)
-        tw_re_bcast = tw_re_1d.unsqueeze(0).expand(num_groups, half).contiguous().to(device)
-        tw_im_bcast = tw_im_1d.unsqueeze(0).expand(num_groups, half).contiguous().to(device)
+        tw_re_bcast = tw_re_1d.unsqueeze(0).expand(total_groups, half).contiguous().to(device)
+        tw_im_bcast = tw_im_1d.unsqueeze(0).expand(total_groups, half).contiguous().to(device)
 
         re, im = butterfly_stage_kernel(re, im, tw_re_bcast, tw_im_bcast, n, s)
 
-    re = re.to(orig_device)
-    im = im.to(orig_device)
+    re = re.to(orig_device).reshape(orig_shape)
+    im = im.to(orig_device).reshape(orig_shape)
     result = ComplexTensor(re, im)
     if inverse:
         result = result * (1.0 / n)

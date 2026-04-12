@@ -1,9 +1,9 @@
 """
 Speech enhancement via complex ratio mask (cIRM) estimation.
 
-Demonstrates trnfft's STFT + complex NN layers for the ASPIRE lab workflow.
-This is a minimal training loop — see neuron-complex-ops for the full
-Speech Enhancement Arena with multi-model comparison.
+Demonstrates trnfft's STFT + complex NN layers for a speech enhancement
+workflow. This is a minimal training loop — see neuron-complex-ops for the
+full Speech Enhancement Arena with multi-model comparison.
 
 Usage:
     python examples/speech_stft.py --demo           # Quick synthetic test

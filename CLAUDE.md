@@ -14,8 +14,8 @@ and Scalar engines.
 
 ## Relationship to neuron-complex-ops
 
-`neuron-complex-ops` was the proof-of-concept for the Williamson/ASPIRE
-engagement at OSU. This project absorbs it:
+`neuron-complex-ops` was the original speech-enhancement proof-of-concept.
+This project absorbs it:
 
 **Folded in from neuron-complex-ops:**
 - `ComplexTensor` with full arithmetic → `trnfft/complex.py`
@@ -116,7 +116,7 @@ python examples/speech_stft.py --demo  # Quick STFT demo
 This repo is part of the `trn*` suite under Playground Logic:
 - `trnfft` — FFT + complex ops (this repo)
 - `trnblas` — BLAS operations (https://github.com/scttfrdmn/trnblas)
-- `trnrand` — Random number generation (https://github.com/scttfrdmn/trnrand)
+- `trnrand` — Random number generation (https://github.com/trnsci/trnrand)
 - `trnsolver` — Linear solvers, eigendecomposition (planned)
 
 All repos: Python/NKI, Apache 2.0, Playground Logic.
