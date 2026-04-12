@@ -124,7 +124,7 @@ y = layer(x)
 | Project | What |
 |---------|------|
 | [neuron-complex-ops](https://github.com/scttfrdmn/neuron-complex-ops) | Original proof-of-concept (now folded into this library) |
-| trnblas *(planned)* | BLAS for Trainium |
+| [trnblas](https://github.com/scttfrdmn/trnblas) | BLAS for Trainium (Level 1-3, DF-MP2 use case) |
 | trnsolver *(planned)* | Linear solvers and eigendecomposition for Trainium |
 
 ## License
