@@ -80,16 +80,27 @@ if HAS_NKI:
 
     @nki.jit
     def _complex_gemm_kernel(a_real, a_imag, b_real, b_imag):
-        """Complex GEMM via stationary tile reuse on Tensor Engine.
+        """Complex GEMM: C = A @ B where A, B, C are complex.
 
-        Phase 1 — A_r stationary: PSUM_real += A_r.T @ B_r, PSUM_imag += A_r.T @ B_i
-        Phase 2 — A_i stationary: PSUM_real += A_i.T @ (-B_i), PSUM_imag += A_i.T @ B_r
+        Uses 4 real matmuls accumulated into 2 PSUM tiles:
+            C_real = A_real @ B_real - A_imag @ B_imag
+            C_imag = A_real @ B_imag + A_imag @ B_real
+
+        NKI 2.24 calling convention:
+            psum[...] += nisa.nc_matmul(stationary, moving)
+        Both inputs must be SBUF tiles. Stationary partition ≤ 128 (= K).
+        Stationary free ≤ 128 (= M). Moving free ≤ 512 (= N).
+
+        Tile shapes (after reshaping for the systolic array):
+            stationary (A row-tile, transposed): (TILE_K, TILE_M)
+            moving (B col-tile):                 (TILE_K, TILE_N)
+            result (PSUM):                       (TILE_M, TILE_N)
         """
         M, K = a_real.shape
         _, N = b_real.shape
 
-        TILE_M = min(M, PMAX)
-        TILE_K = min(K, PMAX)
+        TILE_M = min(M, 128)
+        TILE_K = min(K, 128)
         TILE_N = min(N, 512)
 
         c_real = nl.ndarray((M, N), dtype=a_real.dtype, buffer=nl.shared_hbm)
@@ -100,29 +111,28 @@ if HAS_NKI:
                 m_off = m * TILE_M
                 n_off = n * TILE_N
 
-                psum_cr = nl.zeros((TILE_M, TILE_N), dtype=nl.float32,
-                                   buffer=nl.psum)
-                psum_ci = nl.zeros((TILE_M, TILE_N), dtype=nl.float32,
-                                   buffer=nl.psum)
+                psum_cr = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                psum_ci = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
                 for k in nl.affine_range(K // TILE_K):
                     k_off = k * TILE_K
 
-                    ar = nl.load(a_real[m_off:m_off+TILE_M, k_off:k_off+TILE_K])
-                    ai = nl.load(a_imag[m_off:m_off+TILE_M, k_off:k_off+TILE_K])
+                    # Load A row-tile and transpose so partition dim = K.
+                    # nl.load gives (TILE_M, TILE_K); need (TILE_K, TILE_M).
+                    ar_t = nl.load_transpose2d(a_real[m_off:m_off+TILE_M, k_off:k_off+TILE_K])
+                    ai_t = nl.load_transpose2d(a_imag[m_off:m_off+TILE_M, k_off:k_off+TILE_K])
+
+                    # Load B col-tile with partition dim = K (already K-major).
                     br = nl.load(b_real[k_off:k_off+TILE_K, n_off:n_off+TILE_N])
                     bi = nl.load(b_imag[k_off:k_off+TILE_K, n_off:n_off+TILE_N])
 
-                    # Phase 1: A_r stationary
-                    nisa.nc_matmul(psum_cr, ar, br)
-                    nisa.nc_matmul(psum_ci, ar, bi)
+                    # C_real += A_real @ B_real  -  A_imag @ B_imag
+                    psum_cr[...] += nisa.nc_matmul(ar_t, br)
+                    psum_cr[...] -= nisa.nc_matmul(ai_t, bi)
 
-                    # Vector Engine: negate B_i (overlaps with matmuls)
-                    neg_bi = nl.negate(bi)
-
-                    # Phase 2: A_i stationary
-                    nisa.nc_matmul(psum_cr, ai, neg_bi)
-                    nisa.nc_matmul(psum_ci, ai, br)
+                    # C_imag += A_real @ B_imag  +  A_imag @ B_real
+                    psum_ci[...] += nisa.nc_matmul(ar_t, bi)
+                    psum_ci[...] += nisa.nc_matmul(ai_t, br)
 
                 cr_sbuf = nl.copy(psum_cr, dtype=a_real.dtype)
                 ci_sbuf = nl.copy(psum_ci, dtype=a_real.dtype)
@@ -135,35 +145,56 @@ if HAS_NKI:
     def _complex_mul_kernel(a_real, a_imag, b_real, b_imag):
         """Fused element-wise complex multiply.
 
-        Loads all 4 inputs in one pass, computes ac-bd and ad+bc in SBUF,
-        writes 2 outputs. Avoids 6 separate HBM round-trips.
+        Computes (a_re + i a_im) * (b_re + i b_im) = (a_re*b_re - a_im*b_im) + i(a_re*b_im + a_im*b_re)
+        in a single kernel, avoiding 6 separate HBM round-trips.
+
+        NKI 2.24 partition-dim constraint: any SBUF tile must be 2D with first
+        dim being the partition dim, and partition size ≤ 128. We reshape the
+        flat input into (PMAX, ceil(total/PMAX)) and process row-by-column tiles.
+        Inputs must have total size divisible by PMAX (128).
         """
         shape = a_real.shape
         total = 1
         for s in shape:
             total *= s
 
-        TILE = min(total, PMAX * 512)
+        # Trainium's Vector Engine partition limit. Inputs that are not multiples
+        # of 128 elements would need a tail tile — caller pads if necessary.
+        assert total % 128 == 0, \
+            f"_complex_mul_kernel requires total size divisible by 128; got {total}"
+
+        free = total // 128
+        # Free-dim tile size: cap at 512 to keep SBUF usage reasonable.
+        FMAX = 512
+        free_tile = min(free, FMAX)
 
         c_real = nl.ndarray(shape, dtype=a_real.dtype, buffer=nl.shared_hbm)
         c_imag = nl.ndarray(shape, dtype=a_real.dtype, buffer=nl.shared_hbm)
 
-        n_tiles = (total + TILE - 1) // TILE
+        # Reshape views: flatten then expose as (128, free).
+        a_re_2d = a_real.reshape((128, free))
+        a_im_2d = a_imag.reshape((128, free))
+        b_re_2d = b_real.reshape((128, free))
+        b_im_2d = b_imag.reshape((128, free))
+        c_re_2d = c_real.reshape((128, free))
+        c_im_2d = c_imag.reshape((128, free))
+
+        n_tiles = (free + free_tile - 1) // free_tile
 
         for t in nl.affine_range(n_tiles):
-            off = t * TILE
-            size = min(TILE, total - off)
+            f_off = t * free_tile
+            f_end = min(f_off + free_tile, free)
 
-            ar = nl.load(a_real.reshape((total,))[off:off+size])
-            ai = nl.load(a_imag.reshape((total,))[off:off+size])
-            br = nl.load(b_real.reshape((total,))[off:off+size])
-            bi = nl.load(b_imag.reshape((total,))[off:off+size])
+            ar = nl.load(a_re_2d[:, f_off:f_end])
+            ai = nl.load(a_im_2d[:, f_off:f_end])
+            br = nl.load(b_re_2d[:, f_off:f_end])
+            bi = nl.load(b_im_2d[:, f_off:f_end])
 
             cr = ar * br - ai * bi
             ci = ar * bi + ai * br
 
-            nl.store(c_real.reshape((total,))[off:off+size], value=cr)
-            nl.store(c_imag.reshape((total,))[off:off+size], value=ci)
+            nl.store(c_re_2d[:, f_off:f_end], value=cr)
+            nl.store(c_im_2d[:, f_off:f_end], value=ci)
 
         return c_real, c_imag
 
@@ -179,8 +210,16 @@ def _nki_complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
 
 
 def _nki_complex_mask(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTensor:
-    """NKI fused complex mask application."""
+    """NKI fused complex mask application.
+
+    The kernel requires total element count divisible by 128 (the Trainium
+    Vector Engine partition limit). For inputs that aren't, fall back to
+    PyTorch element-wise multiply.
+    """
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
+    total = mask.real.numel()
+    if total % 128 != 0:
+        return mask * spec
     c_real, c_imag = _complex_mul_kernel(mask.real, mask.imag, spec.real, spec.imag)
     return ComplexTensor(c_real, c_imag)
