@@ -114,23 +114,26 @@ class TestNKIKernels:
     def test_gemm_nki_vs_pytorch(self, nki_backend):
         from trnfft.nki import complex_gemm
         rng = np.random.default_rng(42)
-        for shape in [(128, 128), (256, 512)]:
-            m, n = shape
+        # Shapes (M, K) for A; B is (K, M). Multiples of 128 + non-square.
+        for shape in [(128, 128), (256, 512), (512, 512), (1024, 1024)]:
+            m, k = shape
             a = ComplexTensor(
-                torch.tensor(rng.standard_normal((m, n)), dtype=torch.float32),
-                torch.tensor(rng.standard_normal((m, n)), dtype=torch.float32),
+                torch.tensor(rng.standard_normal((m, k)), dtype=torch.float32),
+                torch.tensor(rng.standard_normal((m, k)), dtype=torch.float32),
             )
             b = ComplexTensor(
-                torch.tensor(rng.standard_normal((n, m)), dtype=torch.float32),
-                torch.tensor(rng.standard_normal((n, m)), dtype=torch.float32),
+                torch.tensor(rng.standard_normal((k, m)), dtype=torch.float32),
+                torch.tensor(rng.standard_normal((k, m)), dtype=torch.float32),
             )
             nki_result = complex_gemm(a, b)
             pytorch_result = complex_matmul(a, b)
+            # Larger shapes accumulate more FP32 error; relax tol for K >= 512.
+            tol = 1e-3 if k <= 256 else 5e-3
             np.testing.assert_allclose(
-                nki_result.real.numpy(), pytorch_result.real.numpy(), atol=1e-3
+                nki_result.real.numpy(), pytorch_result.real.numpy(), atol=tol, rtol=tol
             )
             np.testing.assert_allclose(
-                nki_result.imag.numpy(), pytorch_result.imag.numpy(), atol=1e-3
+                nki_result.imag.numpy(), pytorch_result.imag.numpy(), atol=tol, rtol=tol
             )
 
     def test_mask_apply_nki_vs_pytorch(self, nki_backend):

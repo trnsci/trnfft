@@ -80,3 +80,23 @@ class TestISTFT:
         np.testing.assert_allclose(
             recovered[interior].numpy(), signal[interior].numpy(), atol=1e-3
         )
+
+
+@pytest.mark.neuron
+class TestNKISTFT:
+    """STFT/ISTFT routed through NKI butterfly kernel for the inner FFTs."""
+
+    def test_stft_nki_shape(self, nki_backend):
+        torch.manual_seed(42)
+        signal = torch.randn(2048)
+        S = trnfft.stft(signal, n_fft=128, hop_length=64)
+        freq_bins = 128 // 2 + 1
+        assert S.shape[-2] == freq_bins
+        assert torch.all(torch.isfinite(S.abs()))
+
+    def test_stft_nki_roundtrip(self, nki_backend):
+        torch.manual_seed(42)
+        signal = torch.randn(2048)
+        S = trnfft.stft(signal, n_fft=128, hop_length=64)
+        recovered = trnfft.istft(S, n_fft=128, hop_length=64, length=2048)
+        np.testing.assert_allclose(recovered.numpy(), signal.numpy(), atol=1e-3)

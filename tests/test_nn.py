@@ -96,3 +96,45 @@ class TestGradients:
         loss.backward()
         assert signal.grad is not None
         assert torch.all(torch.isfinite(signal.grad))
+
+
+@pytest.mark.neuron
+class TestNKILayers:
+    """Validate that NN layers work end-to-end with NKI dispatch."""
+
+    def test_complex_linear_nki_vs_pytorch(self, nki_backend):
+        from trnfft import set_backend
+        torch.manual_seed(42)
+        # Sizes: M=K_in=128, K_out=256. All multiples of 128 for clean tiling.
+        layer = ComplexLinear(128, 256, bias=True)
+        x = ComplexTensor(torch.randn(128, 128), torch.randn(128, 128))
+
+        # NKI path (active because of nki_backend fixture)
+        y_nki = layer(x)
+
+        # PyTorch reference
+        set_backend("pytorch")
+        y_ref = layer(x)
+        set_backend("nki")  # restore for fixture's teardown
+
+        np.testing.assert_allclose(y_nki.real.detach().numpy(),
+                                   y_ref.real.detach().numpy(), atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(y_nki.imag.detach().numpy(),
+                                   y_ref.imag.detach().numpy(), atol=1e-3, rtol=1e-3)
+
+    def test_complex_conv1d_pytorch_fallback(self, nki_backend):
+        # No NKI conv kernel exists. Layer must still work via PyTorch ops.
+        layer = ComplexConv1d(1, 4, kernel_size=3, padding=1)
+        x = ComplexTensor(torch.randn(2, 1, 64), torch.randn(2, 1, 64))
+        y = layer(x)
+        assert y.shape == (2, 4, 64)
+        assert torch.all(torch.isfinite(y.real))
+        assert torch.all(torch.isfinite(y.imag))
+
+    def test_complex_modrelu_pytorch_fallback(self, nki_backend):
+        # No NKI ModReLU kernel exists. Falls back to elementwise PyTorch ops.
+        layer = ComplexModReLU(8)
+        x = ComplexTensor(torch.randn(4, 8), torch.randn(4, 8))
+        y = layer(x)
+        assert y.shape == (4, 8)
+        assert torch.all(torch.isfinite(y.abs()))

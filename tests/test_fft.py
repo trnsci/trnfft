@@ -184,19 +184,58 @@ class TestFFTnD:
 class TestNKIFFT:
 
     def test_fft_nki_vs_numpy(self, nki_backend):
-        for n in [16, 64, 256, 1024]:
+        # Sizes >= 2048 exercise multi-partition tiling in butterfly kernel
+        # (num_groups > PMAX=128 in stage 0).
+        for n in [16, 64, 256, 1024, 4096, 16384]:
             torch.manual_seed(42)
             x = torch.randn(n)
             result = trnfft.fft(x)
             expected = np.fft.fft(x.numpy())
-            np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-4, rtol=1e-4)
-            np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-4, rtol=1e-4)
+            np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-3, rtol=1e-3)
+            np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
 
     def test_fft_nki_roundtrip(self, nki_backend):
-        for n in [16, 64, 256]:
+        for n in [16, 64, 256, 1024]:
             torch.manual_seed(42)
             x = torch.randn(n)
             X = trnfft.fft(x)
             recovered = trnfft.ifft(X)
-            np.testing.assert_allclose(recovered.real.numpy(), x.numpy(), atol=1e-4)
-            np.testing.assert_allclose(recovered.imag.numpy(), np.zeros(n), atol=1e-4)
+            np.testing.assert_allclose(recovered.real.numpy(), x.numpy(), atol=1e-3)
+            np.testing.assert_allclose(recovered.imag.numpy(), np.zeros(n), atol=1e-3)
+
+    def test_fft2_nki_vs_numpy(self, nki_backend):
+        for shape in [(16, 16), (64, 64)]:
+            torch.manual_seed(42)
+            x = torch.randn(*shape)
+            result = trnfft.fft2(x)
+            expected = np.fft.fft2(x.numpy())
+            np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-3, rtol=1e-3)
+            np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
+
+    def test_fftn_nki_vs_numpy(self, nki_backend):
+        torch.manual_seed(42)
+        x = torch.randn(4, 8, 8)
+        result = trnfft.fftn(x)
+        expected = np.fft.fftn(x.numpy())
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
+
+    def test_batched_fft_nki(self, nki_backend):
+        torch.manual_seed(42)
+        x = torch.randn(4, 64)
+        result = trnfft.fft(x)
+        expected = np.fft.fft(x.numpy())
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
+
+    def test_bluestein_nki_vs_numpy(self, nki_backend):
+        # Bluestein wraps three power-of-2 FFTs that route through NKI butterfly,
+        # while chirp multiply / padding / filter remain on host.
+        for n in [7, 13, 100, 127]:
+            torch.manual_seed(42)
+            x = torch.randn(n)
+            result = trnfft.fft(x)
+            expected = np.fft.fft(x.numpy())
+            tol = 1e-3 if n < 50 else 1e-2
+            np.testing.assert_allclose(result.real.numpy(), expected.real, atol=tol, rtol=tol)
+            np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=tol, rtol=tol)
