@@ -13,9 +13,6 @@ on:
           - trn2
           - inf2
 
-env:
-  AWS_PROFILE: aws
-
 jobs:
   neuron-test:
     runs-on: ubuntu-latest
@@ -28,23 +25,67 @@ jobs:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-east-1
+          aws-region: ${{ vars.AWS_REGION }}
 
-      # TODO: Wire to actual Trainium instance via SSM or SSH.
-      # The steps below are a scaffold — replace with your instance access method.
-      #
-      # Example with SSM:
-      #   - name: Run tests on ${{ inputs.instance_type }}
-      #     run: |
-      #       INSTANCE_ID=$(aws ec2 describe-instances \
-      #         --filters "Name=tag:Name,Values=trnfft-ci-${{ inputs.instance_type }}" \
-      #         --query 'Reservations[0].Instances[0].InstanceId' --output text)
-      #       aws ssm send-command --instance-ids $INSTANCE_ID \
-      #         --document-name "AWS-RunShellScript" \
-      #         --parameters 'commands=["cd /home/ubuntu/trnfft && git pull && pip install -e \".[neuron,dev]\" && pytest tests/ -v -m neuron --tb=short"]'
-      - name: Run neuron tests on ${{ inputs.instance_type }}
+      - name: Start instance
+        id: start
         run: |
-          echo "Neuron hardware CI scaffold"
-          echo "Instance type: ${{ inputs.instance_type }}"
-          echo "TODO: Wire to actual ${{ inputs.instance_type }} instance"
-          echo "Expected command: pytest tests/ -v -m neuron --tb=short"
+          INSTANCE_ID=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=trnfft-ci-${{ inputs.instance_type }}" \
+                      "Name=instance-state-name,Values=stopped,running" \
+            --query 'Reservations[0].Instances[0].InstanceId' \
+            --output text)
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "::error::No instance found with tag Name=trnfft-ci-${{ inputs.instance_type }}"
+            exit 1
+          fi
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+          echo "Starting $INSTANCE_ID..."
+          aws ec2 start-instances --instance-ids "$INSTANCE_ID"
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          aws ssm wait instance-information --filters "Key=InstanceIds,Values=$INSTANCE_ID"
+          echo "Instance ready."
+
+      - name: Run neuron tests via SSM
+        id: run
+        run: |
+          INSTANCE_ID="${{ steps.start.outputs.instance_id }}"
+          SHA="${{ github.sha }}"
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "trnfft neuron tests @ $SHA" \
+            --parameters "commands=[
+              \"set -euo pipefail\",
+              \"cd /home/ubuntu/trnfft\",
+              \"git fetch --all\",
+              \"git checkout $SHA\",
+              \"pip install -e '.[neuron,dev]' --quiet\",
+              \"pytest tests/ -v -m neuron --tb=short\"
+            ]" \
+            --output text --query 'Command.CommandId')
+          echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
+          echo "Waiting for command $CMD_ID to complete..."
+          aws ssm wait command-executed \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID"
+
+      - name: Collect output
+        if: always() && steps.run.outputs.command_id != ''
+        run: |
+          INSTANCE_ID="${{ steps.start.outputs.instance_id }}"
+          CMD_ID="${{ steps.run.outputs.command_id }}"
+          echo "=== STDOUT ==="
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text
+          echo "=== STDERR ==="
+          aws ssm get-command-invocation \
+            --command-id "$CMD_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --query 'StandardErrorContent' --output text
+
+      - name: Stop instance
+        if: always() && steps.start.outputs.instance_id != ''
+        run: aws ec2 stop-instances --instance-ids "${{ steps.start.outputs.instance_id }}"
