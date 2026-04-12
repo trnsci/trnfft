@@ -201,12 +201,20 @@ if HAS_NKI:
 
 # --- NKI kernel wrappers ---
 
+def _to_xla(*tensors):
+    """Move a list of tensors to the XLA device."""
+    import torch_xla.core.xla_model as xm
+    device = xm.xla_device()
+    return [t.to(device) for t in tensors], tensors[0].device
+
+
 def _nki_complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     """NKI complex GEMM with stationary reuse."""
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
-    c_real, c_imag = _complex_gemm_kernel(a.real, a.imag, b.real, b.imag)
-    return ComplexTensor(c_real, c_imag)
+    (ar, ai, br, bi), orig_device = _to_xla(a.real, a.imag, b.real, b.imag)
+    c_real, c_imag = _complex_gemm_kernel(ar, ai, br, bi)
+    return ComplexTensor(c_real.to(orig_device), c_imag.to(orig_device))
 
 
 def _nki_complex_mask(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTensor:
@@ -221,5 +229,6 @@ def _nki_complex_mask(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTensor
     total = mask.real.numel()
     if total % 128 != 0:
         return mask * spec
-    c_real, c_imag = _complex_mul_kernel(mask.real, mask.imag, spec.real, spec.imag)
-    return ComplexTensor(c_real, c_imag)
+    (mr, mi, sr, si), orig_device = _to_xla(mask.real, mask.imag, spec.real, spec.imag)
+    c_real, c_imag = _complex_mul_kernel(mr, mi, sr, si)
+    return ComplexTensor(c_real.to(orig_device), c_imag.to(orig_device))

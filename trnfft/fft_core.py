@@ -102,8 +102,13 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
 
 def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
-    """Cooley-Tukey FFT using NKI butterfly kernel on Trainium."""
+    """Cooley-Tukey FFT using NKI butterfly kernel on Trainium.
+
+    Inputs are moved to the XLA device for kernel dispatch, then results
+    are moved back to the original device.
+    """
     from .nki.butterfly import butterfly_stage_kernel
+    import torch_xla.core.xla_model as xm
 
     n = x.shape[-1]
     log2n = int(math.log2(n))
@@ -111,10 +116,13 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
     sign = 1.0 if inverse else -1.0
 
+    device = xm.xla_device()
+    orig_device = x.real.device
+
     # Bit-reversal permutation
     indices = _bit_reverse_indices(n, log2n)
-    re = x.real[..., indices].clone()
-    im = x.imag[..., indices].clone()
+    re = x.real[..., indices].to(device)
+    im = x.imag[..., indices].to(device)
 
     # Run butterfly stages via NKI kernel
     for s in range(log2n):
@@ -122,16 +130,14 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         half = m >> 1
 
         # Precompute twiddle factors for this stage
-        angles = sign * 2.0 * math.pi * torch.arange(half, dtype=re.dtype) / m
-        tw_re = torch.cos(angles)
-        tw_im = torch.sin(angles)
+        angles = sign * 2.0 * math.pi * torch.arange(half, dtype=x.real.dtype) / m
+        tw_re = torch.cos(angles).to(device)
+        tw_im = torch.sin(angles).to(device)
 
-        out_re = re.clone()
-        out_im = im.clone()
-        butterfly_stage_kernel(re, im, tw_re, tw_im, out_re, out_im, n, s)
-        re = out_re
-        im = out_im
+        re, im = butterfly_stage_kernel(re, im, tw_re, tw_im, n, s)
 
+    re = re.to(orig_device)
+    im = im.to(orig_device)
     result = ComplexTensor(re, im)
     if inverse:
         result = result * (1.0 / n)

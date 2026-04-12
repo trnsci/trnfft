@@ -25,19 +25,22 @@ if HAS_NKI:
     PMAX = 128
 
     @nki.jit
-    def butterfly_stage_kernel(
-        x_re, x_im, tw_re, tw_im, out_re, out_im,
-        n: int, stage: int,
-    ):
+    def butterfly_stage_kernel(x_re, x_im, tw_re, tw_im, n: int, stage: int):
         """Batched radix-2 butterfly stage with 2D partition layout.
 
         Parameters
         ----------
         x_re, x_im     : [n] input real/imag (HBM)
         tw_re, tw_im   : [half] twiddle factors for this stage (HBM)
-        out_re, out_im : [n] output real/imag (HBM, same shape as input)
         n              : transform size (power of 2)
         stage          : stage index in [0, log2(n))
+
+        Returns
+        -------
+        out_re, out_im : [n] output real/imag (HBM, allocated by the kernel)
+
+        NKI 2.24 requires output buffers to be allocated inside the kernel
+        (parameters are immutable). The shape mirrors the input.
 
         Layout
         ------
@@ -58,6 +61,9 @@ if HAS_NKI:
         half = m >> 1
         num_groups = n // m
 
+        out_re = nl.ndarray((n,), dtype=x_re.dtype, buffer=nl.shared_hbm)
+        out_im = nl.ndarray((n,), dtype=x_im.dtype, buffer=nl.shared_hbm)
+
         # 2D views. Partition dim = num_groups (the gather dim).
         x_re_2d = x_re.reshape((num_groups, m))
         x_im_2d = x_im.reshape((num_groups, m))
@@ -74,7 +80,7 @@ if HAS_NKI:
             # Process each butterfly position k within this partition tile.
             for k in nl.affine_range(half):
                 # Twiddle is a single complex scalar for all groups at position k.
-                t_re_k = nl.load(tw_re[k:k+1])  # shape (1,) → broadcastable
+                t_re_k = nl.load(tw_re[k:k+1])
                 t_im_k = nl.load(tw_im[k:k+1])
 
                 # Even and odd columns. Each load yields a (groups_chunk, 1) tile
@@ -93,3 +99,5 @@ if HAS_NKI:
                 nl.store(out_im_2d[p_off:p_end, k:k+1], value=e_im + prod_im)
                 nl.store(out_re_2d[p_off:p_end, k+half:k+half+1], value=e_re - prod_re)
                 nl.store(out_im_2d[p_off:p_end, k+half:k+half+1], value=e_im - prod_im)
+
+        return out_re, out_im
