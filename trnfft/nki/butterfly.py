@@ -57,12 +57,18 @@ if HAS_NKI:
         out_re_2d = out_re.reshape((num_groups, m))
         out_im_2d = out_im.reshape((num_groups, m))
 
-        # Tile over num_groups in chunks of PMAX.
-        n_partition_tiles = (num_groups + PMAX - 1) // PMAX
+        # NKI affine_range can't evaluate min() symbolically, so use a constant
+        # chunk size. For all power-of-2 transforms with num_groups <= 128 this
+        # is one tile; otherwise num_groups is always a multiple of 128, so the
+        # division is exact and no tail tile is needed.
+        groups_chunk = num_groups if num_groups <= PMAX else PMAX
+        assert num_groups % groups_chunk == 0, \
+            f"num_groups={num_groups} not divisible by chunk size {groups_chunk}"
+        n_partition_tiles = num_groups // groups_chunk
 
         for p in nl.affine_range(n_partition_tiles):
-            p_off = p * PMAX
-            p_end = min(p_off + PMAX, num_groups)
+            p_off = p * groups_chunk
+            p_end = p_off + groups_chunk  # constant slice size
 
             # Process each butterfly position k within this partition tile.
             for k in nl.affine_range(half):

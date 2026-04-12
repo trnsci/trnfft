@@ -126,9 +126,13 @@ if HAS_NKI:
                     br = nl.load(b_real[k_off:k_off+TILE_K, n_off:n_off+TILE_N])
                     bi = nl.load(b_imag[k_off:k_off+TILE_K, n_off:n_off+TILE_N])
 
-                    # C_real += A_real @ B_real  -  A_imag @ B_imag
+                    # NKI 2.24 doesn't support `psum -=` inside affine_range;
+                    # use Vector Engine to negate B_imag, then accumulate with +=.
+                    neg_bi = nl.negate(bi)
+
+                    # C_real += A_real @ B_real  +  A_imag @ (-B_imag)
                     psum_cr[...] += nisa.nc_matmul(ar_t, br)
-                    psum_cr[...] -= nisa.nc_matmul(ai_t, bi)
+                    psum_cr[...] += nisa.nc_matmul(ai_t, neg_bi)
 
                     # C_imag += A_real @ B_imag  +  A_imag @ B_real
                     psum_ci[...] += nisa.nc_matmul(ar_t, bi)
