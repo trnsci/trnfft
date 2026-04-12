@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-12
+
+### Added
+
+- Fused NKI 4-real-matmul kernel `_complex_linear_kernel` for `ComplexLinear` — loads activations once, streams W_real/W_imag against both phases. `ComplexLinear.forward()` now dispatches to NKI when `set_backend("nki")` is active (previously always took the 4 separate `nn.Linear` PyTorch path).
+- `complex_linear()` exposed in `trnfft.nki` package.
+- 9 new neuron-marked tests, bringing hardware coverage from 4 to **13 tests**: ComplexLinear NKI vs PyTorch, ComplexConv1d/ModReLU PyTorch fallback, STFT shape + ISTFT roundtrip, fft2 (2D), fftn (3D), batched FFT, Bluestein arbitrary sizes (7, 13, 100, 127), FFT at 4096/16384 to exercise multi-partition tiling.
+- GEMM hardware shape coverage extended to (512, 512) and (1024, 1024).
+
+### Changed
+
+- `_cooley_tukey_nki` now handles batched input (N-D) by flattening leading dims and iterating row-by-row, so STFT, fft2, fftn, and batched 1D FFT all route through the NKI butterfly kernel.
+- Replaced deprecated `xm.xla_device()` with `torch_xla.device()` (eliminates 12 deprecation warnings per neuron test run).
+
 ## [0.5.0] - 2026-04-12
 
 ### Added
@@ -88,7 +102,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Speech enhancement example using complex ideal ratio mask (cIRM).
 - 83 tests covering arithmetic, FFT correctness, STFT, NN layers, and gradients.
 
-[Unreleased]: https://github.com/scttfrdmn/trnfft/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/trnfft/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/scttfrdmn/trnfft/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/scttfrdmn/trnfft/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/scttfrdmn/trnfft/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/scttfrdmn/trnfft/compare/v0.2.0...v0.3.0
