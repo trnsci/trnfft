@@ -133,7 +133,7 @@ NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https
 |---------|------|
 | [neuron-complex-ops](https://github.com/scttfrdmn/neuron-complex-ops) | Original proof-of-concept (now folded into this library) |
 | [trnblas](https://github.com/scttfrdmn/trnblas) | BLAS for Trainium (Level 1-3, DF-MP2 use case) |
-| [trnrand](https://github.com/scttfrdmn/trnrand) | Random number generation (Philox/Sobol) for Trainium |
+| [trnrand](https://github.com/trnsci/trnrand) | Random number generation (Philox/Sobol) for Trainium |
 | trnsolver *(planned)* | Linear solvers and eigendecomposition for Trainium |
 
 ## License
