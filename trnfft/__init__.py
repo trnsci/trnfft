@@ -3,7 +3,7 @@ trnfft — FFT and complex-valued operations for AWS Trainium via NKI.
 
 Drop-in replacement for torch.fft on Trainium hardware.
 Includes complex neural network layers for speech/audio/physics workloads.
-Part of the trn-* scientific computing suite by Playground Logic.
+Part of the trnsci scientific computing suite.
 
 Incorporates neuron-complex-ops (ComplexTensor, NKI dispatch, complex NN layers).
 """

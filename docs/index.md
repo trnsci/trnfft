@@ -4,7 +4,7 @@ FFT and complex-valued tensor operations for AWS Trainium via NKI.
 
 Trainium has no native complex number support and ships no FFT library. **trnfft** fills that gap with split real/imaginary representation, complex neural network layers, and NKI kernels optimized for the NeuronCore architecture.
 
-Part of the **trn-\*** scientific computing suite by [Playground Logic](https://playgroundlogic.co).
+Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
 ## Features
 
@@ -27,4 +27,4 @@ recovered = trnfft.ifft(X)
 
 ## License
 
-Apache 2.0 — Copyright 2026 Scott Friedman / Playground Logic LLC
+Apache 2.0 — Copyright 2026 Scott Friedman

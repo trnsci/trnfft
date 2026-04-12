@@ -88,7 +88,7 @@ def complex_mask_apply(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTenso
 
 
 # --- NKI kernels ---
-# Ported from neuron-complex-ops/kernels.py (Apache 2.0, Playground Logic LLC)
+# Ported from neuron-complex-ops/kernels.py (Apache 2.0)
 
 if HAS_NKI:
 
