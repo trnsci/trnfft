@@ -1,9 +1,9 @@
 # trnfft
 
-[![CI](https://github.com/scttfrdmn/trnfft/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/trnfft/actions/workflows/ci.yml)
+[![CI](https://github.com/trnsci/trnfft/actions/workflows/ci.yml/badge.svg)](https://github.com/trnsci/trnfft/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/trnfft)](https://pypi.org/project/trnfft/)
 [![Python](https://img.shields.io/pypi/pyversions/trnfft)](https://pypi.org/project/trnfft/)
-[![License](https://img.shields.io/github/license/scttfrdmn/trnfft)](LICENSE)
+[![License](https://img.shields.io/github/license/trnsci/trnfft)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-mkdocs-blue)](https://scttfrdmn.github.io/trnfft/)
 
 FFT and complex-valued tensor operations for AWS Trainium via NKI.

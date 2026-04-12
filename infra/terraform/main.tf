@@ -122,7 +122,7 @@ resource "aws_instance" "ci" {
     #!/bin/bash
     set -euxo pipefail
     cd /home/ubuntu
-    sudo -u ubuntu git clone https://github.com/scttfrdmn/trnfft.git trnfft
+    sudo -u ubuntu git clone https://github.com/trnsci/trnfft.git trnfft
     # Install into the AMI's pre-built Neuron venv (has neuronxcc preinstalled).
     # Use [dev] only — [neuron] would try to fetch neuronxcc from PyPI where it doesn't exist.
     NEURON_VENV=$(ls -d /opt/aws_neuronx_venv_pytorch_* | head -1)

@@ -20,7 +20,7 @@ The `trnfft[neuron]` extra is only useful when building a custom Neuron environm
 ## Development install
 
 ```bash
-git clone https://github.com/scttfrdmn/trnfft.git
+git clone https://github.com/trnsci/trnfft.git
 cd trnfft
 pip install -e ".[dev]"
 pytest tests/ -v
