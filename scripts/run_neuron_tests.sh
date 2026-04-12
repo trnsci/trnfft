@@ -28,7 +28,7 @@ SHA="$(git rev-parse HEAD)"
 echo "Looking up instance with Name=$TAG in $REGION..."
 INSTANCE_ID=$(aws ec2 describe-instances \
   --filters "Name=tag:Name,Values=$TAG" \
-            "Name=instance-state-name,Values=stopped,running,pending" \
+            "Name=instance-state-name,Values=stopped,stopping,running,pending" \
   --query 'Reservations[0].Instances[0].InstanceId' \
   --output text \
   --region "$REGION")
@@ -52,6 +52,12 @@ trap cleanup EXIT
 
 STATE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
   --query 'Reservations[0].Instances[0].State.Name' --output text)
+
+if [[ "$STATE" == "stopping" ]]; then
+  echo "Instance is stopping; waiting for stopped state..."
+  aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID" --region "$REGION"
+  STATE="stopped"
+fi
 
 if [[ "$STATE" == "stopped" ]]; then
   echo "Starting instance..."
