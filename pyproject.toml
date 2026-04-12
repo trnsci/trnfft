@@ -43,7 +43,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/trnsci/trnfft"
-Documentation = "https://scttfrdmn.github.io/trnfft/"
+Documentation = "https://trnsci.github.io/trnfft/"
 Repository = "https://github.com/trnsci/trnfft"
 Issues = "https://github.com/trnsci/trnfft/issues"
 

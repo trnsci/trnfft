@@ -4,7 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/trnfft)](https://pypi.org/project/trnfft/)
 [![Python](https://img.shields.io/pypi/pyversions/trnfft)](https://pypi.org/project/trnfft/)
 [![License](https://img.shields.io/github/license/trnsci/trnfft)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-mkdocs-blue)](https://scttfrdmn.github.io/trnfft/)
+[![Docs](https://img.shields.io/badge/docs-mkdocs-blue)](https://trnsci.github.io/trnfft/)
 
 FFT and complex-valued tensor operations for AWS Trainium via NKI.
 
@@ -100,11 +100,11 @@ y = layer(x)
 
 ## Hardware compatibility
 
-NKI kernels are validated against **Neuron SDK 2.24+** on the **Deep Learning AMI Neuron PyTorch 2.9 (Ubuntu 24.04)** AMI (20260410 or later). See [docs/installation.md](https://scttfrdmn.github.io/trnfft/installation/#hardware-compatibility) for the full compatibility matrix.
+NKI kernels are validated against **Neuron SDK 2.24+** on the **Deep Learning AMI Neuron PyTorch 2.9 (Ubuntu 24.04)** AMI (20260410 or later). See [docs/installation.md](https://trnsci.github.io/trnfft/installation/#hardware-compatibility) for the full compatibility matrix.
 
 ## Benchmarks
 
-NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https://scttfrdmn.github.io/trnfft/benchmarks/) for the latest numbers.
+NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https://trnsci.github.io/trnfft/benchmarks/) for the latest numbers.
 
 ## Status
 
