@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-04-12
+
+### Added
+
+- Three-baseline benchmark suite (`benchmarks/bench_fft.py`) — NKI vs trnfft-PyTorch vs raw `torch.*` — covering 1D FFT, fft2, fftn, batched FFT, Bluestein, STFT, complex GEMM, ComplexLinear, and complex mask apply across multiple shapes (70 cases total).
+- `scripts/run_benchmarks.sh` — starts the trn1 instance, runs the suite under SSM, fetches results, stops the instance.
+- `scripts/bench_to_md.py` and `scripts/bench_text_to_md.py` — convert pytest-benchmark output (JSON or pretty-printed text) into the markdown table for `docs/benchmarks.md`.
+- `docs/benchmarks.md` — methodology, results table, and findings section. Linked from README and mkdocs nav.
+- `docs/benchmark_results/v0.7.0.txt` — raw captured output from the v0.7.0 hardware run for reproducibility.
+
+### Findings (v0.7.0 hardware run on trn1.2xlarge)
+
+- NKI is 2-11× faster than the trnfft PyTorch fallback for single 1D FFT (n ≥ 256), 2-10× for Bluestein, and 3-4× for complex GEMM ≥ 1024².
+- Multi-call paths (fftn, fft2, batched 1D FFT, STFT) are catastrophically slow on NKI right now (50-1600× slower) because `_cooley_tukey_nki` loops over batch rows in Python — filed as #38 (batched butterfly kernel).
+- Small ops are dispatch-bound; host CPU wins below per-op thresholds.
+- Detailed table and analysis in `docs/benchmarks.md`.
+
 ## [0.6.0] - 2026-04-12
 
 ### Added
@@ -102,7 +119,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Speech enhancement example using complex ideal ratio mask (cIRM).
 - 83 tests covering arithmetic, FFT correctness, STFT, NN layers, and gradients.
 
-[Unreleased]: https://github.com/scttfrdmn/trnfft/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/scttfrdmn/trnfft/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/scttfrdmn/trnfft/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/scttfrdmn/trnfft/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/scttfrdmn/trnfft/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/scttfrdmn/trnfft/compare/v0.3.0...v0.4.0
