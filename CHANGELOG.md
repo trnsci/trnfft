@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-04-13
+
+### Added
+
+- `rfft2(input, s=None)` — 2D FFT of a real signal; output shape `(..., M, N//2 + 1)` (Closes #48).
+- `irfft2(input, s=None)` — inverse of `rfft2`, Hermitian-reconstructs the last dim.
+- `rfftn(input, s=None, dim=None)` — N-D FFT of a real signal.
+- `irfftn(input, s=None, dim=None)` — inverse of `rfftn`.
+- 6 new CPU tests in `TestRFFTnD` covering vs-numpy correctness, roundtrips, default shape inference, and `s=` padding/truncation.
+
+### Changed
+
+- API coverage note in README and docs/index.md updated: trnfft now implements **13 of ~15** common `torch.fft` transforms. Only `hfft` and `ihfft` (Hermitian-input variants) remain unimplemented.
+
 ## [0.9.0] - 2026-04-13
 
 ### Fixed
@@ -177,7 +191,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Speech enhancement example using complex ideal ratio mask (cIRM).
 - 83 tests covering arithmetic, FFT correctness, STFT, NN layers, and gradients.
 
-[Unreleased]: https://github.com/trnsci/trnfft/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/trnsci/trnfft/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/trnsci/trnfft/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/trnsci/trnfft/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/trnsci/trnfft/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/trnsci/trnfft/compare/v0.6.0...v0.7.0

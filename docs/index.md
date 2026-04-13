@@ -8,7 +8,7 @@ Part of the trnsci scientific computing suite ([github.com/trnsci](https://githu
 
 ## Features
 
-- **`torch.fft`-compatible API** — `fft`, `ifft`, `rfft`, `irfft`, `fft2`, `fftn`, `ifftn`, `stft`, `istft` (9 of 12; real-FFT variants `hfft`, `ihfft`, `rfft2`, `irfft2`, `rfftn`, `irfftn` are on the roadmap)
+- **`torch.fft`-compatible API** — `fft`, `ifft`, `rfft`, `irfft`, `fft2`, `rfft2`, `irfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `stft`, `istft` (13 of ~15; `hfft` and `ihfft` — Hermitian-input variants — are the only transforms not implemented)
 - **ComplexTensor** — split real/imaginary representation with full arithmetic
 - **Complex NN layers** — `ComplexLinear`, `ComplexConv1d`, `ComplexBatchNorm1d`, `ComplexModReLU`
 - **NKI acceleration** — butterfly FFT, complex GEMM, ComplexLinear, and fused multiply kernels for Trainium. Validated on trn1.2xlarge; beats vanilla `torch.fft` for STFT and batched FFT. See [Benchmarks](benchmarks.md).

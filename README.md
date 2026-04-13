@@ -108,18 +108,17 @@ NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https
 
 ## Status
 
-**v0.8.0** — NKI butterfly, GEMM, complex-multiply, and ComplexLinear kernels are validated on trn1.2xlarge. For STFT and batched FFT, `set_backend("nki")` now beats vanilla `torch.fft.fft`. See [benchmarks](https://trnsci.github.io/trnfft/benchmarks/) for the full picture.
+**v0.10.0** — NKI kernels validated on trn1.2xlarge. For STFT and batched FFT, `set_backend("nki")` beats vanilla `torch.fft.fft`. See [benchmarks](https://trnsci.github.io/trnfft/benchmarks/) for the full picture.
 
-**API coverage** (9 of 12 `torch.fft` functions):
-`fft`, `ifft`, `rfft`, `irfft`, `fft2`, `fftn`, `ifftn`, `stft`, `istft`.
-Not yet: `hfft`, `ihfft`, `rfft2`, `irfft2`, `rfftn`, `irfftn` (tracked for v0.10.0+).
+**API coverage** (13 common `torch.fft` functions):
+`fft`, `ifft`, `rfft`, `irfft`, `fft2`, `rfft2`, `irfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `stft`, `istft`.
+Not implemented: `hfft`, `ihfft` — Hermitian-input variants; rare in practice. [File an issue](https://github.com/trnsci/trnfft/issues) if you need them.
 
 **Roadmap**
 - NKI `ComplexConv1d` / `ComplexModReLU` kernels (today both fall back to PyTorch on NKI)
 - BF16 / FP16 support across NKI kernels
 - Multi-NeuronCore parallelism (scaffold in `trnfft/nki/multicore.py`)
 - SBUF-resident dispatch to reduce small-op overhead
-- Remaining `torch.fft` functions
 
 ## Related projects in the trnsci suite
 
