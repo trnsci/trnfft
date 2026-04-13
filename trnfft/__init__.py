@@ -8,7 +8,7 @@ Part of the trnsci scientific computing suite.
 Incorporates neuron-complex-ops (ComplexTensor, NKI dispatch, complex NN layers).
 """
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 from .api import (
     fft, ifft, rfft, irfft,

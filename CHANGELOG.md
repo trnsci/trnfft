@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-04-13
+
+### Fixed
+
+- **NKI kernels now preserve autograd** (#56). Prior to this release, any training loop that touched a NKI code path (`ComplexLinear`, `trnfft.fft`/`stft` with `set_backend("nki")`, `complex_gemm`, or `complex_mask_apply`) silently detached the autograd graph because `@nki.jit`-decorated kernels returned raw tensors from `nl.shared_hbm` with no `grad_fn`. `loss.backward()` raised `RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn`. The workaround was `trnfft.set_backend("pytorch")`, which bypassed NKI entirely.
+
+  Fix: new `trnfft/nki/autograd.py` with `torch.autograd.Function` subclasses — `_ComplexMulFn`, `_ComplexGEMMFn`, `_ComplexLinearFn`, `_FFTFn` — whose `forward` calls the NKI kernel and whose `backward` emits the analytic adjoint. For complex mul / GEMM / Linear the adjoint is the conjugate-transposed version of forward; for FFT the adjoint is IFFT scaled by `n` (and vice versa). Backward is implemented via standard PyTorch ops on the same device as forward; backward-on-NKI is a possible future optimization.
+
+- Three neuron-marked gradient tests in `TestNKIGradients` cover ComplexLinear, 1D FFT, and STFT end-to-end training paths on trn1.2xlarge.
+
 ## [0.10.0] - 2026-04-13
 
 ### Added
@@ -191,7 +201,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Speech enhancement example using complex ideal ratio mask (cIRM).
 - 83 tests covering arithmetic, FFT correctness, STFT, NN layers, and gradients.
 
-[Unreleased]: https://github.com/trnsci/trnfft/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/trnsci/trnfft/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/trnsci/trnfft/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/trnsci/trnfft/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/trnsci/trnfft/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/trnsci/trnfft/compare/v0.7.0...v0.8.0
