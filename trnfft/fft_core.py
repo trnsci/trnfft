@@ -124,11 +124,16 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
 #   straight win — asymmetric hardware affordances flip the usual
 #   complexity-vs-constant tradeoff.
 #
-#   Threshold set conservatively at 128 = one PSUM tile
-#   (TILE_K=TILE_M=128 in `_complex_gemm_kernel`). At the threshold, CT
-#   would do 7 butterfly stages + bit-reversal; DFT-GEMM does one matmul.
-#   Empirical threshold refinement is the v0.12 milestone-1 output.
-_DFT_GEMM_THRESHOLD = 128
+#   Threshold is a probe value during v0.12 Thread A. Set to 16384
+#   ("always DFT-GEMM up to the tested ceiling") so batched FFT and STFT
+#   — both of which flatten to (B, N) and flow through this path — pick
+#   up the same launch-count win the small-N bench demonstrated. Final
+#   threshold will be set to the measured crossover once the widened
+#   bench sweep lands. The `_complex_gemm_kernel` already tiles K
+#   internally, so correctness at N > 128 is expected to fall through
+#   for free; the empirical question is where partition-dim
+#   underutilization at M=1 starts to eat the launch-count advantage.
+_DFT_GEMM_THRESHOLD = 16384
 
 
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
