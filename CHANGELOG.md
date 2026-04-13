@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `stft` frame extraction no longer uses `torch.Tensor.unfold`, which has no XLA backend implementation in torch-xla 2.9 / torch-neuronx and raised `RuntimeError: The operator aten::unfold appears to be a view operator, but it has no implementation for the backend "xla:0"`. Replaced with explicit `torch.arange`-based index construction, which is device-agnostic and works on CPU, CUDA, MPS, and XLA/Trainium without branching.
+
 ## [0.7.0] - 2026-04-12
 
 ### Added
