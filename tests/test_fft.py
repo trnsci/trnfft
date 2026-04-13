@@ -378,3 +378,28 @@ class TestNKIFFT:
             tol = 1e-3 if n < 50 else 1e-2
             np.testing.assert_allclose(result.real.numpy(), expected.real, atol=tol, rtol=tol)
             np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=tol, rtol=tol)
+
+    def test_kahan_butterfly_compiles_and_matches_fast(self, nki_backend):
+        # Compile + sanity check for the Dekker-2Prod butterfly variant.
+        # Kahan is a precision tightening, not a different answer — it should
+        # agree with "fast" to ~FP32 rtol on typical inputs. On-silicon
+        # precision characterization (does kahan actually help FP32?) is a
+        # separate follow-up — here we just confirm it compiles and doesn't
+        # diverge.
+        from trnfft import set_precision, get_precision
+        old = get_precision()
+        try:
+            torch.manual_seed(42)
+            x = torch.randn(1024)
+            set_precision("fast")
+            y_fast = trnfft.fft(x)
+            set_precision("kahan")
+            y_kahan = trnfft.fft(x)
+            np.testing.assert_allclose(
+                y_kahan.real.numpy(), y_fast.real.numpy(), atol=1e-3, rtol=1e-3
+            )
+            np.testing.assert_allclose(
+                y_kahan.imag.numpy(), y_fast.imag.numpy(), atol=1e-3, rtol=1e-3
+            )
+        finally:
+            set_precision(old)
