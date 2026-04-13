@@ -42,6 +42,7 @@ def _warm(fn, *args, **kwargs):
 # 1D FFT
 # ---------------------------------------------------------------------------
 
+
 class TestFFT1D:
     @pytest.mark.neuron
     def test_fft_nki(self, benchmark, random_signal):
@@ -74,6 +75,7 @@ class TestFFT1D:
 #
 # Force path selection by toggling fft_core._DFT_GEMM_THRESHOLD.
 
+
 @pytest.fixture(params=[8, 16, 32, 64, 128, 256, 512, 1024, 2048])
 def small_fft_size(request):
     return request.param
@@ -91,6 +93,7 @@ class TestFFT1DSmallN:
     @pytest.mark.neuron
     def test_fft_nki_dft_gemm(self, benchmark, small_random_signal):
         from trnfft import fft_core
+
         old = fft_core._DFT_GEMM_THRESHOLD
         fft_core._DFT_GEMM_THRESHOLD = 1 << 30  # force DFT-GEMM path
         _set("nki")
@@ -104,6 +107,7 @@ class TestFFT1DSmallN:
     @pytest.mark.neuron
     def test_fft_nki_butterfly(self, benchmark, small_random_signal):
         from trnfft import fft_core
+
         old = fft_core._DFT_GEMM_THRESHOLD
         fft_core._DFT_GEMM_THRESHOLD = 0  # force butterfly path
         _set("nki")
@@ -118,6 +122,7 @@ class TestFFT1DSmallN:
 # ---------------------------------------------------------------------------
 # 2D FFT
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(params=[(64, 64), (256, 256), (1024, 1024)])
 def fft2_shape(request):
@@ -155,6 +160,7 @@ class TestFFT2D:
 # 3D FFT
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(params=[(8, 16, 16), (32, 64, 64)])
 def fftn_shape(request):
     return request.param
@@ -190,6 +196,7 @@ class TestFFTN:
 # ---------------------------------------------------------------------------
 # Batched 1D FFT
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(params=[(32, 1024), (128, 1024)])
 def batched_shape(request):
@@ -227,6 +234,7 @@ class TestBatchedFFT:
 # Bluestein (arbitrary-size FFT)
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(params=[127, 997, 4097])
 def bluestein_size(request):
     return request.param
@@ -263,6 +271,7 @@ class TestBluestein:
 # STFT
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def waveform():
     torch.manual_seed(42)
@@ -290,13 +299,13 @@ class TestSTFT:
             _set("auto")
 
     def test_stft_torch(self, benchmark, waveform):
-        benchmark(torch.stft, waveform, n_fft=self.N_FFT,
-                  hop_length=self.HOP, return_complex=True)
+        benchmark(torch.stft, waveform, n_fft=self.N_FFT, hop_length=self.HOP, return_complex=True)
 
 
 # ---------------------------------------------------------------------------
 # Complex GEMM
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(params=[128, 256, 512, 1024])
 def gemm_size(request):
@@ -306,10 +315,8 @@ def gemm_size(request):
 @pytest.fixture
 def gemm_complex_pair(gemm_size):
     torch.manual_seed(42)
-    a = ComplexTensor(torch.randn(gemm_size, gemm_size),
-                      torch.randn(gemm_size, gemm_size))
-    b = ComplexTensor(torch.randn(gemm_size, gemm_size),
-                      torch.randn(gemm_size, gemm_size))
+    a = ComplexTensor(torch.randn(gemm_size, gemm_size), torch.randn(gemm_size, gemm_size))
+    b = ComplexTensor(torch.randn(gemm_size, gemm_size), torch.randn(gemm_size, gemm_size))
     return a, b
 
 
@@ -317,6 +324,7 @@ class TestComplexGEMM:
     @pytest.mark.neuron
     def test_gemm_nki(self, benchmark, gemm_complex_pair):
         from trnfft.nki import complex_gemm
+
         a, b = gemm_complex_pair
         _set("nki")
         try:
@@ -340,6 +348,7 @@ class TestComplexGEMM:
 # ComplexLinear forward
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(params=[(128, 256), (512, 1024)])
 def linear_shape(request):
     return request.param
@@ -351,8 +360,7 @@ def linear_layer_and_input(linear_shape):
     torch.manual_seed(42)
     layer = ComplexLinear(in_features, out_features, bias=True)
     # Batch dim chosen as in_features for a square activation tile.
-    x = ComplexTensor(torch.randn(in_features, in_features),
-                      torch.randn(in_features, in_features))
+    x = ComplexTensor(torch.randn(in_features, in_features), torch.randn(in_features, in_features))
     return layer, x
 
 
@@ -380,6 +388,7 @@ class TestComplexLinear:
 # Complex element-wise multiply (mask apply)
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(params=[(64, 32), (256, 128), (1024, 512)])
 def mask_shape(request):
     return request.param
@@ -397,6 +406,7 @@ class TestComplexMask:
     @pytest.mark.neuron
     def test_mask_nki(self, benchmark, mask_pair):
         from trnfft.nki import complex_mask_apply
+
         mask, spec = mask_pair
         _set("nki")
         try:

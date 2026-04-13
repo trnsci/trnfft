@@ -11,8 +11,10 @@ Usage:
 """
 
 import argparse
+
 import torch
 import torch.nn as nn
+
 from trnfft import ComplexTensor, stft
 from trnfft.nn import ComplexLinear, ComplexModReLU
 
@@ -98,15 +100,16 @@ def main():
         enhanced = mask * noisy_spec
 
         # MSE loss on real and imaginary parts
-        loss = ((enhanced.real - clean_spec.real) ** 2 +
-                (enhanced.imag - clean_spec.imag) ** 2).mean()
+        loss = (
+            (enhanced.real - clean_spec.real) ** 2 + (enhanced.imag - clean_spec.imag) ** 2
+        ).mean()
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
         if (epoch + 1) % max(1, args.epochs // 10) == 0:
-            print(f"Epoch {epoch+1}/{args.epochs}  loss={loss.item():.6f}")
+            print(f"Epoch {epoch + 1}/{args.epochs}  loss={loss.item():.6f}")
 
     print("Training complete.")
 

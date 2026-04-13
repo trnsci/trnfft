@@ -24,6 +24,7 @@ def random_signal(fft_size):
 def random_complex_matrix(gemm_size):
     torch.manual_seed(42)
     from trnfft import ComplexTensor
+
     return ComplexTensor(
         torch.randn(gemm_size, gemm_size),
         torch.randn(gemm_size, gemm_size),

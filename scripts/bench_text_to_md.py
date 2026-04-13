@@ -76,7 +76,7 @@ def render_markdown(rows: dict) -> str:
         "| Operation | Param | NKI | trnfft-PyTorch | torch.* | NKI vs PyT |",
         "|-----------|-------|----:|---------------:|--------:|----------:|",
     ]
-    for (op, param) in sorted(rows.keys(), key=lambda k: (k[0], k[1])):
+    for op, param in sorted(rows.keys(), key=lambda k: (k[0], k[1])):
         v = rows[(op, param)]
         nki = v.get("nki")
         pyt = v.get("trnfft_pytorch")
@@ -87,7 +87,7 @@ def render_markdown(rows: dict) -> str:
         torch_str = f"{torch_v:,.1f}" if torch_v is not None else "—"
         if nki is not None and pyt is not None:
             ratio = pyt / nki
-            speedup = f"{ratio:.2f}× faster" if ratio >= 1.0 else f"{1/ratio:.2f}× slower"
+            speedup = f"{ratio:.2f}× faster" if ratio >= 1.0 else f"{1 / ratio:.2f}× slower"
         else:
             speedup = "—"
         out.append(f"| {op} | {param_disp} | {nki_str} | {pyt_str} | {torch_str} | {speedup} |")

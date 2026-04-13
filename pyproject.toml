@@ -56,7 +56,7 @@ include = ["trnfft*"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-extend-exclude = ["docs/benchmark_results"]
+extend-exclude = ["docs/benchmark_results", "scripts"]
 
 [tool.ruff.lint]
 select = [
