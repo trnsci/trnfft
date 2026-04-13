@@ -124,7 +124,15 @@ NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https
 
 **API coverage** (13 common `torch.fft` functions):
 `fft`, `ifft`, `rfft`, `irfft`, `fft2`, `rfft2`, `irfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `stft`, `istft`.
-Not implemented: `hfft`, `ihfft` — Hermitian-input variants; rare in practice. [File an issue](https://github.com/trnsci/trnfft/issues) if you need them.
+
+**Not implemented: `hfft`, `ihfft`** — Hermitian-symmetric input variants.
+These assume the input tensor is already conjugate-symmetric (`X[k] = conj(X[N-k])`),
+which in practice means you've post-processed an `rfft` output or are
+reconstructing from a known real signal's spectrum. Both workflows are
+easier expressed with `rfft` / `irfft` plus a manual unpack/pack step.
+If you have a use-case producing Hermitian-symmetric tensors directly,
+[open an issue](https://github.com/trnsci/trnfft/issues) with the
+concrete workload and we'll add them.
 
 **Roadmap**
 - NKI `ComplexConv1d` / `ComplexModReLU` kernels (today both fall back to PyTorch on NKI)

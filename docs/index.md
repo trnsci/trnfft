@@ -8,7 +8,7 @@ Part of the trnsci scientific computing suite ([github.com/trnsci](https://githu
 
 ## Features
 
-- **`torch.fft`-compatible API** — `fft`, `ifft`, `rfft`, `irfft`, `fft2`, `rfft2`, `irfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `stft`, `istft` (13 of ~15; `hfft` and `ihfft` — Hermitian-input variants — are the only transforms not implemented)
+- **`torch.fft`-compatible API** — `fft`, `ifft`, `rfft`, `irfft`, `fft2`, `rfft2`, `irfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `stft`, `istft` (13 of ~15; `hfft` / `ihfft` are not implemented — see the [API stance](#hfft-ihfft-not-implemented) below)
 - **ComplexTensor** — split real/imaginary representation with full arithmetic
 - **Complex NN layers** — `ComplexLinear`, `ComplexConv1d`, `ComplexBatchNorm1d`, `ComplexModReLU`
 - **NKI acceleration** — butterfly FFT, complex GEMM, ComplexLinear, and fused multiply kernels for Trainium. Validated on trn1.2xlarge; beats vanilla `torch.fft` for STFT and batched FFT. See [Benchmarks](benchmarks.md).
@@ -35,6 +35,28 @@ signal = torch.randn(1024)
 X = trnfft.fft(signal)
 recovered = trnfft.ifft(X)
 ```
+
+## `hfft` / `ihfft` — not implemented
+
+The two `torch.fft` functions trnfft doesn't provide are `hfft` (Hermitian
+input → real output) and its inverse `ihfft`. These expect a
+conjugate-symmetric input tensor `X[k] = conj(X[N-k])`, which in practice
+only arises if you've just produced one via `rfft` — at which point the
+natural continuation is `irfft`, not `hfft`.
+
+**When you'd want them:** if your workload *directly* produces a
+Hermitian-symmetric spectrum (e.g., reconstructing a real signal from a
+known symmetric frequency-domain representation) and you don't want the
+manual unpack/pack step that gets you there via `rfft` / `irfft`.
+
+**Workaround today:** pack your symmetric input into the first `N//2+1`
+bins and call `irfft`. Unpack an `rfft` output to the full N bins when a
+Hermitian-input consumer expects it.
+
+**If you need these:** [open an issue](https://github.com/trnsci/trnfft/issues)
+with the concrete workload — the NKI butterfly kernels already implement
+the primitives; it's a matter of adding the normalization + axis
+conventions that match PyTorch.
 
 ## License
 
