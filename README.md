@@ -12,6 +12,18 @@ Trainium has no native complex number support and ships no FFT library. `trnfft`
 
 Incorporates [neuron-complex-ops](https://github.com/scttfrdmn/neuron-complex-ops). Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
+## Current phase
+
+trnfft follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
+
+- **[Phase 1 — correctness](https://github.com/trnsci/trnfft/issues/51)**: **complete as of v0.8.0** (butterfly + complex GEMM kernels hardware-validated on trn1.2xlarge, 70/70 benchmark cases passing).
+- **[Phase 2 — precision](https://github.com/trnsci/trnfft/issues/52)** (next): Kahan / Neumaier compensated summation for long Bluestein chains.
+- **[Phase 3 — perf](https://github.com/trnsci/trnfft/issues/53)**: plan reuse, streaming large FFTs, NEFF cache reuse.
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trnfft/issues/54)**: multi-chip large-N FFT (N > 2²⁰).
+- **[Phase 5 — generation](https://github.com/trnsci/trnfft/issues/55)**: trn2 larger-SBUF butterfly path.
+
+Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1).
+
 ## Why
 
 NVIDIA has cuFFT, cuBLAS, and native `complex64`. Trainium has none of these. Every signal processing, speech enhancement, physics simulation, and spectral method workload on Trainium currently falls back to CPU or requires hand-rolling complex arithmetic. trnfft fixes this.
