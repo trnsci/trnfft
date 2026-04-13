@@ -304,29 +304,29 @@ def _to_xla(*tensors):
 
 
 def _nki_complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
-    """NKI complex GEMM with stationary reuse."""
+    """NKI complex GEMM with stationary reuse (autograd-aware)."""
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
-    (ar, ai, br, bi), orig_device = _to_xla(a.real, a.imag, b.real, b.imag)
-    c_real, c_imag = _complex_gemm_kernel(ar, ai, br, bi)
-    return ComplexTensor(c_real.to(orig_device), c_imag.to(orig_device))
+    from .autograd import complex_gemm_autograd
+    c_real, c_imag = complex_gemm_autograd(a.real, a.imag, b.real, b.imag)
+    return ComplexTensor(c_real, c_imag)
 
 
 def _nki_complex_linear(x: ComplexTensor, w_real: torch.Tensor, w_imag: torch.Tensor) -> ComplexTensor:
-    """NKI complex linear: y = x @ W^T (complex) via fused 4-matmul kernel."""
+    """NKI complex linear: y = x @ W^T (complex) via fused 4-matmul kernel (autograd-aware)."""
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
-    (xr, xi, wr, wi), orig_device = _to_xla(x.real, x.imag, w_real, w_imag)
-    y_real, y_imag = _complex_linear_kernel(xr, xi, wr, wi)
-    return ComplexTensor(y_real.to(orig_device), y_imag.to(orig_device))
+    from .autograd import complex_linear_autograd
+    y_real, y_imag = complex_linear_autograd(x.real, x.imag, w_real, w_imag)
+    return ComplexTensor(y_real, y_imag)
 
 
 def _nki_complex_mask(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTensor:
-    """NKI fused complex mask application.
+    """NKI fused complex mask application (autograd-aware).
 
     The kernel requires total element count divisible by 128 (the Trainium
     Vector Engine partition limit). For inputs that aren't, fall back to
-    PyTorch element-wise multiply.
+    PyTorch element-wise multiply (which is already autograd-safe).
     """
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
@@ -336,9 +336,9 @@ def _nki_complex_mask(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTensor
     # Force contiguous layout before the kernel's reshape to (128, free).
     # Non-contiguous inputs (e.g., from broadcasting or transposed views) break
     # the reshape at NKI compile time even when the logical shape is fine.
-    (mr, mi, sr, si), orig_device = _to_xla(
+    from .autograd import complex_mul_autograd
+    c_real, c_imag = complex_mul_autograd(
         mask.real.contiguous(), mask.imag.contiguous(),
         spec.real.contiguous(), spec.imag.contiguous(),
     )
-    c_real, c_imag = _complex_mul_kernel(mr, mi, sr, si)
-    return ComplexTensor(c_real.to(orig_device), c_imag.to(orig_device))
+    return ComplexTensor(c_real, c_imag)

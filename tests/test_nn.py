@@ -138,3 +138,52 @@ class TestNKILayers:
         y = layer(x)
         assert y.shape == (4, 8)
         assert torch.all(torch.isfinite(y.abs()))
+
+
+@pytest.mark.neuron
+class TestNKIGradients:
+    """Autograd must flow through NKI kernels (#56).
+
+    These tests exercise the ``torch.autograd.Function`` wrappers in
+    ``trnfft/nki/autograd.py``. Before the fix, any of these would raise
+    ``RuntimeError: element 0 of tensors does not require grad and does not
+    have a grad_fn``.
+    """
+
+    def test_complex_linear_nki_grad(self, nki_backend):
+        torch.manual_seed(42)
+        layer = ComplexLinear(128, 256, bias=True)
+        x = ComplexTensor(
+            torch.randn(128, 128, requires_grad=True),
+            torch.randn(128, 128, requires_grad=True),
+        )
+        y = layer(x)
+        loss = (y.real ** 2 + y.imag ** 2).sum()
+        loss.backward()
+        assert layer.W_re.weight.grad is not None
+        assert layer.W_im.weight.grad is not None
+        assert torch.all(torch.isfinite(layer.W_re.weight.grad))
+        assert torch.all(torch.isfinite(layer.W_im.weight.grad))
+        assert x.real.grad is not None
+        assert torch.all(torch.isfinite(x.real.grad))
+
+    def test_fft_nki_grad(self, nki_backend):
+        import trnfft
+        torch.manual_seed(42)
+        x_re = torch.randn(64, requires_grad=True)
+        x = ComplexTensor(x_re)
+        X = trnfft.fft(x)
+        loss = (X.real ** 2 + X.imag ** 2).sum()
+        loss.backward()
+        assert x_re.grad is not None
+        assert torch.all(torch.isfinite(x_re.grad))
+
+    def test_stft_nki_grad(self, nki_backend):
+        import trnfft
+        torch.manual_seed(42)
+        signal = torch.randn(2048, requires_grad=True)
+        S = trnfft.stft(signal, n_fft=128, hop_length=64, center=False)
+        loss = S.abs().sum()
+        loss.backward()
+        assert signal.grad is not None
+        assert torch.all(torch.isfinite(signal.grad))

@@ -102,11 +102,29 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
 
 def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """Autograd-aware entry point for the NKI FFT path.
+
+    Routes through ``_FFTFn`` (``torch.autograd.Function``) so gradients can
+    flow through ``loss.backward()``. The raw forward-only path is
+    :func:`_cooley_tukey_nki_nograd`; the autograd Function uses the analytic
+    adjoint (IFFT*n for FFT, FFT/n for IFFT) rather than auto-diffing the
+    butterfly, which is cheap since FFT is linear.
+    """
+    from .nki.autograd import fft_autograd
+
+    y_real, y_imag = fft_autograd(x.real, x.imag, inverse)
+    return ComplexTensor(y_real, y_imag)
+
+
+def _cooley_tukey_nki_nograd(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Cooley-Tukey FFT using batched NKI butterfly kernel on Trainium.
 
     Accepts any shape; leading dims are flattened into a single batch dim B
     and passed to the kernel as (B, n). The kernel vectorizes across B in a
     single call per stage — no Python loop over batch rows.
+
+    This is the forward-only path (no autograd). Call :func:`_cooley_tukey_nki`
+    instead if autograd support is needed.
     """
     from .nki.butterfly import butterfly_stage_kernel
     import torch_xla
