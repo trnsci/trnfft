@@ -122,11 +122,20 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     B_orig = flat_re.shape[0]
 
     # The NKI kernel's partition tiling uses chunk size PMAX=128 and requires
-    # total_groups = B * num_groups to be divisible by it at every stage. Since
-    # num_groups goes down to 1 at the last stage, B itself must be a multiple
-    # of PMAX. Pad with zeros at the host, strip after the final stage.
+    # total_groups = B * num_groups to be divisible by PMAX at every stage
+    # where total_groups > PMAX. For power-of-2 B and power-of-2 n, every
+    # total_groups value is also a power of 2 — so whenever total_groups > 128
+    # it is automatically divisible by 128. No padding needed.
+    #
+    # For non-power-of-2 B (STFT's num_frames=33, for example), pad B up to
+    # the next multiple of PMAX so the constraint holds. Unbatched FFT
+    # (B=1) is already a power of 2 and takes the zero-copy path.
     PMAX = 128
-    if B_orig % PMAX == 0:
+
+    def _is_pow2(x: int) -> bool:
+        return x > 0 and (x & (x - 1)) == 0
+
+    if _is_pow2(B_orig):
         B = B_orig
         pad_re = flat_re
         pad_im = flat_im
