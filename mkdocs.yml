@@ -1,6 +1,6 @@
 site_name: trnfft
 site_description: FFT and complex-valued tensor operations for AWS Trainium via NKI
-site_url: https://trnsci.github.io/trnfft/
+site_url: https://trnsci.dev/trnfft/
 repo_url: https://github.com/trnsci/trnfft
 repo_name: trnsci/trnfft
 
