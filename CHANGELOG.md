@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-04-13
+
+### Added
+
+- **Precision modes for Bluestein FFT** (#52, partial). New `trnfft.set_precision(mode)` API selects between:
+  - `"fast"` (default, unchanged): existing FP32 path.
+  - `"double"`: promotes Bluestein host math to FP64, casts back on exit. Empirically 5.5e-13 rel error at n=500 and 7.5e-9 at n=8193 — 10+ orders of magnitude better than `"fast"` (which accumulates ~2.5e-4 rel at n=500, ~2.2e-3 at n=8193). Power-of-2 Cooley-Tukey is unaffected; FFTs inside Bluestein stay on PyTorch because NKI kernels are FP32-only.
+  - `"kahan"`: Dekker 2Prod compensated complex multiply at the two chirp multiplies and at the inner Y*H product; NKI butterfly kernel has a matching `butterfly_stage_kernel_kahan` variant (~2× butterfly op count). On CPU `"kahan"` equals `"fast"` because the chirp multiplies aren't the dominant error source — the 3-FFT butterfly chain is. The kahan kernel compiles and matches fast-mode output on silicon (validated on trn1 against NKI 2.24.5133.0); on-silicon precision characterization is deferred to v0.12.
+
+- 10 new CPU tests in `TestBluesteinsPrecision` covering fast/double correctness and the precision-setter API; 1 new neuron-marked test `test_kahan_butterfly_compiles_and_matches_fast` exercising the Dekker butterfly kernel on trn1.
+
+- Architecture doc gains a Precision modes section with per-mode error/cost table.
+
+### Changed
+
+- Precision is threaded through `fft_core` → `_cooley_tukey` → `_cooley_tukey_nki` → `_cooley_tukey_nki_nograd`, and through the `_FFTFn` autograd wrapper so gradients respect the chosen mode.
+
 ## [0.10.1] - 2026-04-13
 
 ### Fixed
