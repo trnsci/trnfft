@@ -22,3 +22,7 @@ site/
 *.tfstate
 *.tfstate.backup
 .terraform.lock.hcl
+
+# Build artifacts
+site/
+files*.zip
