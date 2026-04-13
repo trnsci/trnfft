@@ -51,9 +51,15 @@ v0.8.0 shipped the batched `(B, n)` butterfly kernel, the single biggest gap in 
 
 - **Small operations** (mask 64×32, GEMM 128, ComplexLinear 128→256) remain dispatch-bound. Host CPU wins by 5-100×. Tracked as #40 (SBUF-resident dispatch).
 - **Very large 2D/3D FFT** (fft2 1024×1024, fftn): NKI is now only 1.2-3.5× slower than PyTorch (down from 60-1600× in v0.7.0), but PyTorch still wins on pure throughput.
-- **Complex mask at 1024×512** still triggers a compile error — tracked as #39.
+- **Complex mask at 1024×512** — fixed in v0.9.0; compiles and runs, but still 5.7× slower than CPU (dispatch-bound like the smaller mask shapes).
 
 The bottom line for v0.8.0: **trnfft-NKI is now the right default for STFT and batched FFT on Trainium**, and a clear win over the trnfft PyTorch fallback across most of the API. For small ops and 2D/3D FFT at very large sizes, keep using `set_backend("pytorch")`.
+
+## What changed in v0.9.0
+
+- **#39 fixed**: `_complex_mul_kernel` at 1024×512 now compiles and runs (prior `min()` in `affine_range` pattern matched the v0.8.0 butterfly bug). All 70/70 benchmarks pass for the first time. See the `mask | mask_shape2` row for the new number.
+- **Docs refreshed**: README status banner, Related Projects table, and CLAUDE.md now reflect the matured trn-* suite (all 6 siblings + umbrella on PyPI).
+- No kernel perf changes expected; the numbers above match v0.8.0 within run-to-run variance.
 
 ## Results
 
@@ -65,31 +71,31 @@ _All times in microseconds (μs); lower is better. Speedup is trnfft-PyTorch / N
 
 | Operation | Param | NKI | trnfft-PyTorch | torch.* | NKI vs PyT |
 |-----------|-------|----:|---------------:|--------:|----------:|
-| batched_fft | batched_shape0 | 25,103.3 | 94,806.8 | 48.9 | 3.78× faster |
-| batched_fft | batched_shape1 | 52,422.6 | 104,750.5 | 79.2 | 2.00× faster |
-| bluestein | 127 | 31,553.4 | 66,740.6 | 14.0 | 2.12× faster |
-| bluestein | 4097 | 435,055.6 | 4,332,786.9 | 328.5 | 9.96× faster |
-| bluestein | 997 | 82,700.9 | 536,492.5 | 58.8 | 6.49× faster |
-| fft | 1024 | 16,006.1 | 87,375.9 | 28.6 | 5.46× faster |
-| fft | 16384 | 131,665.6 | 1,430,051.1 | 164.6 | 10.86× faster |
-| fft | 256 | 9,852.1 | 21,590.2 | 10.6 | 2.19× faster |
-| fft | 4096 | 39,537.3 | 352,915.9 | 93.7 | 8.93× faster |
-| fft | 65536 | 556,940.6 | 5,783,417.8 | 559.2 | 10.38× faster |
-| fft2 | fft2_shape0 | 15,786.3 | 12,080.5 | 20.3 | 1.31× slower |
-| fft2 | fft2_shape1 | 45,186.4 | 58,768.5 | 107.3 | 1.30× faster |
-| fft2 | fft2_shape2 | 545,473.6 | 449,887.0 | 1,082.8 | 1.21× slower |
-| fftn | fftn_shape0 | 14,248.2 | 4,109.5 | 16.5 | 3.47× slower |
-| fftn | fftn_shape1 | 70,820.7 | 31,561.1 | 88.6 | 2.24× slower |
-| gemm | 1024 | 5,013.8 | 13,974.8 | 13,001.2 | 2.79× faster |
-| gemm | 128 | 1,569.4 | 114.7 | 35.2 | 13.68× slower |
-| gemm | 256 | 1,785.8 | 316.9 | 228.2 | 5.64× slower |
-| gemm | 512 | 2,339.9 | 1,936.7 | 1,715.9 | 1.21× slower |
-| linear | linear_shape0 | 1,729.1 | 199.5 | — | 8.67× slower |
-| linear | linear_shape1 | 3,563.4 | 3,975.6 | — | 1.12× faster |
-| mask | mask_shape0 | 1,440.5 | 14.6 | — | 98.47× slower |
-| mask | mask_shape1 | 1,546.2 | 51.1 | — | 30.25× slower |
-| mask | mask_shape2 | — | 513.5 | — | — |
-| stft | - | 27,905.2 | 48,884.4 | 48.9 | 1.75× faster |
+| batched_fft | batched_shape0 | 25,399.2 | 94,313.6 | 49.9 | 3.71× faster |
+| batched_fft | batched_shape1 | 52,993.4 | 108,431.5 | 81.2 | 2.05× faster |
+| bluestein | 127 | 31,420.6 | 66,836.8 | 13.4 | 2.13× faster |
+| bluestein | 4097 | 433,125.2 | 4,342,374.5 | 314.5 | 10.03× faster |
+| bluestein | 997 | 82,359.1 | 540,116.1 | 56.6 | 6.56× faster |
+| fft | 1024 | 15,982.0 | 87,643.0 | 28.3 | 5.48× faster |
+| fft | 16384 | 131,765.5 | 1,435,530.4 | 166.5 | 10.89× faster |
+| fft | 256 | 10,034.8 | 21,755.1 | 10.5 | 2.17× faster |
+| fft | 4096 | 39,297.5 | 355,413.5 | 92.8 | 9.04× faster |
+| fft | 65536 | 555,985.4 | 5,794,943.3 | 559.6 | 10.42× faster |
+| fft2 | fft2_shape0 | 15,063.0 | 12,240.9 | 20.4 | 1.23× slower |
+| fft2 | fft2_shape1 | 44,826.8 | 60,771.0 | 105.6 | 1.36× faster |
+| fft2 | fft2_shape2 | 537,623.9 | 474,073.2 | 1,067.1 | 1.13× slower |
+| fftn | fftn_shape0 | 14,076.3 | 4,132.6 | 16.6 | 3.41× slower |
+| fftn | fftn_shape1 | 70,156.7 | 32,736.6 | 85.6 | 2.14× slower |
+| gemm | 1024 | 4,823.7 | 13,560.8 | 12,973.5 | 2.81× faster |
+| gemm | 128 | 1,493.6 | 72.6 | 33.6 | 20.59× slower |
+| gemm | 256 | 1,685.8 | 321.0 | 220.2 | 5.25× slower |
+| gemm | 512 | 2,294.3 | 1,877.0 | 1,709.3 | 1.22× slower |
+| linear | linear_shape0 | 1,659.4 | 201.4 | — | 8.24× slower |
+| linear | linear_shape1 | 3,269.0 | 4,069.7 | — | 1.24× faster |
+| mask | mask_shape0 | 1,412.7 | 15.0 | — | 94.37× slower |
+| mask | mask_shape1 | 1,527.6 | 50.2 | — | 30.44× slower |
+| mask | mask_shape2 | 2,965.8 | 519.7 | — | 5.71× slower |
+| stft | - | 29,339.2 | 48,769.3 | 47.1 | 1.66× faster |
 
 <!-- BENCH_TABLE_END -->
 

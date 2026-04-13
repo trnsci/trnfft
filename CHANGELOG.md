@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-04-13
+
+### Fixed
+
+- `_complex_mul_kernel` now compiles for shapes that tile multiple times in the free dim (e.g., 1024×512 = 4096-free → 8 tiles). The prior `f_end = min(f_off + FMAX, free)` pattern failed inside `nl.affine_range` because NKI 2.24 can't evaluate `min()` symbolically. Replaced with a constant chunk size plus an explicit divisibility assert — same pattern as the v0.8.0 butterfly fix. All 70 benchmark cases now pass on trn1.2xlarge (#39).
+
+### Changed
+
+- **Documentation refresh** for the matured `trn-*` suite:
+  - README status banner updated from v0.1.0 "scaffolded" text to v0.8.0 summary citing benchmark wins.
+  - Related Projects table expanded to all 6 siblings + umbrella meta-package, with PyPI release versions.
+  - CLAUDE.md naming convention section removes `(planned)` markers; adds trnsparse, trntensor, trnsci.
+  - docs/index.md clarifies API coverage (9 of 12 `torch.fft` functions; `hfft`, `ihfft`, `rfft2`, `irfft2`, `rfftn`, `irfftn` tracked as roadmap).
+
+### Roadmap (moved to v0.10.0 milestone)
+
+- SBUF-resident dispatch for small-op overhead (#40) + investigation spike (#47)
+- `torch.fft` API parity decision (#48)
+- NKI ComplexConv1d kernel (#49)
+- BF16 / FP16 support across kernels (#50)
+
 ## [0.8.0] - 2026-04-12
 
 ### Added
@@ -156,7 +177,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Speech enhancement example using complex ideal ratio mask (cIRM).
 - 83 tests covering arithmetic, FFT correctness, STFT, NN layers, and gradients.
 
-[Unreleased]: https://github.com/trnsci/trnfft/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/trnsci/trnfft/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/trnsci/trnfft/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/trnsci/trnfft/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/trnsci/trnfft/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/trnsci/trnfft/compare/v0.5.0...v0.6.0
