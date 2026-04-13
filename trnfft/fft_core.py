@@ -115,6 +115,55 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
     return result
 
 
+# DFT-as-GEMM fast path. Rationale:
+#   The Trainium Tensor engine (`nisa.nc_matmul`) executes a full matmul with
+#   PSUM accumulation at throughput that dwarfs the Vector engine, which is
+#   what every butterfly stage bottlenecks on. For small N, replacing
+#   log2(N) butterfly stages with one `W @ x` matmul (O(N^2) work but on the
+#   fast engine, with one HBM round-trip instead of log2(N)) is a
+#   straight win — asymmetric hardware affordances flip the usual
+#   complexity-vs-constant tradeoff.
+#
+#   Threshold set conservatively at 128 = one PSUM tile
+#   (TILE_K=TILE_M=128 in `_complex_gemm_kernel`). At the threshold, CT
+#   would do 7 butterfly stages + bit-reversal; DFT-GEMM does one matmul.
+#   Empirical threshold refinement is the v0.12 milestone-1 output.
+_DFT_GEMM_THRESHOLD = 128
+
+
+def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """Compute FFT as a single complex matmul: X = W @ x.
+
+    Routes onto the Trainium Tensor engine via `complex_gemm`. Works on CPU
+    too (PyTorch matmul fallback) but asymptotically worse than Cooley-Tukey
+    there; this path only gets dispatched when `_use_nki()`.
+
+    Shape handling: flattens leading batch dims to 2D (B, N), does
+    `x @ W` (W is the N×N symmetric DFT matrix), restores original shape.
+    """
+    from .nki.dispatch import complex_gemm
+
+    n = x.shape[-1]
+    orig_shape = x.real.shape
+    x_re = x.real.reshape(-1, n).contiguous()
+    x_im = x.imag.reshape(-1, n).contiguous()
+
+    sign = 1.0 if inverse else -1.0
+    k = torch.arange(n, dtype=x_re.dtype)
+    kj = k.unsqueeze(1) * k.unsqueeze(0)  # (N, N) outer product: W_angle = sign * 2π * k * j / N
+    angles = sign * 2.0 * math.pi * kj / n
+    W = ComplexTensor(torch.cos(angles), torch.sin(angles))
+
+    # x is (B, N), W is (N, N) symmetric, so x @ W gives (B, N).
+    X_2d = complex_gemm(ComplexTensor(x_re, x_im), W)
+    X_re = X_2d.real.reshape(orig_shape)
+    X_im = X_2d.imag.reshape(orig_shape)
+    result = ComplexTensor(X_re, X_im)
+    if inverse:
+        result = result * (1.0 / n)
+    return result
+
+
 def _cooley_tukey_nki(x: ComplexTensor, inverse: bool, precision: str = "fast") -> ComplexTensor:
     """Autograd-aware entry point for the NKI FFT path.
 
@@ -146,12 +195,21 @@ def _cooley_tukey_nki_nograd(x: ComplexTensor, inverse: bool, precision: str = "
 
     This is the forward-only path (no autograd). Call :func:`_cooley_tukey_nki`
     instead if autograd support is needed.
+
+    For N <= _DFT_GEMM_THRESHOLD the butterfly path is bypassed in favor of
+    :func:`_fft_via_gemm`, which routes onto the Tensor engine (one matmul)
+    instead of the Vector engine (log2(N) butterfly stages). "fast" precision
+    only — the kahan variant stays on the butterfly path so the compensated
+    complex multiply remains available for users who explicitly want it.
     """
     from .nki.butterfly import butterfly_stage_kernel, butterfly_stage_kernel_kahan
     import torch_xla
     kernel = butterfly_stage_kernel_kahan if precision == "kahan" else butterfly_stage_kernel
 
     n = x.shape[-1]
+    if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
+        return _fft_via_gemm(x, inverse)
+
     log2n = int(math.log2(n))
     assert 1 << log2n == n, f"Not power of 2: {n}"
 

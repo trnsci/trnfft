@@ -266,6 +266,49 @@ class TestBluesteinsPrecision:
             trnfft.set_precision("quad")
 
 
+class TestDFTGEMM:
+    """Direct unit tests for the DFT-as-GEMM fast path.
+
+    The path dispatches automatically when running under NKI backend
+    (see _cooley_tukey_nki_nograd in fft_core.py), but the math is
+    equally valid on CPU — _fft_via_gemm calls through complex_gemm,
+    which falls back to torch.matmul without NKI.
+    """
+
+    @pytest.mark.parametrize("n", [8, 16, 32, 64, 128])
+    def test_matches_numpy(self, n):
+        from trnfft.fft_core import _fft_via_gemm
+        from trnfft.complex import ComplexTensor
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        result = _fft_via_gemm(ComplexTensor(x, torch.zeros(n)), inverse=False)
+        expected = np.fft.fft(x.numpy())
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize("n", [8, 32, 128])
+    def test_roundtrip(self, n):
+        from trnfft.fft_core import _fft_via_gemm
+        from trnfft.complex import ComplexTensor
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        ct = ComplexTensor(x, torch.zeros(n))
+        X = _fft_via_gemm(ct, inverse=False)
+        back = _fft_via_gemm(X, inverse=True)
+        np.testing.assert_allclose(back.real.numpy(), x.numpy(), atol=1e-3)
+        np.testing.assert_allclose(back.imag.numpy(), np.zeros(n), atol=1e-3)
+
+    def test_batched(self):
+        from trnfft.fft_core import _fft_via_gemm
+        from trnfft.complex import ComplexTensor
+        torch.manual_seed(42)
+        x = torch.randn(4, 64)
+        result = _fft_via_gemm(ComplexTensor(x, torch.zeros_like(x)), inverse=False)
+        expected = np.fft.fft(x.numpy(), axis=-1)
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
+
+
 class TestFFT2D:
 
     def test_vs_numpy(self):
