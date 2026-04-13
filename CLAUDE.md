@@ -113,10 +113,13 @@ python examples/speech_stft.py --demo  # Quick STFT demo
 
 ## Naming Convention
 
-This repo is part of the `trn*` suite:
+This repo is part of the `trn*` suite (all released on PyPI under org `trnsci`):
 - `trnfft` — FFT + complex ops (this repo)
-- `trnblas` — BLAS operations (https://github.com/trnsci/trnblas)
-- `trnrand` — Random number generation (https://github.com/trnsci/trnrand)
-- `trnsolver` — Linear solvers, eigendecomposition (planned)
+- `trnblas` — BLAS Level 1–3 (https://github.com/trnsci/trnblas)
+- `trnrand` — Philox / Sobol / Halton RNG (https://github.com/trnsci/trnrand)
+- `trnsolver` — Linear solvers + eigendecomposition (https://github.com/trnsci/trnsolver)
+- `trnsparse` — Sparse matrix ops (https://github.com/trnsci/trnsparse)
+- `trntensor` — Tensor contractions / einsum (https://github.com/trnsci/trntensor)
+- `trnsci` — Umbrella meta-package (https://github.com/trnsci/trnsci)
 
 All repos: Python/NKI, Apache 2.0.

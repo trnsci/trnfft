@@ -108,33 +108,32 @@ NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https
 
 ## Status
 
-**v0.1.0** — CPU fallback works, NKI kernels scaffolded for on-hardware validation.
+**v0.8.0** — NKI butterfly, GEMM, complex-multiply, and ComplexLinear kernels are validated on trn1.2xlarge. For STFT and batched FFT, `set_backend("nki")` now beats vanilla `torch.fft.fft`. See [benchmarks](https://trnsci.github.io/trnfft/benchmarks/) for the full picture.
 
-- [x] ComplexTensor with full arithmetic
-- [x] Complex matmul (4 real matmuls)
-- [x] 1D FFT/IFFT (power-of-2, Cooley-Tukey)
-- [x] Bluestein (arbitrary sizes)
-- [x] rfft/irfft
-- [x] 2D FFT
-- [x] STFT
-- [x] Complex NN layers (Linear, Conv1d, BatchNorm, ModReLU)
-- [x] NKI dispatch layer (auto/pytorch/nki)
-- [x] Plan caching
-- [ ] NKI butterfly kernel validation on trn1/trn2
-- [ ] NKI GEMM kernel validation
-- [ ] Multi-NeuronCore parallelism
-- [ ] Benchmarks vs cuFFT
-- [ ] Inverse STFT
-- [ ] N-D FFT
+**API coverage** (9 of 12 `torch.fft` functions):
+`fft`, `ifft`, `rfft`, `irfft`, `fft2`, `fftn`, `ifftn`, `stft`, `istft`.
+Not yet: `hfft`, `ihfft`, `rfft2`, `irfft2`, `rfftn`, `irfftn` (tracked for v0.10.0+).
 
-## Related Projects
+**Roadmap**
+- NKI `ComplexConv1d` / `ComplexModReLU` kernels (today both fall back to PyTorch on NKI)
+- BF16 / FP16 support across NKI kernels
+- Multi-NeuronCore parallelism (scaffold in `trnfft/nki/multicore.py`)
+- SBUF-resident dispatch to reduce small-op overhead
+- Remaining `torch.fft` functions
 
-| Project | What |
-|---------|------|
-| [neuron-complex-ops](https://github.com/scttfrdmn/neuron-complex-ops) | Original proof-of-concept (now folded into this library) |
-| [trnblas](https://github.com/trnsci/trnblas) | BLAS for Trainium (Level 1-3, DF-MP2 use case) |
-| [trnrand](https://github.com/trnsci/trnrand) | Random number generation (Philox/Sobol) for Trainium |
-| [trnsolver](https://github.com/trnsci/trnsolver) | Linear solvers and eigendecomposition for Trainium |
+## Related projects in the trnsci suite
+
+All six siblings are on PyPI, along with the umbrella meta-package:
+
+| Project | What | Latest |
+|---------|------|-------:|
+| [trnsci](https://github.com/trnsci/trnsci) | Umbrella meta-package pulling the whole suite | v0.1.0 |
+| [trnblas](https://github.com/trnsci/trnblas) | BLAS Level 1–3 for Trainium | v0.4.0 |
+| [trnrand](https://github.com/trnsci/trnrand) | Philox / Sobol / Halton random number generation | v0.1.0 |
+| [trnsolver](https://github.com/trnsci/trnsolver) | Linear solvers (CG, GMRES) and eigendecomposition | v0.3.0 |
+| [trnsparse](https://github.com/trnsci/trnsparse) | Sparse matrix operations | v0.1.1 |
+| [trntensor](https://github.com/trnsci/trntensor) | Tensor contractions (einsum, TT/Tucker decompositions) | v0.1.1 |
+| [neuron-complex-ops](https://github.com/scttfrdmn/neuron-complex-ops) | Original proof-of-concept, folded into trnfft | archived |
 
 ## License
 
