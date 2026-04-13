@@ -109,3 +109,88 @@ if HAS_NKI:
                 nl.store(out_im_2d[p_off:p_end, k+half:k+half+1], value=e_im - prod_im)
 
         return out_re, out_im
+
+    @nki.jit
+    def butterfly_stage_kernel_kahan(x_re, x_im, tw_re_bcast, tw_im_bcast, n: int, stage: int):
+        """Kahan-compensated variant of ``butterfly_stage_kernel``.
+
+        Uses Dekker 2Prod to split each ``t * o`` product into (hi, lo) and
+        accumulates the complex multiply as
+
+            prod_re = (hi_rr - hi_ii) + (lo_rr - lo_ii)
+            prod_im = (hi_ri + hi_ir) + (lo_ri + lo_ir)
+
+        The ``lo_*`` terms recover the mantissa bits that are ordinarily
+        lost when ``t_re*o_re`` and ``t_im*o_im`` are close in magnitude.
+        Roughly 2× the op count of the stock kernel; opt-in via
+        ``set_precision("kahan")``.
+
+        Dekker split constant for FP32 is ``2^12 + 1 = 4097``.
+        """
+        B, _ = x_re.shape
+        m = 1 << (stage + 1)
+        half = m >> 1
+        num_groups = n // m
+        total_groups = B * num_groups
+
+        out_re = nl.ndarray((B, n), dtype=x_re.dtype, buffer=nl.shared_hbm)
+        out_im = nl.ndarray((B, n), dtype=x_im.dtype, buffer=nl.shared_hbm)
+
+        x_re_2d = x_re.reshape((total_groups, m))
+        x_im_2d = x_im.reshape((total_groups, m))
+        out_re_2d = out_re.reshape((total_groups, m))
+        out_im_2d = out_im.reshape((total_groups, m))
+
+        groups_chunk = total_groups if total_groups <= PMAX else PMAX
+        assert total_groups % groups_chunk == 0, (
+            f"total_groups={total_groups} (B={B}, num_groups={num_groups}) "
+            f"not divisible by chunk size {groups_chunk}"
+        )
+        n_partition_tiles = total_groups // groups_chunk
+        C = 4097.0  # Dekker split constant for FP32
+
+        for p in nl.affine_range(n_partition_tiles):
+            p_off = p * groups_chunk
+            p_end = p_off + groups_chunk
+
+            for k in nl.affine_range(half):
+                t_re = nl.load(tw_re_bcast[p_off:p_end, k:k+1])
+                t_im = nl.load(tw_im_bcast[p_off:p_end, k:k+1])
+                e_re = nl.load(x_re_2d[p_off:p_end, k:k+1])
+                e_im = nl.load(x_im_2d[p_off:p_end, k:k+1])
+                o_re = nl.load(x_re_2d[p_off:p_end, k+half:k+half+1])
+                o_im = nl.load(x_im_2d[p_off:p_end, k+half:k+half+1])
+
+                # Dekker split: x -> (xh, xl) with xh + xl == x, xh rounded.
+                def _split(x):
+                    xc = C * x
+                    xh = xc - (xc - x)
+                    xl = x - xh
+                    return xh, xl
+
+                # twoProd(a, b) -> (hi, lo) with hi + lo == a*b (exact),
+                # hi = round(a*b).
+                def _two_prod(a, b):
+                    ah, al = _split(a)
+                    bh, bl = _split(b)
+                    hi = a * b
+                    lo = ((ah * bh - hi) + ah * bl + al * bh) + al * bl
+                    return hi, lo
+
+                hi_rr, lo_rr = _two_prod(t_re, o_re)
+                hi_ii, lo_ii = _two_prod(t_im, o_im)
+                hi_ri, lo_ri = _two_prod(t_re, o_im)
+                hi_ir, lo_ir = _two_prod(t_im, o_re)
+
+                prod_re = (hi_rr - hi_ii) + (lo_rr - lo_ii)
+                prod_im = (hi_ri + hi_ir) + (lo_ri + lo_ir)
+
+                nl.store(out_re_2d[p_off:p_end, k:k+1], value=e_re + prod_re)
+                nl.store(out_im_2d[p_off:p_end, k:k+1], value=e_im + prod_im)
+                nl.store(out_re_2d[p_off:p_end, k+half:k+half+1], value=e_re - prod_re)
+                nl.store(out_im_2d[p_off:p_end, k+half:k+half+1], value=e_im - prod_im)
+
+        return out_re, out_im
+else:
+    # HAS_NKI False: provide a stub so the import doesn't fail on CPU-only installs.
+    butterfly_stage_kernel_kahan = None  # type: ignore[assignment]

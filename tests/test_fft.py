@@ -184,6 +184,88 @@ class TestBluestein:
         np.testing.assert_allclose(recovered.real.numpy(), x.numpy(), atol=1e-3)
 
 
+class TestBluesteinsPrecision:
+    """Precision modes for Bluestein (non-power-of-2 FFT).
+
+    Empirical findings from the host path (CPU):
+
+    * ``"fast"`` is the baseline.
+    * ``"kahan"`` on the host only compensates the chirp multiplies — it
+      matches "fast" because the error budget is dominated by the 3-FFT
+      chain, not the chirps. The NKI butterfly Kahan variant is where
+      this mode pays off (validated separately via ``test_fft_nki_kahan``).
+    * ``"double"`` promotes the Bluestein host math to FP64. Bluestein
+      sizes see ~10 orders of magnitude reduction in error; power-of-2
+      sizes (which skip Bluestein entirely) are unaffected.
+    """
+
+    @pytest.mark.parametrize("n", [500, 1000])
+    def test_fast_mode(self, n):
+        """At N in [500, 1000], 'fast' clears the documented 2e-2 tolerance.
+        Larger Bluestein sizes (N >> 1000) have higher fast-mode error —
+        use 'double' for those. See TestBluesteinsPrecision docstring."""
+        trnfft.set_precision("fast")
+        try:
+            torch.manual_seed(42)
+            x = torch.randn(n)
+            result = trnfft.fft(x)
+            expected = np.fft.fft(x.numpy())
+            np.testing.assert_allclose(result.real.numpy(), expected.real, atol=2e-2, rtol=2e-2)
+            np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=2e-2, rtol=2e-2)
+        finally:
+            trnfft.set_precision("fast")
+
+    @pytest.mark.parametrize("n", [500, 1000, 4097, 8193])
+    def test_double_mode(self, n):
+        """FP64 promotion for Bluestein gives ~1e-6 or better across all sizes."""
+        trnfft.set_precision("double")
+        try:
+            torch.manual_seed(42)
+            x = torch.randn(n)
+            result = trnfft.fft(x)
+            expected = np.fft.fft(x.numpy())
+            # Empirically the rel error is 1e-11 or better; 1e-5 gives safety.
+            np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-5, rtol=1e-5)
+            np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-5, rtol=1e-5)
+        finally:
+            trnfft.set_precision("fast")
+
+    @pytest.mark.parametrize("n", [4097, 8193])
+    def test_double_beats_fast_at_large_n(self, n):
+        """Confirm the user-visible benefit of 'double' over 'fast' at the
+        sizes where fast falls apart. Fast's abs error at N=8193 can reach
+        ~0.5; double keeps it below 1e-7."""
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        expected = np.fft.fft(x.numpy())
+
+        trnfft.set_precision("fast")
+        r_fast = trnfft.fft(x)
+        err_fast = float(np.max(np.abs(r_fast.real.numpy() - expected.real) + np.abs(r_fast.imag.numpy() - expected.imag)))
+
+        trnfft.set_precision("double")
+        r_dbl = trnfft.fft(x)
+        err_dbl = float(np.max(np.abs(r_dbl.real.numpy() - expected.real) + np.abs(r_dbl.imag.numpy() - expected.imag)))
+
+        trnfft.set_precision("fast")
+        assert err_dbl < err_fast / 100.0, (
+            f"double ({err_dbl:.3e}) should be >=100x better than fast ({err_fast:.3e}) at N={n}"
+        )
+
+    def test_precision_getter_setter(self):
+        import trnfft
+        assert trnfft.get_precision() == "fast"
+        trnfft.set_precision("kahan")
+        assert trnfft.get_precision() == "kahan"
+        trnfft.set_precision("double")
+        assert trnfft.get_precision() == "double"
+        trnfft.set_precision("fast")
+
+    def test_invalid_mode_raises(self):
+        with pytest.raises(ValueError, match="precision"):
+            trnfft.set_precision("quad")
+
+
 class TestFFT2D:
 
     def test_vs_numpy(self):

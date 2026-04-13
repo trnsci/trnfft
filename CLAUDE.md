@@ -87,10 +87,11 @@ trnfft/
   on a trn2 instance, wiring the actual kernels from neuron-complex-ops.
 
 - **Bluestein FP32 precision.** N>=500 accumulates ~2e-2 error through the
-  3-FFT Bluestein chain in float32. For applications needing higher precision,
-  run on float64 input (`x.double()`) — the implementation supports it. NKI
-  kernels (FP32-only on Trainium) will need iterative refinement or Kahan
-  summation for large arbitrary-size transforms.
+  3-FFT Bluestein chain in float32. Use `trnfft.set_precision("double")` to
+  promote Bluestein host math to FP64 (~1e-11 rel error at any N); power-of-2
+  Cooley-Tukey is unaffected. `set_precision("kahan")` switches the NKI
+  butterfly to a Dekker 2Prod compensated variant for hardware where FP64
+  isn't available. See `docs/architecture.md` for the full precision table.
 
 - **ComplexBatchNorm** uses independent real/imag normalization, not the
   covariance-based variant (Trabelsi et al. 2018). Deliberate simplicity —

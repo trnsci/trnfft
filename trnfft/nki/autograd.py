@@ -151,14 +151,15 @@ class _FFTFn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x_real, x_imag, inverse: bool):
+    def forward(ctx, x_real, x_imag, inverse: bool, precision: str = "fast"):
         # Call the raw (non-autograd) FFT path to avoid infinite recursion.
         from ..fft_core import _cooley_tukey_nki_nograd
         from ..complex import ComplexTensor
         x = ComplexTensor(x_real, x_imag)
-        y = _cooley_tukey_nki_nograd(x, inverse=inverse)
+        y = _cooley_tukey_nki_nograd(x, inverse=inverse, precision=precision)
         ctx.inverse = inverse
         ctx.n = x.shape[-1]
+        ctx.precision = precision
         return y.real, y.imag
 
     @staticmethod
@@ -168,14 +169,14 @@ class _FFTFn(torch.autograd.Function):
         grad_y = ComplexTensor(grad_y_real, grad_y_imag)
         if ctx.inverse:
             # forward was IFFT; backward is FFT(grad) / n
-            grad_x = _cooley_tukey_nki_nograd(grad_y, inverse=False)
+            grad_x = _cooley_tukey_nki_nograd(grad_y, inverse=False, precision=ctx.precision)
             grad_x = grad_x * (1.0 / ctx.n)
         else:
             # forward was FFT; backward is IFFT(grad) * n (undoing ifft's 1/n)
-            grad_x = _cooley_tukey_nki_nograd(grad_y, inverse=True)
+            grad_x = _cooley_tukey_nki_nograd(grad_y, inverse=True, precision=ctx.precision)
             grad_x = grad_x * ctx.n
-        return grad_x.real, grad_x.imag, None  # None for inverse flag
+        return grad_x.real, grad_x.imag, None, None  # None for inverse flag and precision
 
 
-def fft_autograd(x_real, x_imag, inverse: bool):
-    return _FFTFn.apply(x_real, x_imag, inverse)
+def fft_autograd(x_real, x_imag, inverse: bool, precision: str = "fast"):
+    return _FFTFn.apply(x_real, x_imag, inverse, precision)

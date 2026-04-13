@@ -19,6 +19,7 @@ from .api import (
 from .complex import ComplexTensor, complex_matmul
 from .plan import create_plan, clear_plan_cache, FFTPlan
 from .nki import HAS_NKI, set_backend, get_backend
+from .precision import set_precision, get_precision
 
 __all__ = [
     # FFT operations
@@ -32,4 +33,6 @@ __all__ = [
     "create_plan", "clear_plan_cache", "FFTPlan",
     # Backend
     "HAS_NKI", "set_backend", "get_backend",
+    # Precision
+    "set_precision", "get_precision",
 ]

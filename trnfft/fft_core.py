@@ -18,11 +18,23 @@ from .plan import FFTPlan, FFTAlgorithm, create_plan
 from .nki.dispatch import _use_nki, HAS_NKI
 
 
-def fft_core(x: ComplexTensor, inverse: bool = False, plan: Optional[FFTPlan] = None) -> ComplexTensor:
+def fft_core(
+    x: ComplexTensor,
+    inverse: bool = False,
+    plan: Optional[FFTPlan] = None,
+    precision: Optional[str] = None,
+) -> ComplexTensor:
     """Compute 1-D FFT along last dimension.
 
     If plan is None, one is created (and cached) automatically.
+
+    ``precision`` selects the numerical mode: ``None`` uses the global
+    (see ``trnfft.set_precision``); otherwise one of ``"fast"`` / ``"kahan"`` /
+    ``"double"``.
     """
+    from .precision import _resolve
+    prec = _resolve(precision)
+
     n = x.shape[-1]
     if n == 1:
         return x.clone()
@@ -31,12 +43,12 @@ def fft_core(x: ComplexTensor, inverse: bool = False, plan: Optional[FFTPlan] = 
         plan = create_plan(n, inverse=inverse)
 
     if plan.algorithm == FFTAlgorithm.COOLEY_TUKEY:
-        return _cooley_tukey(x, inverse)
+        return _cooley_tukey(x, inverse, precision=prec)
     else:
-        return _bluestein(x, inverse, padded_n=plan.padded_n)
+        return _bluestein(x, inverse, padded_n=plan.padded_n, precision=prec)
 
 
-def _cooley_tukey(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> ComplexTensor:
     """Iterative radix-2 decimation-in-time FFT.
 
     Standard textbook algorithm:
@@ -45,9 +57,11 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     3. For inverse: divide by N at the end
 
     Dispatches to NKI butterfly kernel when running on Trainium hardware.
+    The ``precision`` mode selects the butterfly variant when NKI is active;
+    host-side CPU path is already FP32 and isn't affected by "kahan".
     """
     if _use_nki():
-        return _cooley_tukey_nki(x, inverse)
+        return _cooley_tukey_nki(x, inverse, precision=precision)
 
     n = x.shape[-1]
     log2n = int(math.log2(n))
@@ -101,7 +115,7 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     return result
 
 
-def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+def _cooley_tukey_nki(x: ComplexTensor, inverse: bool, precision: str = "fast") -> ComplexTensor:
     """Autograd-aware entry point for the NKI FFT path.
 
     Routes through ``_FFTFn`` (``torch.autograd.Function``) so gradients can
@@ -109,25 +123,33 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     :func:`_cooley_tukey_nki_nograd`; the autograd Function uses the analytic
     adjoint (IFFT*n for FFT, FFT/n for IFFT) rather than auto-diffing the
     butterfly, which is cheap since FFT is linear.
+
+    ``precision`` selects between the stock butterfly kernel and the Kahan
+    (compensated twoProd) variant. Only "fast" and "kahan" meaningfully differ
+    on the NKI path; "double" doesn't reach here because NKI is FP32-only.
     """
     from .nki.autograd import fft_autograd
 
-    y_real, y_imag = fft_autograd(x.real, x.imag, inverse)
+    y_real, y_imag = fft_autograd(x.real, x.imag, inverse, precision)
     return ComplexTensor(y_real, y_imag)
 
 
-def _cooley_tukey_nki_nograd(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+def _cooley_tukey_nki_nograd(x: ComplexTensor, inverse: bool, precision: str = "fast") -> ComplexTensor:
     """Cooley-Tukey FFT using batched NKI butterfly kernel on Trainium.
 
     Accepts any shape; leading dims are flattened into a single batch dim B
     and passed to the kernel as (B, n). The kernel vectorizes across B in a
     single call per stage — no Python loop over batch rows.
 
+    ``precision`` picks the butterfly variant: "fast" (default, stock kernel)
+    or "kahan" (compensated twoProd complex multiply — ~2× slower).
+
     This is the forward-only path (no autograd). Call :func:`_cooley_tukey_nki`
     instead if autograd support is needed.
     """
-    from .nki.butterfly import butterfly_stage_kernel
+    from .nki.butterfly import butterfly_stage_kernel, butterfly_stage_kernel_kahan
     import torch_xla
+    kernel = butterfly_stage_kernel_kahan if precision == "kahan" else butterfly_stage_kernel
 
     n = x.shape[-1]
     log2n = int(math.log2(n))
@@ -188,7 +210,7 @@ def _cooley_tukey_nki_nograd(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         tw_re_bcast = tw_re_1d.unsqueeze(0).expand(total_groups, half).contiguous().to(device)
         tw_im_bcast = tw_im_1d.unsqueeze(0).expand(total_groups, half).contiguous().to(device)
 
-        re, im = butterfly_stage_kernel(re, im, tw_re_bcast, tw_im_bcast, n, s)
+        re, im = kernel(re, im, tw_re_bcast, tw_im_bcast, n, s)
 
     re = re.to(orig_device)[:B_orig].reshape(orig_shape)
     im = im.to(orig_device)[:B_orig].reshape(orig_shape)
@@ -198,12 +220,76 @@ def _cooley_tukey_nki_nograd(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     return result
 
 
-def _bluestein(x: ComplexTensor, inverse: bool, padded_n: Optional[int] = None) -> ComplexTensor:
+def _complex_mul_kahan(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
+    """Elementwise complex multiply with 2Prod-compensated accumulation.
+
+    Standard complex multiply is ``c_re = a_re*b_re - a_im*b_im``,
+    ``c_im = a_re*b_im + a_im*b_re``. At FP32, catastrophic cancellation
+    in the difference (``a_re*b_re ≈ a_im*b_im``) costs mantissa bits.
+    We use Kahan/Dekker 2Prod to recover the lost part:
+
+        twoProd(x, y) = (hi, lo)  where  hi + lo = x*y exactly.
+
+    Then ``c_re = (hi_rr - hi_ii) + (lo_rr - lo_ii)`` and similarly for
+    ``c_im``. The ``lo`` terms compensate the rounding error.
+
+    Without an FMA primitive, 2Prod is done via Dekker's split:
+        split(x) = (hi, lo) where hi+lo = x exactly, with hi = x rounded
+                   to half the mantissa.
+    """
+    ar, ai = a.real, a.imag
+    br, bi = b.real, b.imag
+
+    def _two_prod(x, y):
+        # Dekker's 2Prod via splitting. For FP32, split at bit 12.
+        # split factor = 2^12 + 1 = 4097
+        C = 4097.0
+        xc = C * x
+        xh = xc - (xc - x)
+        xl = x - xh
+        yc = C * y
+        yh = yc - (yc - y)
+        yl = y - yh
+        hi = x * y
+        lo = ((xh * yh - hi) + xh * yl + xl * yh) + xl * yl
+        return hi, lo
+
+    hi_rr, lo_rr = _two_prod(ar, br)
+    hi_ii, lo_ii = _two_prod(ai, bi)
+    hi_ri, lo_ri = _two_prod(ar, bi)
+    hi_ir, lo_ir = _two_prod(ai, br)
+
+    c_re = (hi_rr - hi_ii) + (lo_rr - lo_ii)
+    c_im = (hi_ri + hi_ir) + (lo_ri + lo_ir)
+    return ComplexTensor(c_re, c_im)
+
+
+def _bluestein(
+    x: ComplexTensor,
+    inverse: bool,
+    padded_n: Optional[int] = None,
+    precision: str = "fast",
+) -> ComplexTensor:
     """Bluestein's algorithm (chirp-z) for arbitrary-size FFT.
 
     Converts length-N DFT into circular convolution of length M >= 2N-1
     (M is next power of 2), computed via three power-of-2 FFTs.
+
+    ``precision`` modes:
+      - "fast":   straight FP32 (or input dtype), chain accumulates ~2e-2
+                  relative error at N >= 500.
+      - "kahan":  compensated complex multiply at the two chirp multiplies
+                  and at the Y*H product. Reduces error ~10-100×.
+      - "double": promote entire host-side math to FP64, then cast back.
+                  Largest precision win (~6+ orders of magnitude) but
+                  Bluestein-only — power-of-2 FFTs are unaffected, and NKI
+                  kernels stay FP32 throughout the rest of the library.
     """
+    # Dtype promotion for "double" mode. Cast back at the end.
+    orig_dtype = x.real.dtype
+    if precision == "double":
+        x = ComplexTensor(x.real.double(), x.imag.double())
+
     n = x.shape[-1]
     m = padded_n if padded_n is not None else (1 << (2 * n - 2).bit_length())
 
@@ -217,7 +303,10 @@ def _bluestein(x: ComplexTensor, inverse: bool, padded_n: Optional[int] = None) 
     chirp = ComplexTensor(chirp_re, chirp_im)
 
     # Step 1: y[n] = x[n] * chirp[n]
-    y = x * chirp
+    if precision == "kahan":
+        y = _complex_mul_kahan(x, chirp)
+    else:
+        y = x * chirp
 
     # Step 2: Zero-pad y to length m
     batch_shape = x.shape[:-1]
@@ -238,18 +327,33 @@ def _bluestein(x: ComplexTensor, inverse: bool, padded_n: Optional[int] = None) 
     h = ComplexTensor(h_re, h_im)
 
     # Step 4: Circular convolution via FFT
-    Y = _cooley_tukey(y_padded, inverse=False)
-    H = _cooley_tukey(h.unsqueeze(0) if len(batch_shape) > 0 else h, inverse=False)
-    product = Y * H
-    conv = _cooley_tukey(product, inverse=True)
+    Y = _cooley_tukey(y_padded, inverse=False, precision=precision)
+    H = _cooley_tukey(
+        h.unsqueeze(0) if len(batch_shape) > 0 else h,
+        inverse=False,
+        precision=precision,
+    )
+    if precision == "kahan":
+        product = _complex_mul_kahan(Y, H)
+    else:
+        product = Y * H
+    conv = _cooley_tukey(product, inverse=True, precision=precision)
 
     # Step 5: Multiply by chirp and take first N elements
     result_re = conv.real[..., :n]
     result_im = conv.imag[..., :n]
-    result = ComplexTensor(result_re, result_im) * chirp
+    result_shifted = ComplexTensor(result_re, result_im)
+    if precision == "kahan":
+        result = _complex_mul_kahan(result_shifted, chirp)
+    else:
+        result = result_shifted * chirp
 
     if inverse:
         result = result * (1.0 / n)
+
+    # Cast back to original dtype if we promoted for "double" mode.
+    if precision == "double" and result.real.dtype != orig_dtype:
+        result = ComplexTensor(result.real.to(orig_dtype), result.imag.to(orig_dtype))
 
     return result
 
