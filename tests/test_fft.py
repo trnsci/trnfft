@@ -107,6 +107,63 @@ class TestRFFT:
         np.testing.assert_allclose(recovered.numpy(), x.numpy(), atol=1e-4)
 
 
+class TestRFFTnD:
+    """rfft2, irfft2, rfftn, irfftn — real-input N-D FFT variants."""
+
+    def test_rfft2_vs_numpy(self):
+        torch.manual_seed(42)
+        for shape in [(8, 16), (16, 32)]:
+            x = torch.randn(*shape)
+            result = trnfft.rfft2(x)
+            expected = np.fft.rfft2(x.numpy())
+            assert result.shape == (shape[0], shape[1] // 2 + 1)
+            np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-4, rtol=1e-4)
+            np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-4, rtol=1e-4)
+
+    def test_irfft2_roundtrip(self):
+        torch.manual_seed(42)
+        x = torch.randn(8, 16)
+        X = trnfft.rfft2(x)
+        recovered = trnfft.irfft2(X, s=x.shape)
+        np.testing.assert_allclose(recovered.numpy(), x.numpy(), atol=1e-4)
+
+    def test_irfft2_default_shape(self):
+        # With s=None, irfft2 infers last dim as 2*(N_half - 1). The second-
+        # to-last dim is taken from the input shape directly.
+        torch.manual_seed(42)
+        x = torch.randn(8, 16)
+        X = trnfft.rfft2(x)  # shape (8, 9)
+        recovered = trnfft.irfft2(X)  # default: (8, 2*(9-1)) = (8, 16)
+        assert recovered.shape == (8, 16)
+        np.testing.assert_allclose(recovered.numpy(), x.numpy(), atol=1e-4)
+
+    def test_rfftn_vs_numpy_3d(self):
+        torch.manual_seed(42)
+        x = torch.randn(4, 8, 16)
+        result = trnfft.rfftn(x)
+        expected = np.fft.rfftn(x.numpy())
+        assert result.shape == (4, 8, 16 // 2 + 1)
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-4, rtol=1e-4)
+
+    def test_irfftn_roundtrip_3d(self):
+        torch.manual_seed(42)
+        x = torch.randn(4, 8, 16)
+        X = trnfft.rfftn(x)
+        recovered = trnfft.irfftn(X, s=x.shape)
+        np.testing.assert_allclose(recovered.numpy(), x.numpy(), atol=1e-4)
+
+    def test_rfft2_with_s_param(self):
+        # s resizes the input before transform (zero-pad or truncate).
+        torch.manual_seed(42)
+        x = torch.randn(8, 16)
+        padded = trnfft.rfft2(x, s=(16, 32))
+        expected = np.fft.rfft2(x.numpy(), s=(16, 32))
+        assert padded.shape == (16, 32 // 2 + 1)
+        np.testing.assert_allclose(padded.real.numpy(), expected.real, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(padded.imag.numpy(), expected.imag, atol=1e-4, rtol=1e-4)
+
+
 class TestBluestein:
 
     def test_vs_numpy_arbitrary(self, arbitrary_size, random_real_signal):

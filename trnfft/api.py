@@ -133,6 +133,127 @@ def ifftn(
     return x
 
 
+def rfft2(
+    input: torch.Tensor,
+    s: Optional[tuple[int, int]] = None,
+) -> ComplexTensor:
+    """2-D FFT of a real signal along the last two dimensions.
+
+    Output shape: `(..., s[0], s[1] // 2 + 1)` — Hermitian symmetry along the
+    last dim only. If `s` is None, uses the input's last-two-dim shape.
+    """
+    return rfftn(input, s=tuple(s) if s is not None else None, dim=(-2, -1))
+
+
+def rfftn(
+    input: torch.Tensor,
+    s: Optional[tuple[int, ...]] = None,
+    dim: Optional[tuple[int, ...]] = None,
+) -> ComplexTensor:
+    """N-D FFT of a real signal along specified dimensions.
+
+    Hermitian symmetry is applied only to the last dim in ``dim``; that dim's
+    output size is ``s[-1] // 2 + 1`` (or ``input.shape[last_dim] // 2 + 1``
+    if ``s`` is None).
+    """
+    assert not torch.is_complex(input), "rfftn requires real input"
+    ndim = input.dim()
+
+    if dim is None:
+        if s is not None:
+            dim = tuple(range(-len(s), 0))
+        else:
+            dim = tuple(range(-ndim, 0))
+    dim = tuple(d % ndim for d in dim)
+
+    last_dim = dim[-1]
+    other_dims = dim[:-1]
+
+    # rfft acts on the *last* tensor dim. If the caller's last real-axis dim
+    # isn't the last tensor dim, transpose first.
+    n_last = s[-1] if s is not None else None
+    if last_dim == ndim - 1:
+        x = rfft(input, n=n_last)
+    else:
+        x_t = input.transpose(last_dim, -1).contiguous()
+        x = rfft(x_t, n=n_last)
+        x = x.transpose(last_dim, -1)
+
+    # Resize the other dims per s (the last-dim resize was handled by rfft's n=).
+    if s is not None:
+        for size, d in zip(s[:-1], other_dims):
+            x = _resize_dim(x, d, size)
+
+    # Apply full complex FFT along the remaining dims.
+    for d in other_dims:
+        x = _fft_along_dim(x, d, inverse=False)
+
+    return x
+
+
+def irfft2(
+    input: ComplexTensor,
+    s: Optional[tuple[int, int]] = None,
+) -> torch.Tensor:
+    """Inverse of :func:`rfft2`. Returns a real tensor along the last two dims.
+
+    If `s` is None, infers the last-dim output size as ``2 * (N_half - 1)``
+    where ``N_half = input.shape[-1]``, and the second-to-last dim from the
+    input shape.
+    """
+    s_arg = tuple(s) if s is not None else None
+    return irfftn(input, s=s_arg, dim=(-2, -1))
+
+
+def irfftn(
+    input: ComplexTensor,
+    s: Optional[tuple[int, ...]] = None,
+    dim: Optional[tuple[int, ...]] = None,
+) -> torch.Tensor:
+    """Inverse of :func:`rfftn`. Returns a real tensor.
+
+    The last dim in ``dim`` is Hermitian-reconstructed to full length. If
+    ``s`` is None, its size defaults to ``2 * (input.shape[last_dim] - 1)``.
+    """
+    ndim = input.real.dim()
+
+    if dim is None:
+        if s is not None:
+            dim = tuple(range(-len(s), 0))
+        else:
+            dim = tuple(range(-ndim, 0))
+    dim = tuple(d % ndim for d in dim)
+
+    last_dim = dim[-1]
+    other_dims = dim[:-1]
+
+    # Resize the non-last dims per s (the real-axis size is handled via irfft's n=).
+    x = input
+    if s is not None:
+        for size, d in zip(s[:-1], other_dims):
+            x = _resize_dim(x, d, size)
+        n_last = s[-1]
+    else:
+        n_last = 2 * (x.shape[last_dim] - 1)
+
+    # Inverse complex FFT along the other dims first — keeps the Hermitian
+    # structure on the last dim intact so irfft can reconstruct correctly.
+    for d in other_dims:
+        x = _fft_along_dim(x, d, inverse=True)
+
+    # Final step: irfft along the last_dim. irfft only acts on the *last*
+    # tensor dim; transpose if needed, then transpose the real result back.
+    if last_dim == ndim - 1:
+        return irfft(x, n=n_last)
+    # Move last_dim to the end, irfft, move back.
+    x_t = ComplexTensor(
+        x.real.transpose(last_dim, -1).contiguous(),
+        x.imag.transpose(last_dim, -1).contiguous(),
+    )
+    y = irfft(x_t, n=n_last)
+    return y.transpose(last_dim, -1).contiguous()
+
+
 def stft(
     input: torch.Tensor,
     n_fft: int,
