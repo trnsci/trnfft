@@ -124,16 +124,16 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
 #   straight win — asymmetric hardware affordances flip the usual
 #   complexity-vs-constant tradeoff.
 #
-#   Threshold set to 128: the numerical ceiling for DFT-GEMM at FP32
-#   under 1e-3 relative tolerance. Widening probe (16384) on trn1
-#   showed O(N^2) FP32 accumulation in nc_matmul reaches ~2% rel error
-#   at N=1024, which breaks the test suite's 1e-3 tol. The launch-count
-#   win is real (4.5× at N=128 and still growing), but at N=1024+ the
-#   numerical cost starts to bite; Stockham radix-r (Thread B) is the
-#   structurally-correct way to keep compute on the Tensor engine
-#   without paying O(N^2) matmul accumulation. For now: DFT-GEMM where
-#   FP32 accuracy is safe, butterfly elsewhere.
-_DFT_GEMM_THRESHOLD = 128
+#   Threshold set to 256: measured upper bound where FP32 O(N^2)
+#   nc_matmul accumulation stays within 1e-3 relative error vs numpy
+#   reference. Widened bench on trn1 (2026-04-13, docs/design-notes/
+#   fft-is-a-gemm.md) shows the launch-count win extends cleanly to
+#   N=1024 (5.3× over butterfly), with a hard perf cliff at N=2048.
+#   The 256 cap is precision-bound, not perf-bound — raising it further
+#   needs Stockham radix-r (Thread B) to break the O(N^2) accumulation
+#   without falling back to butterfly. test_fft_nki_vs_numpy confirmed
+#   N=256 stays inside 1e-3 tol; N=1024 exceeds (observed 2.2% rel err).
+_DFT_GEMM_THRESHOLD = 256
 
 
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:

@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-04-13
+
+### Added
+
+- **DFT-as-GEMM fast path for small-to-medium FFT on Trainium.** `_fft_via_gemm` routes FFT onto the Tensor engine via the existing `_complex_gemm_kernel` — one matmul instead of log₂(N) butterfly-stage launches. Dispatches automatically for N ≤ 256 when running on NKI (threshold precision-bound, not perf-bound — see below). CPU path unaffected.
+- New design note `docs/design-notes/fft-is-a-gemm.md` documenting the architectural thesis: FFT on Trainium is a problem about kernel launches and Tensor-engine utilization, not arithmetic complexity. Includes head-to-head sweep at N ∈ {8..2048}.
+- 9 new CPU tests in `TestDFTGEMM` covering matches-numpy, roundtrip, and batched cases.
+
+### Changed
+
+- At small N, `trnfft.fft(x)` on Trainium is dramatically faster. Measured on trn1 (NKI 2.24.5133.0) via head-to-head bench (forcing each kernel path explicitly):
+
+| N    | DFT-GEMM (μs) | Butterfly (μs) | Speedup |
+| ---- | ------------- | -------------- | ------- |
+| 8    | 1716          | 3832           | 2.2×    |
+| 64   | 1833          | 6997           | 3.8×    |
+| 256  | 1882          | 9862           | 5.2×    |
+| 1024 | 2954          | 15746          | 5.3×    |
+| 2048 | 17500         | 23819          | 1.4×    |
+
+DFT-GEMM time is roughly constant ~1.7-2.1 ms through N=512 (launch overhead dominates), while butterfly grows cleanly linear in log₂(N) at ~1 ms per stage. Hard perf cliff at N=2048 where partition-dim underutilization and K-tile count together eat the launch-count win.
+
+### Known limitations
+
+- The 256 threshold is **precision-bound**: FP32 `nc_matmul` at N=1024 accumulates ~2.2% relative error, which exceeds the test suite's 1e-3 tolerance. The performance crossover is N ≈ 1024–2048, so there's untapped win at N=512–1024 that's currently unreachable in FP32. Stockham radix-r (v0.13 Thread B) is the structurally-correct path to extend past 256 without paying O(N²) matmul accumulation.
+- Single-FFT case (M=1 batch) at large N wastes 127 of 128 partitions. Batched FFT and STFT get better partition utilization automatically because they flatten to `(B, N)` before dispatch.
+
 ## [0.11.0] - 2026-04-13
 
 ### Added
