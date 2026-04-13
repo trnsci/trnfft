@@ -64,6 +64,58 @@ class TestFFT1D:
 
 
 # ---------------------------------------------------------------------------
+# 1D FFT — small-N head-to-head: DFT-as-GEMM vs butterfly
+# ---------------------------------------------------------------------------
+#
+# The DFT-GEMM fast path (trnfft/fft_core.py::_fft_via_gemm) routes FFT
+# compute onto the Tensor engine via `complex_gemm`. This benchmark compares
+# it head-to-head against the Vector-engine butterfly at sizes where both
+# paths are legal, so the Tensor-vs-Vector crossover is empirically observable.
+#
+# Force path selection by toggling fft_core._DFT_GEMM_THRESHOLD.
+
+@pytest.fixture(params=[8, 16, 32, 64, 128])
+def small_fft_size(request):
+    return request.param
+
+
+@pytest.fixture
+def small_random_signal(small_fft_size):
+    torch.manual_seed(42)
+    return torch.randn(small_fft_size)
+
+
+class TestFFT1DSmallN:
+    """Architectural probe — does DFT-GEMM beat butterfly at small N on Trainium?"""
+
+    @pytest.mark.neuron
+    def test_fft_nki_dft_gemm(self, benchmark, small_random_signal):
+        from trnfft import fft_core
+        old = fft_core._DFT_GEMM_THRESHOLD
+        fft_core._DFT_GEMM_THRESHOLD = 1 << 30  # force DFT-GEMM path
+        _set("nki")
+        try:
+            _warm(trnfft.fft, small_random_signal)
+            benchmark(trnfft.fft, small_random_signal)
+        finally:
+            _set("auto")
+            fft_core._DFT_GEMM_THRESHOLD = old
+
+    @pytest.mark.neuron
+    def test_fft_nki_butterfly(self, benchmark, small_random_signal):
+        from trnfft import fft_core
+        old = fft_core._DFT_GEMM_THRESHOLD
+        fft_core._DFT_GEMM_THRESHOLD = 0  # force butterfly path
+        _set("nki")
+        try:
+            _warm(trnfft.fft, small_random_signal)
+            benchmark(trnfft.fft, small_random_signal)
+        finally:
+            _set("auto")
+            fft_core._DFT_GEMM_THRESHOLD = old
+
+
+# ---------------------------------------------------------------------------
 # 2D FFT
 # ---------------------------------------------------------------------------
 
