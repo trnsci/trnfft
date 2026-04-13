@@ -249,8 +249,19 @@ if HAS_NKI:
 
         free = total // 128
         # Free-dim tile size: cap at 512 to keep SBUF usage reasonable.
+        # NKI affine_range can't evaluate min() symbolically, so use a constant
+        # chunk size: the full free dim when it fits in one tile, or FMAX with
+        # an exact-divisibility requirement. For power-of-2 input shapes, free
+        # is always a power of 2 and FMAX=512 divides it exactly when free>FMAX.
         FMAX = 512
-        free_tile = min(free, FMAX)
+        if free <= FMAX:
+            free_tile = free
+        else:
+            assert free % FMAX == 0, (
+                f"_complex_mul_kernel: free={free} (total={total}) must be <= {FMAX} "
+                f"or a multiple of {FMAX} to avoid dynamic tile sizing"
+            )
+            free_tile = FMAX
 
         c_real = nl.ndarray(shape, dtype=a_real.dtype, buffer=nl.shared_hbm)
         c_imag = nl.ndarray(shape, dtype=a_real.dtype, buffer=nl.shared_hbm)
@@ -263,11 +274,11 @@ if HAS_NKI:
         c_re_2d = c_real.reshape((128, free))
         c_im_2d = c_imag.reshape((128, free))
 
-        n_tiles = (free + free_tile - 1) // free_tile
+        n_tiles = free // free_tile
 
         for t in nl.affine_range(n_tiles):
             f_off = t * free_tile
-            f_end = min(f_off + free_tile, free)
+            f_end = f_off + free_tile  # constant slice size; no min()
 
             ar = nl.load(a_re_2d[:, f_off:f_end])
             ai = nl.load(a_im_2d[:, f_off:f_end])
