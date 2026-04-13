@@ -74,7 +74,7 @@ class TestFFT1D:
 #
 # Force path selection by toggling fft_core._DFT_GEMM_THRESHOLD.
 
-@pytest.fixture(params=[8, 16, 32, 64, 128])
+@pytest.fixture(params=[8, 16, 32, 64, 128, 256, 512, 1024, 2048])
 def small_fft_size(request):
     return request.param
 

@@ -124,16 +124,16 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
 #   straight win — asymmetric hardware affordances flip the usual
 #   complexity-vs-constant tradeoff.
 #
-#   Threshold is a probe value during v0.12 Thread A. Set to 16384
-#   ("always DFT-GEMM up to the tested ceiling") so batched FFT and STFT
-#   — both of which flatten to (B, N) and flow through this path — pick
-#   up the same launch-count win the small-N bench demonstrated. Final
-#   threshold will be set to the measured crossover once the widened
-#   bench sweep lands. The `_complex_gemm_kernel` already tiles K
-#   internally, so correctness at N > 128 is expected to fall through
-#   for free; the empirical question is where partition-dim
-#   underutilization at M=1 starts to eat the launch-count advantage.
-_DFT_GEMM_THRESHOLD = 16384
+#   Threshold set to 128: the numerical ceiling for DFT-GEMM at FP32
+#   under 1e-3 relative tolerance. Widening probe (16384) on trn1
+#   showed O(N^2) FP32 accumulation in nc_matmul reaches ~2% rel error
+#   at N=1024, which breaks the test suite's 1e-3 tol. The launch-count
+#   win is real (4.5× at N=128 and still growing), but at N=1024+ the
+#   numerical cost starts to bite; Stockham radix-r (Thread B) is the
+#   structurally-correct way to keep compute on the Tensor engine
+#   without paying O(N^2) matmul accumulation. For now: DFT-GEMM where
+#   FP32 accuracy is safe, butterfly elsewhere.
+_DFT_GEMM_THRESHOLD = 128
 
 
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:

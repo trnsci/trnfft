@@ -429,8 +429,17 @@ class TestNKIFFT:
         # precision characterization (does kahan actually help FP32?) is a
         # separate follow-up — here we just confirm it compiles and doesn't
         # diverge.
+        #
+        # Force butterfly on both sides by zeroing the DFT-GEMM threshold;
+        # otherwise "fast" would route to DFT-GEMM (a different algorithm
+        # with its own FP32 error profile) and this test would measure
+        # algorithm divergence instead of the kahan-vs-fast butterfly
+        # question it's supposed to answer.
         from trnfft import set_precision, get_precision
-        old = get_precision()
+        from trnfft import fft_core
+        old_prec = get_precision()
+        old_thr = fft_core._DFT_GEMM_THRESHOLD
+        fft_core._DFT_GEMM_THRESHOLD = 0
         try:
             torch.manual_seed(42)
             x = torch.randn(1024)
@@ -445,4 +454,5 @@ class TestNKIFFT:
                 y_kahan.imag.numpy(), y_fast.imag.numpy(), atol=1e-3, rtol=1e-3
             )
         finally:
-            set_precision(old)
+            set_precision(old_prec)
+            fft_core._DFT_GEMM_THRESHOLD = old_thr
