@@ -159,9 +159,17 @@ def stft(
         input = torch.nn.functional.pad(input, (pad_amount, pad_amount), mode=pad_mode)
         input = input.squeeze(0) if input.dim() == 2 and input.shape[0] == 1 else input
 
-    # Frame the signal using unfold (vectorized, no Python loop)
-    # unfold(dim, size, step) → (..., num_frames, n_fft)
-    frames_tensor = input.unfold(-1, n_fft, hop_length)  # (..., num_frames, n_fft)
+    # Frame the signal. torch.Tensor.unfold is a view op that is not
+    # implemented on the XLA backend (torch-xla 2.9 / torch-neuronx), so we
+    # build the frame index matrix explicitly — this works on CPU, CUDA, MPS,
+    # and XLA/Trainium without a device-specific branch.
+    padded_length = input.shape[-1]
+    num_frames = 1 + (padded_length - n_fft) // hop_length
+    frame_idx = (
+        torch.arange(n_fft, device=input.device).unsqueeze(0)
+        + torch.arange(num_frames, device=input.device).unsqueeze(1) * hop_length
+    )
+    frames_tensor = input[..., frame_idx]  # (..., num_frames, n_fft)
 
     # Apply window
     if win_length < n_fft:
