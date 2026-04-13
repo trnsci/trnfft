@@ -36,6 +36,7 @@ neuron = [
 dev = [
     "pytest>=7.0",
     "pytest-benchmark>=4.0",
+    "pytest-cov>=4.0",
     "scipy>=1.11",
     "mkdocs>=1.5",
     "mkdocs-material>=9.0",

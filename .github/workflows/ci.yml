@@ -17,4 +17,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
-      - run: pytest tests/ -v -x --tb=short -m "not neuron"
+      - run: pytest tests/ -v -x --tb=short -m "not neuron" --cov=trnfft --cov-report=xml
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: trnsci/trnfft
