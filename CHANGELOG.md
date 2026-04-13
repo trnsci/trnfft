@@ -7,9 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-04-12
+
+### Added
+
+- Batched NKI butterfly kernel: `butterfly_stage_kernel` now accepts `(B, n)` input and vectorizes across the batch dim within a single kernel invocation per stage. Removes the per-row Python loop in `_cooley_tukey_nki` that was the dominant cost on multi-call paths (fftn, fft2, batched 1D FFT, STFT).
+- `docs/benchmark_results/v0.8.0.txt` — full v0.8.0 hardware results from trn1.2xlarge.
+
+### Changed
+
+- `_cooley_tukey_nki` pads the batch dim up to the next multiple of PMAX (128) only when `B` is not already a power of 2. Unbatched FFT (`B=1`) and power-of-2 batched FFT take the zero-copy path. Non-power-of-2 cases (STFT's `num_frames=33`) pad with zeros, run, then discard the padding.
+- Repository rehomed from `scttfrdmn/trnfft` to `trnsci/trnfft`. URLs updated throughout (`README.md`, `pyproject.toml`, `mkdocs.yml`, `docs/installation.md`, `infra/terraform/main.tf`, CHANGELOG footer links). GitHub transparently redirects the old URLs.
+- Docs Pages URL migrated from `scttfrdmn.github.io/trnfft/` to `trnsci.github.io/trnfft/`.
+- Author email in `pyproject.toml` switched to GitHub noreply.
+
 ### Fixed
 
-- `stft` frame extraction no longer uses `torch.Tensor.unfold`, which has no XLA backend implementation in torch-xla 2.9 / torch-neuronx and raised `RuntimeError: The operator aten::unfold appears to be a view operator, but it has no implementation for the backend "xla:0"`. Replaced with explicit `torch.arange`-based index construction, which is device-agnostic and works on CPU, CUDA, MPS, and XLA/Trainium without branching.
+- `stft` frame extraction no longer uses `torch.Tensor.unfold`, which has no XLA backend implementation in torch-xla 2.9 / torch-neuronx. Replaced with explicit `torch.arange`-based index construction, device-agnostic across CPU, CUDA, MPS, and XLA/Trainium (PR #44).
+- `_complex_mul_kernel` wrapper now forces input tensors contiguous before reshape to avoid NKI 2.24 compile errors on non-contiguous views.
+
+### Performance (v0.7.0 → v0.8.0 on trn1.2xlarge; NKI path)
+
+| Operation | v0.7.0 | v0.8.0 | Speedup |
+|---|---:|---:|---:|
+| fftn 32×64×64 | 52.3 s | 70.8 ms | 738× faster |
+| fft2 256×256 | 5.0 s | 45 ms | 111× faster |
+| fft2 1024×1024 | 32.4 s | 545 ms | 59× faster |
+| batched FFT (128×1024) | 2.07 s | 52 ms | 39× faster |
+| batched FFT (32×1024) | 520 ms | 25 ms | 21× faster |
+| STFT (16k samples) | 765 ms | 28 ms | 27× faster |
+
+**trnfft-NKI now beats vanilla `torch.fft.fft` for batched FFT and STFT.** Single 1D FFT and Bluestein paths are unchanged from v0.7.0 (already batched across groups). Full table and caveats in `docs/benchmarks.md`.
+
+### Known issues
+
+- `#39` Complex mask kernel still fails on 1024×512 shape — contiguity fix was insufficient; actual root cause still TBD.
+- `#40` SBUF-resident dispatch for small ops — deferred to v0.9.0.
 
 ## [0.7.0] - 2026-04-12
 
@@ -123,7 +156,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Speech enhancement example using complex ideal ratio mask (cIRM).
 - 83 tests covering arithmetic, FFT correctness, STFT, NN layers, and gradients.
 
-[Unreleased]: https://github.com/trnsci/trnfft/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/trnsci/trnfft/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/trnsci/trnfft/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/trnsci/trnfft/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/trnsci/trnfft/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/trnsci/trnfft/compare/v0.4.0...v0.5.0
