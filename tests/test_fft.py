@@ -1,14 +1,14 @@
 """Test 1D FFT correctness against numpy.fft."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 import trnfft
 from trnfft import ComplexTensor
 
 
 class TestFFT1D:
-
     def test_impulse(self):
         n = 16
         x = torch.zeros(n)
@@ -70,7 +70,6 @@ class TestFFT1D:
 
 
 class TestIFFT1D:
-
     def test_roundtrip(self, power_of_2_size, random_real_signal):
         n = power_of_2_size
         x = random_real_signal(n)
@@ -89,7 +88,6 @@ class TestIFFT1D:
 
 
 class TestRFFT:
-
     def test_vs_numpy(self, random_real_signal):
         n = 128
         x = random_real_signal(n)
@@ -165,7 +163,6 @@ class TestRFFTnD:
 
 
 class TestBluestein:
-
     def test_vs_numpy_arbitrary(self, arbitrary_size, random_real_signal):
         n = arbitrary_size
         x = random_real_signal(n)
@@ -241,11 +238,21 @@ class TestBluesteinsPrecision:
 
         trnfft.set_precision("fast")
         r_fast = trnfft.fft(x)
-        err_fast = float(np.max(np.abs(r_fast.real.numpy() - expected.real) + np.abs(r_fast.imag.numpy() - expected.imag)))
+        err_fast = float(
+            np.max(
+                np.abs(r_fast.real.numpy() - expected.real)
+                + np.abs(r_fast.imag.numpy() - expected.imag)
+            )
+        )
 
         trnfft.set_precision("double")
         r_dbl = trnfft.fft(x)
-        err_dbl = float(np.max(np.abs(r_dbl.real.numpy() - expected.real) + np.abs(r_dbl.imag.numpy() - expected.imag)))
+        err_dbl = float(
+            np.max(
+                np.abs(r_dbl.real.numpy() - expected.real)
+                + np.abs(r_dbl.imag.numpy() - expected.imag)
+            )
+        )
 
         trnfft.set_precision("fast")
         assert err_dbl < err_fast / 100.0, (
@@ -254,6 +261,7 @@ class TestBluesteinsPrecision:
 
     def test_precision_getter_setter(self):
         import trnfft
+
         assert trnfft.get_precision() == "fast"
         trnfft.set_precision("kahan")
         assert trnfft.get_precision() == "kahan"
@@ -277,8 +285,9 @@ class TestDFTGEMM:
 
     @pytest.mark.parametrize("n", [8, 16, 32, 64, 128])
     def test_matches_numpy(self, n):
-        from trnfft.fft_core import _fft_via_gemm
         from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_gemm
+
         torch.manual_seed(42)
         x = torch.randn(n)
         result = _fft_via_gemm(ComplexTensor(x, torch.zeros(n)), inverse=False)
@@ -288,8 +297,9 @@ class TestDFTGEMM:
 
     @pytest.mark.parametrize("n", [8, 32, 128])
     def test_roundtrip(self, n):
-        from trnfft.fft_core import _fft_via_gemm
         from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_gemm
+
         torch.manual_seed(42)
         x = torch.randn(n)
         ct = ComplexTensor(x, torch.zeros(n))
@@ -299,8 +309,9 @@ class TestDFTGEMM:
         np.testing.assert_allclose(back.imag.numpy(), np.zeros(n), atol=1e-3)
 
     def test_batched(self):
-        from trnfft.fft_core import _fft_via_gemm
         from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_gemm
+
         torch.manual_seed(42)
         x = torch.randn(4, 64)
         result = _fft_via_gemm(ComplexTensor(x, torch.zeros_like(x)), inverse=False)
@@ -310,7 +321,6 @@ class TestDFTGEMM:
 
 
 class TestFFT2D:
-
     def test_vs_numpy(self):
         rng = np.random.default_rng(42)
         x_np = rng.standard_normal((8, 8)).astype(np.float32)
@@ -322,7 +332,6 @@ class TestFFT2D:
 
 
 class TestFFTnD:
-
     def test_fftn_3d(self):
         rng = np.random.default_rng(42)
         x_np = rng.standard_normal((4, 8, 8)).astype(np.float32)
@@ -364,7 +373,6 @@ class TestFFTnD:
 
 @pytest.mark.neuron
 class TestNKIFFT:
-
     def test_fft_nki_vs_numpy(self, nki_backend):
         # Sizes >= 2048 exercise multi-partition tiling in butterfly kernel
         # (num_groups > PMAX=128 in stage 0).
@@ -435,8 +443,8 @@ class TestNKIFFT:
         # with its own FP32 error profile) and this test would measure
         # algorithm divergence instead of the kahan-vs-fast butterfly
         # question it's supposed to answer.
-        from trnfft import set_precision, get_precision
-        from trnfft import fft_core
+        from trnfft import fft_core, get_precision, set_precision
+
         old_prec = get_precision()
         old_thr = fft_core._DFT_GEMM_THRESHOLD
         fft_core._DFT_GEMM_THRESHOLD = 0

@@ -11,7 +11,6 @@ Originally from neuron-complex-ops, now folded into trnfft.
 from __future__ import annotations
 
 import torch
-from typing import Optional
 
 
 class ComplexTensor:
@@ -19,7 +18,7 @@ class ComplexTensor:
 
     __slots__ = ("real", "imag")
 
-    def __init__(self, real: torch.Tensor, imag: Optional[torch.Tensor] = None):
+    def __init__(self, real: torch.Tensor, imag: torch.Tensor | None = None):
         if imag is None:
             if torch.is_complex(real):
                 self.real = real.real.contiguous()
@@ -53,7 +52,7 @@ class ComplexTensor:
         return torch.complex(self.real, self.imag)
 
     def abs(self) -> torch.Tensor:
-        return torch.sqrt(self.real ** 2 + self.imag ** 2)
+        return torch.sqrt(self.real**2 + self.imag**2)
 
     def angle(self) -> torch.Tensor:
         return torch.atan2(self.imag, self.real)
@@ -134,7 +133,7 @@ class ComplexTensor:
     def unsqueeze(self, dim: int) -> ComplexTensor:
         return ComplexTensor(self.real.unsqueeze(dim), self.imag.unsqueeze(dim))
 
-    def squeeze(self, dim: Optional[int] = None) -> ComplexTensor:
+    def squeeze(self, dim: int | None = None) -> ComplexTensor:
         if dim is None:
             return ComplexTensor(self.real.squeeze(), self.imag.squeeze())
         return ComplexTensor(self.real.squeeze(dim), self.imag.squeeze(dim))

@@ -1,13 +1,13 @@
 """Test STFT and ISTFT correctness."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 import trnfft
 
 
 class TestSTFT:
-
     def test_shape(self):
         signal = torch.randn(16000)
         n_fft = 256
@@ -38,7 +38,6 @@ class TestSTFT:
 
 
 class TestISTFT:
-
     def test_roundtrip(self):
         torch.manual_seed(42)
         signal = torch.randn(1024)
@@ -77,9 +76,7 @@ class TestISTFT:
         # Boundary samples where window is zero are irrecoverable without centering.
         # Check interior where overlap-add is well-conditioned.
         interior = slice(hop, -hop)
-        np.testing.assert_allclose(
-            recovered[interior].numpy(), signal[interior].numpy(), atol=1e-3
-        )
+        np.testing.assert_allclose(recovered[interior].numpy(), signal[interior].numpy(), atol=1e-3)
 
 
 @pytest.mark.neuron

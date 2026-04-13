@@ -14,14 +14,16 @@ from __future__ import annotations
 
 try:
     import neuronxcc.nki as nki
-    import neuronxcc.nki.language as nl
     import neuronxcc.nki.isa as nisa
+    import neuronxcc.nki.language as nl
+
     HAS_NKI = True
 except ImportError:
     HAS_NKI = False
 
-from ..complex import ComplexTensor, complex_matmul
 import torch
+
+from ..complex import ComplexTensor, complex_matmul
 
 PMAX = 128  # Max partition dimension (systolic array rows)
 
@@ -133,12 +135,16 @@ if HAS_NKI:
 
                     # Load A row-tile and transpose so partition dim = K.
                     # nl.load gives (TILE_M, TILE_K); need (TILE_K, TILE_M).
-                    ar_t = nl.load_transpose2d(a_real[m_off:m_off+TILE_M, k_off:k_off+TILE_K])
-                    ai_t = nl.load_transpose2d(a_imag[m_off:m_off+TILE_M, k_off:k_off+TILE_K])
+                    ar_t = nl.load_transpose2d(
+                        a_real[m_off : m_off + TILE_M, k_off : k_off + TILE_K]
+                    )
+                    ai_t = nl.load_transpose2d(
+                        a_imag[m_off : m_off + TILE_M, k_off : k_off + TILE_K]
+                    )
 
                     # Load B col-tile with partition dim = K (already K-major).
-                    br = nl.load(b_real[k_off:k_off+TILE_K, n_off:n_off+TILE_N])
-                    bi = nl.load(b_imag[k_off:k_off+TILE_K, n_off:n_off+TILE_N])
+                    br = nl.load(b_real[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                    bi = nl.load(b_imag[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
 
                     # NKI 2.24 doesn't support `psum -=` inside affine_range;
                     # use Vector Engine to negate B_imag, then accumulate with +=.
@@ -154,8 +160,8 @@ if HAS_NKI:
 
                 cr_sbuf = nl.copy(psum_cr, dtype=a_real.dtype)
                 ci_sbuf = nl.copy(psum_ci, dtype=a_real.dtype)
-                nl.store(c_real[m_off:m_off+TILE_M, n_off:n_off+TILE_N], value=cr_sbuf)
-                nl.store(c_imag[m_off:m_off+TILE_M, n_off:n_off+TILE_N], value=ci_sbuf)
+                nl.store(c_real[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=cr_sbuf)
+                nl.store(c_imag[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=ci_sbuf)
 
         return c_real, c_imag
 
@@ -198,14 +204,22 @@ if HAS_NKI:
                     k_off = k * TILE_K
 
                     # Stationary: x tile, transposed so partition dim = K_in.
-                    xr_t = nl.load_transpose2d(x_real[m_off:m_off+TILE_M, k_off:k_off+TILE_K])
-                    xi_t = nl.load_transpose2d(x_imag[m_off:m_off+TILE_M, k_off:k_off+TILE_K])
+                    xr_t = nl.load_transpose2d(
+                        x_real[m_off : m_off + TILE_M, k_off : k_off + TILE_K]
+                    )
+                    xi_t = nl.load_transpose2d(
+                        x_imag[m_off : m_off + TILE_M, k_off : k_off + TILE_K]
+                    )
 
                     # Moving: W^T columns, partition dim = K_in.
                     # W is (K_out, K_in) row-major; W^T is (K_in, K_out).
                     # Slice W[n_off:n_off+TILE_N, k_off:k_off+TILE_K] then transpose:
-                    wr_t = nl.load_transpose2d(w_real[n_off:n_off+TILE_N, k_off:k_off+TILE_K])
-                    wi_t = nl.load_transpose2d(w_imag[n_off:n_off+TILE_N, k_off:k_off+TILE_K])
+                    wr_t = nl.load_transpose2d(
+                        w_real[n_off : n_off + TILE_N, k_off : k_off + TILE_K]
+                    )
+                    wi_t = nl.load_transpose2d(
+                        w_imag[n_off : n_off + TILE_N, k_off : k_off + TILE_K]
+                    )
 
                     # NKI 2.24 doesn't support `psum -=` in affine_range.
                     neg_wi_t = nl.negative(wi_t)
@@ -220,8 +234,8 @@ if HAS_NKI:
 
                 yr_sbuf = nl.copy(psum_yr, dtype=x_real.dtype)
                 yi_sbuf = nl.copy(psum_yi, dtype=x_real.dtype)
-                nl.store(y_real[m_off:m_off+TILE_M, n_off:n_off+TILE_N], value=yr_sbuf)
-                nl.store(y_imag[m_off:m_off+TILE_M, n_off:n_off+TILE_N], value=yi_sbuf)
+                nl.store(y_real[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=yr_sbuf)
+                nl.store(y_imag[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=yi_sbuf)
 
         return y_real, y_imag
 
@@ -229,7 +243,8 @@ if HAS_NKI:
     def _complex_mul_kernel(a_real, a_imag, b_real, b_imag):
         """Fused element-wise complex multiply.
 
-        Computes (a_re + i a_im) * (b_re + i b_im) = (a_re*b_re - a_im*b_im) + i(a_re*b_im + a_im*b_re)
+        Computes (a_re + i a_im) * (b_re + i b_im)
+          = (a_re*b_re - a_im*b_im) + i (a_re*b_im + a_im*b_re)
         in a single kernel, avoiding 6 separate HBM round-trips.
 
         NKI 2.24 partition-dim constraint: any SBUF tile must be 2D with first
@@ -244,8 +259,9 @@ if HAS_NKI:
 
         # Trainium's Vector Engine partition limit. Inputs that are not multiples
         # of 128 elements would need a tail tile — caller pads if necessary.
-        assert total % 128 == 0, \
+        assert total % 128 == 0, (
             f"_complex_mul_kernel requires total size divisible by 128; got {total}"
+        )
 
         free = total // 128
         # Free-dim tile size: cap at 512 to keep SBUF usage reasonable.
@@ -296,9 +312,11 @@ if HAS_NKI:
 
 # --- NKI kernel wrappers ---
 
+
 def _to_xla(*tensors):
     """Move a list of tensors to the XLA device."""
     import torch_xla
+
     device = torch_xla.device()
     return [t.to(device) for t in tensors], tensors[0].device
 
@@ -308,15 +326,19 @@ def _nki_complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
     from .autograd import complex_gemm_autograd
+
     c_real, c_imag = complex_gemm_autograd(a.real, a.imag, b.real, b.imag)
     return ComplexTensor(c_real, c_imag)
 
 
-def _nki_complex_linear(x: ComplexTensor, w_real: torch.Tensor, w_imag: torch.Tensor) -> ComplexTensor:
+def _nki_complex_linear(
+    x: ComplexTensor, w_real: torch.Tensor, w_imag: torch.Tensor
+) -> ComplexTensor:
     """NKI complex linear: y = x @ W^T (complex) via fused 4-matmul kernel (autograd-aware)."""
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
     from .autograd import complex_linear_autograd
+
     y_real, y_imag = complex_linear_autograd(x.real, x.imag, w_real, w_imag)
     return ComplexTensor(y_real, y_imag)
 
@@ -337,8 +359,11 @@ def _nki_complex_mask(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTensor
     # Non-contiguous inputs (e.g., from broadcasting or transposed views) break
     # the reshape at NKI compile time even when the logical shape is fine.
     from .autograd import complex_mul_autograd
+
     c_real, c_imag = complex_mul_autograd(
-        mask.real.contiguous(), mask.imag.contiguous(),
-        spec.real.contiguous(), spec.imag.contiguous(),
+        mask.real.contiguous(),
+        mask.imag.contiguous(),
+        spec.real.contiguous(),
+        spec.imag.contiguous(),
     )
     return ComplexTensor(c_real, c_imag)

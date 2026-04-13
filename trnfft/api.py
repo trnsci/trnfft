@@ -12,14 +12,14 @@ Usage:
 from __future__ import annotations
 
 import math
+
 import torch
-from typing import Optional
 
 from .complex import ComplexTensor
 from .fft_core import fft_core
 
 
-def fft(input: torch.Tensor | ComplexTensor, n: Optional[int] = None) -> ComplexTensor:
+def fft(input: torch.Tensor | ComplexTensor, n: int | None = None) -> ComplexTensor:
     """1-D discrete Fourier Transform along last dimension."""
     x = _to_complex(input)
     if n is not None:
@@ -27,7 +27,7 @@ def fft(input: torch.Tensor | ComplexTensor, n: Optional[int] = None) -> Complex
     return fft_core(x, inverse=False)
 
 
-def ifft(input: torch.Tensor | ComplexTensor, n: Optional[int] = None) -> ComplexTensor:
+def ifft(input: torch.Tensor | ComplexTensor, n: int | None = None) -> ComplexTensor:
     """1-D inverse discrete Fourier Transform."""
     x = _to_complex(input)
     if n is not None:
@@ -35,7 +35,7 @@ def ifft(input: torch.Tensor | ComplexTensor, n: Optional[int] = None) -> Comple
     return fft_core(x, inverse=True)
 
 
-def rfft(input: torch.Tensor, n: Optional[int] = None) -> ComplexTensor:
+def rfft(input: torch.Tensor, n: int | None = None) -> ComplexTensor:
     """1-D FFT of real signal, returning positive frequencies only."""
     if n is not None:
         input = _resize_real(input, n)
@@ -46,7 +46,7 @@ def rfft(input: torch.Tensor, n: Optional[int] = None) -> ComplexTensor:
     return ComplexTensor(result.real[..., :half], result.imag[..., :half])
 
 
-def irfft(input: ComplexTensor, n: Optional[int] = None) -> torch.Tensor:
+def irfft(input: ComplexTensor, n: int | None = None) -> torch.Tensor:
     """Inverse FFT of Hermitian-symmetric spectrum, returning real signal."""
     if n is None:
         n = 2 * (input.shape[-1] - 1)
@@ -61,14 +61,14 @@ def irfft(input: ComplexTensor, n: Optional[int] = None) -> torch.Tensor:
     if n > 1:
         # Indices n-1, n-2, ..., half correspond to conj of indices 1, 2, ..., n-half
         num_neg = n - half
-        full_re[..., half:] = torch.flip(input.real[..., 1:1 + num_neg], dims=[-1])
-        full_im[..., half:] = -torch.flip(input.imag[..., 1:1 + num_neg], dims=[-1])
+        full_re[..., half:] = torch.flip(input.real[..., 1 : 1 + num_neg], dims=[-1])
+        full_im[..., half:] = -torch.flip(input.imag[..., 1 : 1 + num_neg], dims=[-1])
 
     result = fft_core(ComplexTensor(full_re, full_im), inverse=True)
     return result.real
 
 
-def fft2(input: torch.Tensor | ComplexTensor, s: Optional[tuple[int, int]] = None) -> ComplexTensor:
+def fft2(input: torch.Tensor | ComplexTensor, s: tuple[int, int] | None = None) -> ComplexTensor:
     """2-D FFT along last two dimensions."""
     s_arg = None if s is None else tuple(s)
     return fftn(input, s=s_arg, dim=(-2, -1))
@@ -76,8 +76,8 @@ def fft2(input: torch.Tensor | ComplexTensor, s: Optional[tuple[int, int]] = Non
 
 def fftn(
     input: torch.Tensor | ComplexTensor,
-    s: Optional[tuple[int, ...]] = None,
-    dim: Optional[tuple[int, ...]] = None,
+    s: tuple[int, ...] | None = None,
+    dim: tuple[int, ...] | None = None,
 ) -> ComplexTensor:
     """N-D FFT along specified dimensions (default: all)."""
     x = _to_complex(input)
@@ -95,7 +95,7 @@ def fftn(
     # Resize if s is provided
     if s is not None:
         assert len(s) == len(dim), f"len(s)={len(s)} must match len(dim)={len(dim)}"
-        for size, d in zip(s, dim):
+        for size, d in zip(s, dim, strict=True):
             x = _resize_dim(x, d, size)
 
     # Apply 1D FFT along each dimension
@@ -107,8 +107,8 @@ def fftn(
 
 def ifftn(
     input: torch.Tensor | ComplexTensor,
-    s: Optional[tuple[int, ...]] = None,
-    dim: Optional[tuple[int, ...]] = None,
+    s: tuple[int, ...] | None = None,
+    dim: tuple[int, ...] | None = None,
 ) -> ComplexTensor:
     """N-D inverse FFT along specified dimensions (default: all)."""
     x = _to_complex(input)
@@ -124,7 +124,7 @@ def ifftn(
 
     if s is not None:
         assert len(s) == len(dim), f"len(s)={len(s)} must match len(dim)={len(dim)}"
-        for size, d in zip(s, dim):
+        for size, d in zip(s, dim, strict=True):
             x = _resize_dim(x, d, size)
 
     for d in dim:
@@ -135,7 +135,7 @@ def ifftn(
 
 def rfft2(
     input: torch.Tensor,
-    s: Optional[tuple[int, int]] = None,
+    s: tuple[int, int] | None = None,
 ) -> ComplexTensor:
     """2-D FFT of a real signal along the last two dimensions.
 
@@ -147,8 +147,8 @@ def rfft2(
 
 def rfftn(
     input: torch.Tensor,
-    s: Optional[tuple[int, ...]] = None,
-    dim: Optional[tuple[int, ...]] = None,
+    s: tuple[int, ...] | None = None,
+    dim: tuple[int, ...] | None = None,
 ) -> ComplexTensor:
     """N-D FFT of a real signal along specified dimensions.
 
@@ -181,7 +181,7 @@ def rfftn(
 
     # Resize the other dims per s (the last-dim resize was handled by rfft's n=).
     if s is not None:
-        for size, d in zip(s[:-1], other_dims):
+        for size, d in zip(s[:-1], other_dims, strict=True):
             x = _resize_dim(x, d, size)
 
     # Apply full complex FFT along the remaining dims.
@@ -193,7 +193,7 @@ def rfftn(
 
 def irfft2(
     input: ComplexTensor,
-    s: Optional[tuple[int, int]] = None,
+    s: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Inverse of :func:`rfft2`. Returns a real tensor along the last two dims.
 
@@ -207,8 +207,8 @@ def irfft2(
 
 def irfftn(
     input: ComplexTensor,
-    s: Optional[tuple[int, ...]] = None,
-    dim: Optional[tuple[int, ...]] = None,
+    s: tuple[int, ...] | None = None,
+    dim: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Inverse of :func:`rfftn`. Returns a real tensor.
 
@@ -230,7 +230,7 @@ def irfftn(
     # Resize the non-last dims per s (the real-axis size is handled via irfft's n=).
     x = input
     if s is not None:
-        for size, d in zip(s[:-1], other_dims):
+        for size, d in zip(s[:-1], other_dims, strict=True):
             x = _resize_dim(x, d, size)
         n_last = s[-1]
     else:
@@ -257,9 +257,9 @@ def irfftn(
 def stft(
     input: torch.Tensor,
     n_fft: int,
-    hop_length: Optional[int] = None,
-    win_length: Optional[int] = None,
-    window: Optional[torch.Tensor] = None,
+    hop_length: int | None = None,
+    win_length: int | None = None,
+    window: torch.Tensor | None = None,
     center: bool = True,
     pad_mode: str = "reflect",
     normalized: bool = False,
@@ -296,7 +296,7 @@ def stft(
     if win_length < n_fft:
         padded_window = torch.zeros(n_fft, dtype=input.dtype)
         offset = (n_fft - win_length) // 2
-        padded_window[offset:offset + win_length] = window
+        padded_window[offset : offset + win_length] = window
         frames_tensor = frames_tensor * padded_window
     else:
         frames_tensor = frames_tensor * window
@@ -332,13 +332,13 @@ def stft(
 def istft(
     input: ComplexTensor,
     n_fft: int,
-    hop_length: Optional[int] = None,
-    win_length: Optional[int] = None,
-    window: Optional[torch.Tensor] = None,
+    hop_length: int | None = None,
+    win_length: int | None = None,
+    window: torch.Tensor | None = None,
     center: bool = True,
     normalized: bool = False,
     onesided: bool = True,
-    length: Optional[int] = None,
+    length: int | None = None,
 ) -> torch.Tensor:
     """Inverse Short-time Fourier Transform. Reconstructs signal via overlap-add."""
     if hop_length is None:
@@ -367,8 +367,8 @@ def istft(
         full_im[..., :freq_bins] = spec_im
         if full_n > 1:
             num_neg = full_n - freq_bins
-            full_re[..., freq_bins:] = torch.flip(spec_re[..., 1:1 + num_neg], dims=[-1])
-            full_im[..., freq_bins:] = -torch.flip(spec_im[..., 1:1 + num_neg], dims=[-1])
+            full_re[..., freq_bins:] = torch.flip(spec_re[..., 1 : 1 + num_neg], dims=[-1])
+            full_im[..., freq_bins:] = -torch.flip(spec_im[..., 1 : 1 + num_neg], dims=[-1])
         spec_re = full_re
         spec_im = full_im
 
@@ -384,7 +384,7 @@ def istft(
     if win_length < n_fft:
         padded_window = torch.zeros(n_fft, dtype=window.dtype)
         offset = (n_fft - win_length) // 2
-        padded_window[offset:offset + win_length] = window
+        padded_window[offset : offset + win_length] = window
         window = padded_window
 
     # Overlap-add with window normalization
@@ -399,15 +399,15 @@ def istft(
 
     for t in range(num_frames):
         start = t * hop_length
-        output[..., start:start + n_fft] += frames[..., t, :] * window
-        window_sum[start:start + n_fft] += window ** 2
+        output[..., start : start + n_fft] += frames[..., t, :] * window
+        window_sum[start : start + n_fft] += window**2
 
     # Where the window sum is large enough, normalize. Where it's near zero
     # (boundary samples), fall back to the raw overlap-add of IFFT frames.
     raw_output = torch.zeros(*batch_shape, expected_len, dtype=frames.dtype)
     for t in range(num_frames):
         start = t * hop_length
-        raw_output[..., start:start + n_fft] += frames[..., t, :]
+        raw_output[..., start : start + n_fft] += frames[..., t, :]
 
     mask = window_sum > 1e-8
     output[..., mask] = output[..., mask] / window_sum[mask]
@@ -433,6 +433,7 @@ def istft(
 
 
 # --- Helpers ---
+
 
 def _to_complex(x) -> ComplexTensor:
     if isinstance(x, ComplexTensor):

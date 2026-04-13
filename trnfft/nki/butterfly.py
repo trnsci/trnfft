@@ -89,24 +89,24 @@ if HAS_NKI:
             # Process each butterfly position k within this partition tile.
             for k in nl.affine_range(half):
                 # Twiddle for this column, broadcast to match partition dim.
-                t_re_col = nl.load(tw_re_bcast[p_off:p_end, k:k+1])
-                t_im_col = nl.load(tw_im_bcast[p_off:p_end, k:k+1])
+                t_re_col = nl.load(tw_re_bcast[p_off:p_end, k : k + 1])
+                t_im_col = nl.load(tw_im_bcast[p_off:p_end, k : k + 1])
 
                 # Even and odd columns.
-                e_re = nl.load(x_re_2d[p_off:p_end, k:k+1])
-                e_im = nl.load(x_im_2d[p_off:p_end, k:k+1])
-                o_re = nl.load(x_re_2d[p_off:p_end, k+half:k+half+1])
-                o_im = nl.load(x_im_2d[p_off:p_end, k+half:k+half+1])
+                e_re = nl.load(x_re_2d[p_off:p_end, k : k + 1])
+                e_im = nl.load(x_im_2d[p_off:p_end, k : k + 1])
+                o_re = nl.load(x_re_2d[p_off:p_end, k + half : k + half + 1])
+                o_im = nl.load(x_im_2d[p_off:p_end, k + half : k + half + 1])
 
                 # Complex multiply: (t_re + i*t_im) * (o_re + i*o_im)
                 prod_re = t_re_col * o_re - t_im_col * o_im
                 prod_im = t_re_col * o_im + t_im_col * o_re
 
                 # Butterfly: even = e + prod, odd = e - prod
-                nl.store(out_re_2d[p_off:p_end, k:k+1], value=e_re + prod_re)
-                nl.store(out_im_2d[p_off:p_end, k:k+1], value=e_im + prod_im)
-                nl.store(out_re_2d[p_off:p_end, k+half:k+half+1], value=e_re - prod_re)
-                nl.store(out_im_2d[p_off:p_end, k+half:k+half+1], value=e_im - prod_im)
+                nl.store(out_re_2d[p_off:p_end, k : k + 1], value=e_re + prod_re)
+                nl.store(out_im_2d[p_off:p_end, k : k + 1], value=e_im + prod_im)
+                nl.store(out_re_2d[p_off:p_end, k + half : k + half + 1], value=e_re - prod_re)
+                nl.store(out_im_2d[p_off:p_end, k + half : k + half + 1], value=e_im - prod_im)
 
         return out_re, out_im
 
@@ -154,12 +154,12 @@ if HAS_NKI:
             p_end = p_off + groups_chunk
 
             for k in nl.affine_range(half):
-                t_re = nl.load(tw_re_bcast[p_off:p_end, k:k+1])
-                t_im = nl.load(tw_im_bcast[p_off:p_end, k:k+1])
-                e_re = nl.load(x_re_2d[p_off:p_end, k:k+1])
-                e_im = nl.load(x_im_2d[p_off:p_end, k:k+1])
-                o_re = nl.load(x_re_2d[p_off:p_end, k+half:k+half+1])
-                o_im = nl.load(x_im_2d[p_off:p_end, k+half:k+half+1])
+                t_re = nl.load(tw_re_bcast[p_off:p_end, k : k + 1])
+                t_im = nl.load(tw_im_bcast[p_off:p_end, k : k + 1])
+                e_re = nl.load(x_re_2d[p_off:p_end, k : k + 1])
+                e_im = nl.load(x_im_2d[p_off:p_end, k : k + 1])
+                o_re = nl.load(x_re_2d[p_off:p_end, k + half : k + half + 1])
+                o_im = nl.load(x_im_2d[p_off:p_end, k + half : k + half + 1])
 
                 # Dekker split: x -> (xh, xl) with xh + xl == x, xh rounded.
                 def _split(x):
@@ -185,10 +185,10 @@ if HAS_NKI:
                 prod_re = (hi_rr - hi_ii) + (lo_rr - lo_ii)
                 prod_im = (hi_ri + hi_ir) + (lo_ri + lo_ir)
 
-                nl.store(out_re_2d[p_off:p_end, k:k+1], value=e_re + prod_re)
-                nl.store(out_im_2d[p_off:p_end, k:k+1], value=e_im + prod_im)
-                nl.store(out_re_2d[p_off:p_end, k+half:k+half+1], value=e_re - prod_re)
-                nl.store(out_im_2d[p_off:p_end, k+half:k+half+1], value=e_im - prod_im)
+                nl.store(out_re_2d[p_off:p_end, k : k + 1], value=e_re + prod_re)
+                nl.store(out_im_2d[p_off:p_end, k : k + 1], value=e_im + prod_im)
+                nl.store(out_re_2d[p_off:p_end, k + half : k + half + 1], value=e_re - prod_re)
+                nl.store(out_im_2d[p_off:p_end, k + half : k + half + 1], value=e_im - prod_im)
 
         return out_re, out_im
 else:

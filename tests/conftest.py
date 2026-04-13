@@ -28,13 +28,15 @@ def random_real_signal(rng):
     def _make(n, batch=None):
         shape = (batch, n) if batch else (n,)
         return torch.randn(shape, generator=rng)
+
     return _make
 
 
 @pytest.fixture
 def nki_backend():
     """Temporarily set backend to NKI for a test."""
-    from trnfft import set_backend, get_backend
+    from trnfft import get_backend, set_backend
+
     old = get_backend()
     set_backend("nki")
     yield
@@ -45,9 +47,11 @@ def nki_backend():
 def random_complex_signal(rng):
     def _make(n, batch=None):
         from trnfft import ComplexTensor
+
         shape = (batch, n) if batch else (n,)
         return ComplexTensor(
             torch.randn(shape, generator=rng),
             torch.randn(shape, generator=rng),
         )
+
     return _make

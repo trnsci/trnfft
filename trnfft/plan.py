@@ -7,12 +7,8 @@ Plans are cached by (size, dtype, inverse).
 
 from __future__ import annotations
 
-import math
-import torch
-import numpy as np
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional
 
 
 class FFTAlgorithm(Enum):
@@ -25,7 +21,7 @@ class FFTPlan:
     n: int
     algorithm: FFTAlgorithm
     inverse: bool
-    padded_n: Optional[int] = None  # For Bluestein
+    padded_n: int | None = None  # For Bluestein
 
     @property
     def is_power_of_2(self) -> bool:

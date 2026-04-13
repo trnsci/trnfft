@@ -37,6 +37,8 @@ dev = [
     "pytest>=7.0",
     "pytest-benchmark>=4.0",
     "pytest-cov>=4.0",
+    "ruff>=0.8",
+    "pre-commit>=3.5",
     "scipy>=1.11",
     "mkdocs>=1.5",
     "mkdocs-material>=9.0",
@@ -50,6 +52,28 @@ Issues = "https://github.com/trnsci/trnfft/issues"
 
 [tool.setuptools.packages.find]
 include = ["trnfft*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["docs/benchmark_results"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "W",   # pycodestyle warnings
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+]
+ignore = [
+    "E741",  # ambiguous variable names (math code uses I, l, N, etc.)
+    "B008",  # function calls in argument defaults (torch.tensor() etc. are fine)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F401", "F811"]  # tests re-import by design in parametrized sections
 
 [tool.pytest.ini_options]
 markers = [

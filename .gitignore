@@ -26,3 +26,8 @@ site/
 # Build artifacts
 site/
 files*.zip
+
+# Test/bench artifacts
+.coverage
+coverage.xml
+benchmark_results.json

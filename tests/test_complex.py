@@ -1,13 +1,13 @@
 """Test ComplexTensor arithmetic."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 from trnfft import ComplexTensor, complex_matmul
 
 
 class TestComplexArithmetic:
-
     def test_from_real(self):
         x = ComplexTensor(torch.tensor([1.0, 2.0, 3.0]))
         assert x.imag.sum().item() == 0.0
@@ -77,11 +77,11 @@ class TestComplexArithmetic:
 
 
 class TestComplexMatmul:
-
     def test_identity(self):
         I = ComplexTensor(torch.eye(2), torch.zeros(2, 2))
-        b = ComplexTensor(torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
-                          torch.tensor([[5.0, 6.0], [7.0, 8.0]]))
+        b = ComplexTensor(
+            torch.tensor([[1.0, 2.0], [3.0, 4.0]]), torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+        )
         c = complex_matmul(I, b)
         np.testing.assert_allclose(c.real.numpy(), b.real.numpy(), atol=1e-5)
         np.testing.assert_allclose(c.imag.numpy(), b.imag.numpy(), atol=1e-5)
@@ -92,10 +92,14 @@ class TestComplexMatmul:
         b_np = rng.standard_normal((4, 4)) + 1j * rng.standard_normal((4, 4))
         expected = a_np @ b_np
 
-        a = ComplexTensor(torch.tensor(a_np.real, dtype=torch.float32),
-                          torch.tensor(a_np.imag, dtype=torch.float32))
-        b = ComplexTensor(torch.tensor(b_np.real, dtype=torch.float32),
-                          torch.tensor(b_np.imag, dtype=torch.float32))
+        a = ComplexTensor(
+            torch.tensor(a_np.real, dtype=torch.float32),
+            torch.tensor(a_np.imag, dtype=torch.float32),
+        )
+        b = ComplexTensor(
+            torch.tensor(b_np.real, dtype=torch.float32),
+            torch.tensor(b_np.imag, dtype=torch.float32),
+        )
         c = complex_matmul(a, b)
 
         np.testing.assert_allclose(c.real.numpy(), expected.real, atol=1e-4)
@@ -110,9 +114,9 @@ class TestComplexMatmul:
 
 @pytest.mark.neuron
 class TestNKIKernels:
-
     def test_gemm_nki_vs_pytorch(self, nki_backend):
         from trnfft.nki import complex_gemm
+
         rng = np.random.default_rng(42)
         # Shapes (M, K) for A; B is (K, M). Multiples of 128 + non-square.
         for shape in [(128, 128), (256, 512), (512, 512), (1024, 1024)]:
@@ -138,6 +142,7 @@ class TestNKIKernels:
 
     def test_mask_apply_nki_vs_pytorch(self, nki_backend):
         from trnfft.nki import complex_mask_apply
+
         rng = np.random.default_rng(42)
         mask = ComplexTensor(
             torch.tensor(rng.standard_normal((64, 32)), dtype=torch.float32),
@@ -149,9 +154,5 @@ class TestNKIKernels:
         )
         nki_result = complex_mask_apply(mask, spec)
         pytorch_result = mask * spec
-        np.testing.assert_allclose(
-            nki_result.real.numpy(), pytorch_result.real.numpy(), atol=1e-5
-        )
-        np.testing.assert_allclose(
-            nki_result.imag.numpy(), pytorch_result.imag.numpy(), atol=1e-5
-        )
+        np.testing.assert_allclose(nki_result.real.numpy(), pytorch_result.real.numpy(), atol=1e-5)
+        np.testing.assert_allclose(nki_result.imag.numpy(), pytorch_result.imag.numpy(), atol=1e-5)

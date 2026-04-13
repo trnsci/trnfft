@@ -44,12 +44,14 @@ import torch
 # Elementwise complex multiply
 # ---------------------------------------------------------------------------
 
+
 class _ComplexMulFn(torch.autograd.Function):
     """c = a * b (elementwise complex) with autograd support."""
 
     @staticmethod
     def forward(ctx, a_real, a_imag, b_real, b_imag):
-        from .dispatch import _to_xla, _complex_mul_kernel
+        from .dispatch import _complex_mul_kernel, _to_xla
+
         (ar, ai, br, bi), orig = _to_xla(a_real, a_imag, b_real, b_imag)
         c_real, c_imag = _complex_mul_kernel(ar, ai, br, bi)
         ctx.save_for_backward(a_real, a_imag, b_real, b_imag)
@@ -75,12 +77,14 @@ def complex_mul_autograd(a_real, a_imag, b_real, b_imag):
 # Complex GEMM
 # ---------------------------------------------------------------------------
 
+
 class _ComplexGEMMFn(torch.autograd.Function):
     """C = A @ B (complex GEMM) with autograd support."""
 
     @staticmethod
     def forward(ctx, a_real, a_imag, b_real, b_imag):
-        from .dispatch import _to_xla, _complex_gemm_kernel
+        from .dispatch import _complex_gemm_kernel, _to_xla
+
         (ar, ai, br, bi), orig = _to_xla(a_real, a_imag, b_real, b_imag)
         c_real, c_imag = _complex_gemm_kernel(ar, ai, br, bi)
         ctx.save_for_backward(a_real, a_imag, b_real, b_imag)
@@ -109,12 +113,14 @@ def complex_gemm_autograd(a_real, a_imag, b_real, b_imag):
 # Complex Linear  Y = X @ W^T  (W is (K_out, K_in), as stored in nn.Linear)
 # ---------------------------------------------------------------------------
 
+
 class _ComplexLinearFn(torch.autograd.Function):
     """Y = X @ W^T (complex linear) with autograd support."""
 
     @staticmethod
     def forward(ctx, x_real, x_imag, w_real, w_imag):
-        from .dispatch import _to_xla, _complex_linear_kernel
+        from .dispatch import _complex_linear_kernel, _to_xla
+
         (xr, xi, wr, wi), orig = _to_xla(x_real, x_imag, w_real, w_imag)
         y_real, y_imag = _complex_linear_kernel(xr, xi, wr, wi)
         ctx.save_for_backward(x_real, x_imag, w_real, w_imag)
@@ -143,6 +149,7 @@ def complex_linear_autograd(x_real, x_imag, w_real, w_imag):
 # FFT (wraps the full _cooley_tukey_nki, not individual butterfly stages)
 # ---------------------------------------------------------------------------
 
+
 class _FFTFn(torch.autograd.Function):
     """Forward: y = fft(x) (NKI-accelerated butterfly).
 
@@ -153,8 +160,9 @@ class _FFTFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x_real, x_imag, inverse: bool, precision: str = "fast"):
         # Call the raw (non-autograd) FFT path to avoid infinite recursion.
-        from ..fft_core import _cooley_tukey_nki_nograd
         from ..complex import ComplexTensor
+        from ..fft_core import _cooley_tukey_nki_nograd
+
         x = ComplexTensor(x_real, x_imag)
         y = _cooley_tukey_nki_nograd(x, inverse=inverse, precision=precision)
         ctx.inverse = inverse
@@ -164,8 +172,9 @@ class _FFTFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_y_real, grad_y_imag):
-        from ..fft_core import _cooley_tukey_nki_nograd
         from ..complex import ComplexTensor
+        from ..fft_core import _cooley_tukey_nki_nograd
+
         grad_y = ComplexTensor(grad_y_real, grad_y_imag)
         if ctx.inverse:
             # forward was IFFT; backward is FFT(grad) / n

@@ -30,9 +30,7 @@ def set_precision(mode: str) -> None:
     """Set the global precision mode. One of {"fast", "kahan", "double"}."""
     global _precision
     if mode not in _VALID:
-        raise ValueError(
-            f"precision mode must be one of {_VALID}; got {mode!r}"
-        )
+        raise ValueError(f"precision mode must be one of {_VALID}; got {mode!r}")
     _precision = mode
 
 
@@ -46,7 +44,5 @@ def _resolve(precision) -> str:
     if precision is None:
         return _precision
     if precision not in _VALID:
-        raise ValueError(
-            f"precision must be one of {_VALID} or None; got {precision!r}"
-        )
+        raise ValueError(f"precision must be one of {_VALID} or None; got {precision!r}")
     return precision

@@ -40,10 +40,8 @@ raises NotImplementedError.
 from __future__ import annotations
 
 import os
-import torch
 
 from ..complex import ComplexTensor
-
 
 # Disabled by default. Enable via TRNFFT_MULTICORE=1 or set_multicore(True).
 _use_multicore = os.environ.get("TRNFFT_MULTICORE", "0") == "1"
@@ -67,6 +65,7 @@ def multi_core_fft(x: ComplexTensor, inverse: bool = False) -> ComplexTensor:
     """
     if not _use_multicore:
         from ..fft_core import fft_core
+
         return fft_core(x, inverse=inverse)
 
     batch_size = x.shape[0] if x.real.dim() > 1 else 1
@@ -87,5 +86,6 @@ def _batch_split_fft(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     across NeuronCores.
     """
     from ..fft_core import fft_core
+
     # TODO: Replace with torch_neuronx.parallel or similar when validated.
     return fft_core(x, inverse=inverse)

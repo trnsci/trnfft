@@ -9,20 +9,19 @@ All operations on split real/imaginary tensors for Trainium compatibility.
 from __future__ import annotations
 
 import math
+
 import torch
-import numpy as np
-from typing import Optional
 
 from .complex import ComplexTensor
-from .plan import FFTPlan, FFTAlgorithm, create_plan
-from .nki.dispatch import _use_nki, HAS_NKI
+from .nki.dispatch import _use_nki
+from .plan import FFTAlgorithm, FFTPlan, create_plan
 
 
 def fft_core(
     x: ComplexTensor,
     inverse: bool = False,
-    plan: Optional[FFTPlan] = None,
-    precision: Optional[str] = None,
+    plan: FFTPlan | None = None,
+    precision: str | None = None,
 ) -> ComplexTensor:
     """Compute 1-D FFT along last dimension.
 
@@ -33,6 +32,7 @@ def fft_core(
     ``"double"``.
     """
     from .precision import _resolve
+
     prec = _resolve(precision)
 
     n = x.shape[-1]
@@ -77,8 +77,8 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
     # Precompute twiddle factors for all stages
     # W_N^k = exp(sign * 2πi * k / N)
     for s in range(log2n):
-        m = 1 << (s + 1)       # Butterfly group size
-        half = m >> 1           # Half group
+        m = 1 << (s + 1)  # Butterfly group size
+        half = m >> 1  # Half group
 
         # Twiddle: exp(sign * 2πi * k / m) for k = 0..half-1
         angles = sign * 2.0 * math.pi * torch.arange(half, dtype=re.dtype) / m
@@ -188,7 +188,9 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool, precision: str = "fast") 
     return ComplexTensor(y_real, y_imag)
 
 
-def _cooley_tukey_nki_nograd(x: ComplexTensor, inverse: bool, precision: str = "fast") -> ComplexTensor:
+def _cooley_tukey_nki_nograd(
+    x: ComplexTensor, inverse: bool, precision: str = "fast"
+) -> ComplexTensor:
     """Cooley-Tukey FFT using batched NKI butterfly kernel on Trainium.
 
     Accepts any shape; leading dims are flattened into a single batch dim B
@@ -207,8 +209,10 @@ def _cooley_tukey_nki_nograd(x: ComplexTensor, inverse: bool, precision: str = "
     only — the kahan variant stays on the butterfly path so the compensated
     complex multiply remains available for users who explicitly want it.
     """
-    from .nki.butterfly import butterfly_stage_kernel, butterfly_stage_kernel_kahan
     import torch_xla
+
+    from .nki.butterfly import butterfly_stage_kernel, butterfly_stage_kernel_kahan
+
     kernel = butterfly_stage_kernel_kahan if precision == "kahan" else butterfly_stage_kernel
 
     n = x.shape[-1]
@@ -330,7 +334,7 @@ def _complex_mul_kahan(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
 def _bluestein(
     x: ComplexTensor,
     inverse: bool,
-    padded_n: Optional[int] = None,
+    padded_n: int | None = None,
     precision: str = "fast",
 ) -> ComplexTensor:
     """Bluestein's algorithm (chirp-z) for arbitrary-size FFT.

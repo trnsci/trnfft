@@ -8,8 +8,10 @@ and are used in speech enhancement, physics-informed NNs, etc.
 from __future__ import annotations
 
 import math
+
 import torch
 import torch.nn as nn
+
 from .complex import ComplexTensor
 
 
@@ -31,9 +33,11 @@ class ComplexLinear(nn.Module):
     def forward(self, x: ComplexTensor) -> ComplexTensor:
         # (W_re + iW_im)(x_re + ix_im) = (W_re*x_re - W_im*x_im) + i(W_re*x_im + W_im*x_re)
         from .nki.dispatch import _use_nki
+
         if _use_nki():
             # NKI fused 4-real-matmul kernel reuses x tile across phases.
             from .nki.dispatch import complex_linear
+
             y = complex_linear(x, self.W_re.weight, self.W_im.weight)
             re, im = y.real, y.imag
         else:
@@ -48,13 +52,22 @@ class ComplexLinear(nn.Module):
 class ComplexConv1d(nn.Module):
     """Complex-valued 1D convolution."""
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
-                 stride: int = 1, padding: int = 0, bias: bool = True):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        bias: bool = True,
+    ):
         super().__init__()
-        self.conv_re = nn.Conv1d(in_channels, out_channels, kernel_size,
-                                 stride=stride, padding=padding, bias=False)
-        self.conv_im = nn.Conv1d(in_channels, out_channels, kernel_size,
-                                 stride=stride, padding=padding, bias=False)
+        self.conv_re = nn.Conv1d(
+            in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=False
+        )
+        self.conv_im = nn.Conv1d(
+            in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=False
+        )
         if bias:
             self.bias_re = nn.Parameter(torch.zeros(out_channels))
             self.bias_im = nn.Parameter(torch.zeros(out_channels))
