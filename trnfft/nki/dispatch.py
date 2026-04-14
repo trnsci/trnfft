@@ -181,9 +181,13 @@ if HAS_NKI:
                     nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=br, accumulate=True)
 
                 # NKI 0.3.0: nl.copy returns a view; PSUM→SBUF must go through
-                # nisa.tensor_copy to materialize.
-                cr_sbuf = nisa.tensor_copy(psum_cr, dtype=a_real.dtype)
-                ci_sbuf = nisa.tensor_copy(psum_ci, dtype=a_real.dtype)
+                # nisa.tensor_copy to materialize. tensor_copy no longer takes
+                # a dtype kwarg — if the dtypes differ, cast via nl.cast.
+                cr_sbuf = nisa.tensor_copy(psum_cr)
+                ci_sbuf = nisa.tensor_copy(psum_ci)
+                if a_real.dtype != nl.float32:
+                    cr_sbuf = nl.cast(cr_sbuf, dtype=a_real.dtype)
+                    ci_sbuf = nl.cast(ci_sbuf, dtype=a_real.dtype)
                 nl.store(c_real[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=cr_sbuf)
                 nl.store(c_imag[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=ci_sbuf)
 
@@ -257,8 +261,11 @@ if HAS_NKI:
                     nisa.nc_matmul(dst=psum_yi, stationary=xr_t, moving=wi_t, accumulate=True)
                     nisa.nc_matmul(dst=psum_yi, stationary=xi_t, moving=wr_t, accumulate=True)
 
-                yr_sbuf = nisa.tensor_copy(psum_yr, dtype=x_real.dtype)
-                yi_sbuf = nisa.tensor_copy(psum_yi, dtype=x_real.dtype)
+                yr_sbuf = nisa.tensor_copy(psum_yr)
+                yi_sbuf = nisa.tensor_copy(psum_yi)
+                if x_real.dtype != nl.float32:
+                    yr_sbuf = nl.cast(yr_sbuf, dtype=x_real.dtype)
+                    yi_sbuf = nl.cast(yi_sbuf, dtype=x_real.dtype)
                 nl.store(y_real[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=yr_sbuf)
                 nl.store(y_imag[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=yi_sbuf)
 
@@ -326,8 +333,10 @@ if HAS_NKI:
             br = nl.load(b_re_2d[:, f_off:f_end])
             bi = nl.load(b_im_2d[:, f_off:f_end])
 
-            cr = ar * br - ai * bi
-            ci = ar * bi + ai * br
+            # NKI 0.3.0: Python `*`/`+`/`-` operators aren't defined on
+            # NkiTensor; use nl.multiply / nl.subtract / nl.add explicitly.
+            cr = nl.subtract(nl.multiply(ar, br), nl.multiply(ai, bi))
+            ci = nl.add(nl.multiply(ar, bi), nl.multiply(ai, br))
 
             nl.store(c_re_2d[:, f_off:f_end], value=cr)
             nl.store(c_im_2d[:, f_off:f_end], value=ci)
