@@ -76,6 +76,41 @@ class TestComplexMulSimulator:
             trnfft.set_backend("auto")
 
 
+class TestStockhamSimulator:
+    """Radix-4 Stockham FFT kernel under nki.simulate.
+
+    Validates the NKI port agrees with the CPU reference in
+    ``trnfft.stockham`` to FP32 rtol. Curated to small power-of-4 sizes
+    so the simulator finishes in reasonable CI time — perf question is
+    hardware-only.
+    """
+
+    @pytest.mark.parametrize("n", [64, 256])
+    def test_stockham_nki_matches_cpu(self, n):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_stockham_nki
+        from trnfft.stockham import stockham_radix4
+
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        ct = ComplexTensor(x, torch.zeros(n))
+        sim = _fft_via_stockham_nki(ct, inverse=False)
+        cpu = stockham_radix4(ct, inverse=False)
+        np.testing.assert_allclose(sim.real.numpy(), cpu.real.numpy(), atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(sim.imag.numpy(), cpu.imag.numpy(), atol=1e-4, rtol=1e-4)
+
+    def test_stockham_nki_matches_numpy_n256(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_stockham_nki
+
+        torch.manual_seed(42)
+        x = torch.randn(256)
+        sim = _fft_via_stockham_nki(ComplexTensor(x, torch.zeros(256)), inverse=False)
+        expected = np.fft.fft(x.numpy())
+        np.testing.assert_allclose(sim.real.numpy(), expected.real, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(sim.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
+
+
 class TestFFTSimulator:
     """FFT routes through butterfly_stage_kernel over log2(N) stages under
     nki.simulate. Small N only — simulator is not fast at 1024+."""

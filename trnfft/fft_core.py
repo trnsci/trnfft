@@ -189,6 +189,115 @@ def _cooley_tukey_nki(x: ComplexTensor, inverse: bool, precision: str = "fast") 
     return ComplexTensor(y_real, y_imag)
 
 
+def _is_power_of_four(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0 and (int(math.log2(n)) & 1) == 0
+
+
+def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """Radix-4 Stockham FFT driver — dispatches log_4(N) NKI stages.
+
+    Preconditions: ``x.shape[-1]`` is a power of 4. Host-side precomputes
+    the per-stage twiddle, broadcasts it across the partition-dim tile,
+    and calls the stage kernel once per stage. After log_4(N) stages the
+    output is in natural index order (Stockham property — no
+    bit-reversal permutation required).
+
+    Inverse via the conjugate trick, matching the CPU reference in
+    :mod:`trnfft.stockham`: ``ifft(X) = conj(fft(conj(X))) / N``.
+    """
+    from .nki.dispatch import _use_simulator
+    from .nki.stockham import stockham_radix4_stage_kernel
+
+    n = x.shape[-1]
+    assert _is_power_of_four(n), f"Stockham radix-4 requires N=4^k; got N={n}"
+
+    use_sim = _use_simulator()
+    if not use_sim:
+        import torch_xla
+
+    orig_shape = x.real.shape
+    flat_re = x.real.reshape(-1, n).contiguous()
+    flat_im = x.imag.reshape(-1, n).contiguous()
+
+    # Conjugate trick for inverse.
+    if inverse:
+        flat_im = -flat_im
+
+    B = flat_re.shape[0]
+    # Partition-dim tile alignment. Stockham's total_groups = B * L * M
+    # = B * N / 4 stays constant across stages — no padding needed for
+    # power-of-2 B. For non-power-of-2 B, pad to the next multiple of
+    # PMAX so groups_chunk divides total_groups cleanly.
+    PMAX = 128
+
+    def _is_pow2(v: int) -> bool:
+        return v > 0 and (v & (v - 1)) == 0
+
+    if _is_pow2(B):
+        B_pad = B
+        pad_re = flat_re
+        pad_im = flat_im
+    else:
+        B_pad = ((B + PMAX - 1) // PMAX) * PMAX
+        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype)
+        pad_re = torch.cat([flat_re, padding], dim=0)
+        pad_im = torch.cat([flat_im, padding], dim=0)
+
+    orig_device = x.real.device
+    device = None if use_sim else torch_xla.device()
+    re = pad_re if use_sim else pad_re.to(device)
+    im = pad_im if use_sim else pad_im.to(device)
+
+    log4n = int(math.log2(n)) // 2
+    for s in range(log4n):
+        L = 1 << (2 * s)
+        M = n // (4 * L)
+        total_groups = B_pad * L * M
+
+        # Twiddle for this stage: T[l, k] = exp(-2π i * l * k / (4 L)).
+        # Broadcast across (B, M) to get (total_groups, 4).
+        l_idx = torch.arange(L, dtype=x.real.dtype).view(1, L, 1, 1)
+        k_idx = torch.arange(4, dtype=x.real.dtype).view(1, 1, 4, 1)
+        # Sign is fixed at -1 — inverse is handled via the conjugate trick.
+        ang = -2.0 * math.pi * l_idx * k_idx / (4.0 * L)
+        # Broadcast to (B_pad, L, 4, M) then collapse to (B_pad * L * M, 4)
+        # matching the kernel's partition-dim layout.
+        tw_r_4d = torch.cos(ang).expand(B_pad, L, 4, M)
+        tw_i_4d = torch.sin(ang).expand(B_pad, L, 4, M)
+        tw_r = tw_r_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
+        tw_i = tw_i_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
+
+        if use_sim:
+            import nki as _nki
+
+            re_np, im_np = _nki.simulate(stockham_radix4_stage_kernel)(
+                re.detach().cpu().numpy(),
+                im.detach().cpu().numpy(),
+                tw_r.detach().cpu().numpy(),
+                tw_i.detach().cpu().numpy(),
+                n,
+                s,
+            )
+            re = torch.from_numpy(np.asarray(re_np))
+            im = torch.from_numpy(np.asarray(im_np))
+        else:
+            tw_r = tw_r.to(device)
+            tw_i = tw_i.to(device)
+            re, im = stockham_radix4_stage_kernel(re, im, tw_r, tw_i, n, s)
+
+    if not use_sim:
+        re = re.to(orig_device)
+        im = im.to(orig_device)
+    re = re[:B].reshape(orig_shape)
+    im = im[:B].reshape(orig_shape)
+
+    if inverse:
+        im = -im
+        re = re / n
+        im = im / n
+    return ComplexTensor(re, im)
+
+
 def _cooley_tukey_nki_nograd(
     x: ComplexTensor, inverse: bool, precision: str = "fast"
 ) -> ComplexTensor:
