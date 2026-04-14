@@ -50,12 +50,16 @@ class _ComplexMulFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, a_real, a_imag, b_real, b_imag):
-        from .dispatch import _complex_mul_kernel, _to_xla
+        from .dispatch import _complex_mul_kernel, _simulate_kernel, _to_xla, _use_simulator
 
-        (ar, ai, br, bi), orig = _to_xla(a_real, a_imag, b_real, b_imag)
-        c_real, c_imag = _complex_mul_kernel(ar, ai, br, bi)
+        if _use_simulator():
+            c_real, c_imag = _simulate_kernel(_complex_mul_kernel, a_real, a_imag, b_real, b_imag)
+        else:
+            (ar, ai, br, bi), orig = _to_xla(a_real, a_imag, b_real, b_imag)
+            c_real, c_imag = _complex_mul_kernel(ar, ai, br, bi)
+            c_real, c_imag = c_real.to(orig), c_imag.to(orig)
         ctx.save_for_backward(a_real, a_imag, b_real, b_imag)
-        return c_real.to(orig), c_imag.to(orig)
+        return c_real, c_imag
 
     @staticmethod
     def backward(ctx, grad_c_real, grad_c_imag):
@@ -83,12 +87,16 @@ class _ComplexGEMMFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, a_real, a_imag, b_real, b_imag):
-        from .dispatch import _complex_gemm_kernel, _to_xla
+        from .dispatch import _complex_gemm_kernel, _simulate_kernel, _to_xla, _use_simulator
 
-        (ar, ai, br, bi), orig = _to_xla(a_real, a_imag, b_real, b_imag)
-        c_real, c_imag = _complex_gemm_kernel(ar, ai, br, bi)
+        if _use_simulator():
+            c_real, c_imag = _simulate_kernel(_complex_gemm_kernel, a_real, a_imag, b_real, b_imag)
+        else:
+            (ar, ai, br, bi), orig = _to_xla(a_real, a_imag, b_real, b_imag)
+            c_real, c_imag = _complex_gemm_kernel(ar, ai, br, bi)
+            c_real, c_imag = c_real.to(orig), c_imag.to(orig)
         ctx.save_for_backward(a_real, a_imag, b_real, b_imag)
-        return c_real.to(orig), c_imag.to(orig)
+        return c_real, c_imag
 
     @staticmethod
     def backward(ctx, grad_c_real, grad_c_imag):
@@ -119,12 +127,18 @@ class _ComplexLinearFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x_real, x_imag, w_real, w_imag):
-        from .dispatch import _complex_linear_kernel, _to_xla
+        from .dispatch import _complex_linear_kernel, _simulate_kernel, _to_xla, _use_simulator
 
-        (xr, xi, wr, wi), orig = _to_xla(x_real, x_imag, w_real, w_imag)
-        y_real, y_imag = _complex_linear_kernel(xr, xi, wr, wi)
+        if _use_simulator():
+            y_real, y_imag = _simulate_kernel(
+                _complex_linear_kernel, x_real, x_imag, w_real, w_imag
+            )
+        else:
+            (xr, xi, wr, wi), orig = _to_xla(x_real, x_imag, w_real, w_imag)
+            y_real, y_imag = _complex_linear_kernel(xr, xi, wr, wi)
+            y_real, y_imag = y_real.to(orig), y_imag.to(orig)
         ctx.save_for_backward(x_real, x_imag, w_real, w_imag)
-        return y_real.to(orig), y_imag.to(orig)
+        return y_real, y_imag
 
     @staticmethod
     def backward(ctx, grad_y_real, grad_y_imag):

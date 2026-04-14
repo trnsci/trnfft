@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 
 from .complex import ComplexTensor
@@ -209,11 +210,13 @@ def _cooley_tukey_nki_nograd(
     only — the kahan variant stays on the butterfly path so the compensated
     complex multiply remains available for users who explicitly want it.
     """
-    import torch_xla
-
     from .nki.butterfly import butterfly_stage_kernel, butterfly_stage_kernel_kahan
+    from .nki.dispatch import _use_simulator
 
     kernel = butterfly_stage_kernel_kahan if precision == "kahan" else butterfly_stage_kernel
+    use_sim = _use_simulator()
+    if not use_sim:
+        import torch_xla
 
     n = x.shape[-1]
     if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
@@ -254,13 +257,16 @@ def _cooley_tukey_nki_nograd(
 
     sign = 1.0 if inverse else -1.0
 
-    device = torch_xla.device()
     orig_device = x.real.device
+    device = None if use_sim else torch_xla.device()
 
     # Bit-reversal permutation along the last dim.
     indices = _bit_reverse_indices(n, log2n)
-    re = pad_re[..., indices].to(device)
-    im = pad_im[..., indices].to(device)
+    re = pad_re[..., indices]
+    im = pad_im[..., indices]
+    if not use_sim:
+        re = re.to(device)
+        im = im.to(device)
 
     # Run butterfly stages via batched NKI kernel.
     for s in range(log2n):
@@ -274,13 +280,32 @@ def _cooley_tukey_nki_nograd(
         angles = sign * 2.0 * math.pi * torch.arange(half, dtype=x.real.dtype) / m
         tw_re_1d = torch.cos(angles)
         tw_im_1d = torch.sin(angles)
-        tw_re_bcast = tw_re_1d.unsqueeze(0).expand(total_groups, half).contiguous().to(device)
-        tw_im_bcast = tw_im_1d.unsqueeze(0).expand(total_groups, half).contiguous().to(device)
+        tw_re_bcast = tw_re_1d.unsqueeze(0).expand(total_groups, half).contiguous()
+        tw_im_bcast = tw_im_1d.unsqueeze(0).expand(total_groups, half).contiguous()
 
-        re, im = kernel(re, im, tw_re_bcast, tw_im_bcast, n, s)
+        if use_sim:
+            import nki as _nki
 
-    re = re.to(orig_device)[:B_orig].reshape(orig_shape)
-    im = im.to(orig_device)[:B_orig].reshape(orig_shape)
+            re_np, im_np = _nki.simulate(kernel)(
+                re.detach().cpu().numpy(),
+                im.detach().cpu().numpy(),
+                tw_re_bcast.detach().cpu().numpy(),
+                tw_im_bcast.detach().cpu().numpy(),
+                n,
+                s,
+            )
+            re = torch.from_numpy(np.asarray(re_np))
+            im = torch.from_numpy(np.asarray(im_np))
+        else:
+            tw_re_bcast = tw_re_bcast.to(device)
+            tw_im_bcast = tw_im_bcast.to(device)
+            re, im = kernel(re, im, tw_re_bcast, tw_im_bcast, n, s)
+
+    if not use_sim:
+        re = re.to(orig_device)
+        im = im.to(orig_device)
+    re = re[:B_orig].reshape(orig_shape)
+    im = im[:B_orig].reshape(orig_shape)
     result = ComplexTensor(re, im)
     if inverse:
         result = result * (1.0 / n)

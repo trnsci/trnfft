@@ -26,11 +26,12 @@ dependencies = [
 
 [project.optional-dependencies]
 neuron = [
-    # neuronxcc is not on public PyPI; it ships with the Deep Learning AMI Neuron.
-    # We pin >=2.24 because the NKI kernels use the 2.24+ nc_matmul calling
-    # convention and partition-dim tile layout. See docs/installation.md for the
-    # validated AMI/SDK versions.
-    "neuronxcc>=2.24",
+    # nki is not on public PyPI; it ships with the Deep Learning AMI Neuron.
+    # We pin >=0.3.0 because the NKI kernels use the 0.3.0 nc_matmul kwargs
+    # calling convention (dst=, stationary=, moving=, accumulate=True) and
+    # nisa.tensor_copy for PSUM→SBUF materialization. See
+    # docs/installation.md for the validated AMI/SDK versions.
+    "nki>=0.3.0",
     "torch-neuronx>=2.9",
 ]
 dev = [
@@ -78,5 +79,6 @@ ignore = [
 [tool.pytest.ini_options]
 markers = [
     "neuron: requires Neuron hardware (trn1/trn2 instance)",
+    "nki_simulator: runs under nki.simulate (CPU); requires nki>=0.3.0 + TRNFFT_USE_SIMULATOR=1",
 ]
 testpaths = ["tests"]

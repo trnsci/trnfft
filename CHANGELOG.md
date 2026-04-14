@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **NKI 0.3.0 (Neuron SDK 2.29) migration + CPU simulator dispatch** (#59). `trnfft` now targets the stable `nki` package namespace (`import nki` instead of `import neuronxcc.nki`) and adopts the 0.3.0 calling convention (`nisa.nc_matmul` kwargs-only; `nisa.tensor_copy` for PSUM→SBUF). Kernels run in a new simulator mode via `TRNFFT_USE_SIMULATOR=1`, routing through `nki.simulate(kernel)(numpy_args)` on CPU. Catches Python-trace-level errors (bad kwargs, dropped ops, shape mismatches) without round-tripping to Trainium. MLIR verifier errors remain hardware-only.
+- New `nki-simulator` job in `.github/workflows/ci.yml` running simulator-marked tests on `ubuntu-latest` — first correctness gate for kernel changes that doesn't need AWS access.
+- New `tests/test_nki_sim.py` with simulator-backed tests for `_complex_gemm_kernel`, `_complex_mul_kernel`, and the butterfly FFT path. Curated to small shapes (simulator is CPU-slow at 1024+).
+- New `scripts/run_simulator_tests.sh` mirroring `run_neuron_tests.sh` but with `TRNFFT_USE_SIMULATOR=1` in the SSM env; still AWS-resident as a fallback when the GH-native job can't run.
+- `docs/developing_kernels.md` — trnfft-specific kernel dev pattern, with pointer to the suite-wide guide in trnsci/trnsci.
+
+### Changed
+
+- `pyproject.toml` `[neuron]` extra pins `nki>=0.3.0` (was `neuronxcc>=2.24`). Users on pre-2.29 SDKs must upgrade the DLAMI (`terraform apply` picks up the new AMI automatically).
+- Existing `test` matrix runs with `-m "not neuron and not nki_simulator"` so each test runs on exactly one CI job.
+
 ## [0.12.0] - 2026-04-13
 
 ### Added

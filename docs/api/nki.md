@@ -7,12 +7,18 @@ trnfft auto-detects Trainium hardware and dispatches to optimized NKI kernels wh
 ```python
 import trnfft
 
-trnfft.HAS_NKI          # True if neuronxcc is installed
+trnfft.HAS_NKI          # True if nki (>=0.3.0) is installed
 trnfft.get_backend()    # Current setting: "auto", "pytorch", or "nki"
 trnfft.set_backend("auto")     # NKI if available, else PyTorch (default)
 trnfft.set_backend("pytorch")  # Force PyTorch (any device)
 trnfft.set_backend("nki")      # Force NKI (fails if not on Trainium)
 ```
+
+## Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `TRNFFT_USE_SIMULATOR=1` | Route NKI kernels through `nki.simulate(kernel)(np_args)` on CPU instead of the NEFF + hardware path. Requires `nki>=0.3.0`. Correctness iteration only; simulator explicitly skips NEFF compile and SBUF/PSUM capacity checks. See [developing_kernels.md](../developing_kernels.md). |
 
 ## NKI kernels
 

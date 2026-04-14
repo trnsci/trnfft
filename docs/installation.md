@@ -31,7 +31,7 @@ pytest tests/ -v
 - Python >= 3.10
 - PyTorch >= 2.1
 - NumPy >= 1.24
-- neuronxcc >= 2.24 (optional, for Trainium hardware)
+- nki >= 0.3.0 (optional, for Trainium hardware or CPU simulator; Neuron SDK 2.29+)
 - torch-neuronx >= 2.9 (optional, for Trainium hardware)
 
 ## Hardware compatibility
@@ -40,13 +40,14 @@ The NKI kernels in trnfft are validated against this stack:
 
 | Component | Version |
 |-----------|---------|
-| Neuron SDK (`neuronxcc`) | **2.24.5133.0** (or later 2.24.x) |
-| Deep Learning AMI | **Deep Learning AMI Neuron PyTorch 2.9 (Ubuntu 24.04)** — 20260410 or later |
+| Neuron SDK | **2.29+** (ships NKI 0.3.0 Stable) |
+| `nki` package | **>=0.3.0** |
+| Deep Learning AMI | **Deep Learning AMI Neuron PyTorch 2.9 (Ubuntu 24.04)** with SDK 2.29 bundle |
 | Pre-built venv on AMI | `/opt/aws_neuronx_venv_pytorch_2_9` |
 | Instance types | `trn1.*`, `trn2.*`, `inf2.*` |
 | Python on AMI | 3.12 |
 
-Older Neuron SDKs (< 2.24) used a different `nisa.nc_matmul` calling convention and tile layout requirements; the kernels here will not compile against them. Use the AMI listed above (or its successor in the same major series) for guaranteed compatibility.
+Older Neuron SDKs (< 2.29) used `neuronxcc.nki` namespace and a pre-kwargs `nisa.nc_matmul` calling convention; kernels on 0.12.0+ will not compile against them. If terraform is managing your instance, `terraform apply` auto-picks the latest matching DLAMI. For correctness iteration without hardware, set `TRNFFT_USE_SIMULATOR=1` (see [`docs/api/nki.md`](api/nki.md)).
 
 If you must use a different SDK version, set `trnfft.set_backend("pytorch")` to skip NKI dispatch entirely. CPU/PyTorch correctness is preserved across all platforms.
 

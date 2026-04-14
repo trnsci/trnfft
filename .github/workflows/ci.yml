@@ -28,9 +28,30 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
-      - run: pytest tests/ -v -x --tb=short -m "not neuron" --cov=trnfft --cov-report=xml
+      - run: pytest tests/ -v -x --tb=short -m "not neuron and not nki_simulator" --cov=trnfft --cov-report=xml
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: trnsci/trnfft
+
+  nki-simulator:
+    # Runs NKI kernels through nki.simulate(kernel)(numpy_args) on CPU.
+    # Catches Python-trace-level errors (bad kwargs, dropped ops, shape
+    # mismatches) pre-merge without AWS round-trips. MLIR verifier
+    # errors remain hardware-only (simulator explicitly skips compile).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install trnfft + NKI simulator deps
+        run: |
+          pip install -e ".[dev]"
+          pip install --extra-index-url https://pip.repos.neuron.amazonaws.com \
+            "nki>=0.3.0"
+      - name: Run simulator-backed kernel tests
+        env:
+          TRNFFT_USE_SIMULATOR: "1"
+        run: pytest tests/ -v -m nki_simulator --tb=short

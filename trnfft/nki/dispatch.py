@@ -12,20 +12,40 @@ Backend selection:
 
 from __future__ import annotations
 
+import os
+
 try:
-    import neuronxcc.nki as nki
-    import neuronxcc.nki.isa as nisa
-    import neuronxcc.nki.language as nl
+    import nki
+    import nki.isa as nisa
+    import nki.language as nl
 
     HAS_NKI = True
 except ImportError:
     HAS_NKI = False
 
+import numpy as np
 import torch
 
 from ..complex import ComplexTensor, complex_matmul
 
 PMAX = 128  # Max partition dimension (systolic array rows)
+
+# When set, dispatch bypasses torch_xla and runs kernels through
+# `nki.simulate(kernel)(np_args)` on CPU. Lets us iterate kernels on any
+# x86_64 Linux box without paying the NEFF compile + hardware dispatch
+# cost. Semantics follow NKI 0.3.0's simulator: no NEFF compile, no
+# SBUF/PSUM capacity checks, no latency/parallelism modelling. For
+# correctness iteration only; hardware still owns perf numbers.
+_USE_SIMULATOR = os.environ.get("TRNFFT_USE_SIMULATOR", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _use_simulator() -> bool:
+    return _USE_SIMULATOR and HAS_NKI
+
 
 _backend = "auto"
 
@@ -35,7 +55,7 @@ def set_backend(backend: str):
     global _backend
     assert backend in ("auto", "pytorch", "nki")
     if backend == "nki" and not HAS_NKI:
-        raise RuntimeError("NKI backend requires neuronxcc. Install with: pip install neuronxcc")
+        raise RuntimeError("NKI backend requires nki>=0.3.0 (Neuron SDK 2.29+)")
     _backend = backend
 
 
@@ -151,15 +171,19 @@ if HAS_NKI:
                     neg_bi = nl.negative(bi)
 
                     # C_real += A_real @ B_real  +  A_imag @ (-B_imag)
-                    psum_cr[...] += nisa.nc_matmul(ar_t, br)
-                    psum_cr[...] += nisa.nc_matmul(ai_t, neg_bi)
+                    # NKI 0.3.0: nc_matmul is kwargs-only with dst= / accumulate=
+                    # for in-place accumulation into the PSUM tile.
+                    nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=br, accumulate=True)
+                    nisa.nc_matmul(dst=psum_cr, stationary=ai_t, moving=neg_bi, accumulate=True)
 
                     # C_imag += A_real @ B_imag  +  A_imag @ B_real
-                    psum_ci[...] += nisa.nc_matmul(ar_t, bi)
-                    psum_ci[...] += nisa.nc_matmul(ai_t, br)
+                    nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=bi, accumulate=True)
+                    nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=br, accumulate=True)
 
-                cr_sbuf = nl.copy(psum_cr, dtype=a_real.dtype)
-                ci_sbuf = nl.copy(psum_ci, dtype=a_real.dtype)
+                # NKI 0.3.0: nl.copy returns a view; PSUM→SBUF must go through
+                # nisa.tensor_copy to materialize.
+                cr_sbuf = nisa.tensor_copy(psum_cr, dtype=a_real.dtype)
+                ci_sbuf = nisa.tensor_copy(psum_ci, dtype=a_real.dtype)
                 nl.store(c_real[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=cr_sbuf)
                 nl.store(c_imag[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=ci_sbuf)
 
@@ -225,15 +249,16 @@ if HAS_NKI:
                     neg_wi_t = nl.negative(wi_t)
 
                     # y_real += x_real @ W_real^T  +  x_imag @ (-W_imag^T)
-                    psum_yr[...] += nisa.nc_matmul(xr_t, wr_t)
-                    psum_yr[...] += nisa.nc_matmul(xi_t, neg_wi_t)
+                    # NKI 0.3.0: kwargs-only in-place accumulation.
+                    nisa.nc_matmul(dst=psum_yr, stationary=xr_t, moving=wr_t, accumulate=True)
+                    nisa.nc_matmul(dst=psum_yr, stationary=xi_t, moving=neg_wi_t, accumulate=True)
 
                     # y_imag += x_real @ W_imag^T  +  x_imag @ W_real^T
-                    psum_yi[...] += nisa.nc_matmul(xr_t, wi_t)
-                    psum_yi[...] += nisa.nc_matmul(xi_t, wr_t)
+                    nisa.nc_matmul(dst=psum_yi, stationary=xr_t, moving=wi_t, accumulate=True)
+                    nisa.nc_matmul(dst=psum_yi, stationary=xi_t, moving=wr_t, accumulate=True)
 
-                yr_sbuf = nl.copy(psum_yr, dtype=x_real.dtype)
-                yi_sbuf = nl.copy(psum_yi, dtype=x_real.dtype)
+                yr_sbuf = nisa.tensor_copy(psum_yr, dtype=x_real.dtype)
+                yi_sbuf = nisa.tensor_copy(psum_yi, dtype=x_real.dtype)
                 nl.store(y_real[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=yr_sbuf)
                 nl.store(y_imag[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=yi_sbuf)
 
@@ -319,6 +344,26 @@ def _to_xla(*tensors):
 
     device = torch_xla.device()
     return [t.to(device) for t in tensors], tensors[0].device
+
+
+def _simulate_kernel(kernel, *tensors):
+    """Route a kernel call through `nki.simulate` on CPU.
+
+    Converts each input tensor to numpy, calls the simulator, and marshals
+    results back to torch tensors on the original device. Kernels with
+    multiple HBM outputs return a tuple of numpy arrays; single-output
+    kernels return a numpy array.
+
+    Used by the dispatch wrappers when ``TRNFFT_USE_SIMULATOR=1`` is set
+    in the environment. Bypasses torch_xla and NEFF compile entirely —
+    correctness iteration only; hardware still owns perf numbers.
+    """
+    orig_device = tensors[0].device
+    np_args = [t.detach().cpu().numpy() for t in tensors]
+    out = nki.simulate(kernel)(*np_args)
+    if isinstance(out, tuple):
+        return tuple(torch.from_numpy(np.asarray(o)).to(orig_device) for o in out)
+    return torch.from_numpy(np.asarray(out)).to(orig_device)
 
 
 def _nki_complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:

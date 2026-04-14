@@ -34,8 +34,8 @@ from __future__ import annotations
 from .dispatch import HAS_NKI
 
 if HAS_NKI:
-    import neuronxcc.nki as nki
-    import neuronxcc.nki.language as nl
+    import nki
+    import nki.language as nl
 
     PMAX = 128
 
