@@ -198,7 +198,19 @@ class TestFFTN:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(params=[(32, 1024), (128, 1024)])
+@pytest.fixture(
+    params=[
+        # Small-N shapes below _DFT_GEMM_THRESHOLD (256) — auto-dispatch to
+        # DFT-as-GEMM on NKI. Batched input = one matmul for the whole batch,
+        # M=B provides full systolic-array partition utilization.
+        (32, 128),
+        (32, 256),
+        # Above-threshold shapes — still on the butterfly path. Regression
+        # baseline for comparing v0.11 (pre-DFT-GEMM) numbers.
+        (32, 1024),
+        (128, 1024),
+    ]
+)
 def batched_shape(request):
     return request.param
 
@@ -278,28 +290,42 @@ def waveform():
     return torch.randn(16000)
 
 
-class TestSTFT:
-    N_FFT = 512
-    HOP = 256
+# STFT parametrization spans the DFT-GEMM threshold (256). The small-n_fft
+# variants flatten to many frames of small-N FFT — the canonical "many FFTs
+# at small N" case that should collapse to one matmul under v0.12's fast path.
+@pytest.fixture(
+    params=[
+        (128, 64),  # n_fft=128 → DFT-GEMM
+        (256, 128),  # n_fft=256 → DFT-GEMM (exactly at threshold)
+        (512, 256),  # n_fft=512 → butterfly (pre-v0.12 baseline)
+    ]
+)
+def stft_config(request):
+    return request.param
 
+
+class TestSTFT:
     @pytest.mark.neuron
-    def test_stft_nki(self, benchmark, waveform):
+    def test_stft_nki(self, benchmark, waveform, stft_config):
+        n_fft, hop = stft_config
         _set("nki")
         try:
-            _warm(trnfft.stft, waveform, n_fft=self.N_FFT, hop_length=self.HOP)
-            benchmark(trnfft.stft, waveform, n_fft=self.N_FFT, hop_length=self.HOP)
+            _warm(trnfft.stft, waveform, n_fft=n_fft, hop_length=hop)
+            benchmark(trnfft.stft, waveform, n_fft=n_fft, hop_length=hop)
         finally:
             _set("auto")
 
-    def test_stft_trnfft_pytorch(self, benchmark, waveform):
+    def test_stft_trnfft_pytorch(self, benchmark, waveform, stft_config):
+        n_fft, hop = stft_config
         _set("pytorch")
         try:
-            benchmark(trnfft.stft, waveform, n_fft=self.N_FFT, hop_length=self.HOP)
+            benchmark(trnfft.stft, waveform, n_fft=n_fft, hop_length=hop)
         finally:
             _set("auto")
 
-    def test_stft_torch(self, benchmark, waveform):
-        benchmark(torch.stft, waveform, n_fft=self.N_FFT, hop_length=self.HOP, return_complex=True)
+    def test_stft_torch(self, benchmark, waveform, stft_config):
+        n_fft, hop = stft_config
+        benchmark(torch.stft, waveform, n_fft=n_fft, hop_length=hop, return_complex=True)
 
 
 # ---------------------------------------------------------------------------
