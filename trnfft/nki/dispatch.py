@@ -181,10 +181,12 @@ if HAS_NKI:
                     nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=br, accumulate=True)
 
                 # NKI 0.3.0: nl.copy returns a view; PSUM→SBUF must go through
-                # nisa.tensor_copy to materialize. tensor_copy no longer takes
-                # a dtype kwarg — if the dtypes differ, cast via nl.cast.
-                cr_sbuf = nisa.tensor_copy(psum_cr)
-                ci_sbuf = nisa.tensor_copy(psum_ci)
+                # nisa.tensor_copy(dst=, src=) into a pre-allocated SBUF tile.
+                # If the destination dtype differs from PSUM's fp32, cast after.
+                cr_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+                ci_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=cr_sbuf, src=psum_cr)
+                nisa.tensor_copy(dst=ci_sbuf, src=psum_ci)
                 if a_real.dtype != nl.float32:
                     cr_sbuf = nl.cast(cr_sbuf, dtype=a_real.dtype)
                     ci_sbuf = nl.cast(ci_sbuf, dtype=a_real.dtype)
@@ -261,8 +263,10 @@ if HAS_NKI:
                     nisa.nc_matmul(dst=psum_yi, stationary=xr_t, moving=wi_t, accumulate=True)
                     nisa.nc_matmul(dst=psum_yi, stationary=xi_t, moving=wr_t, accumulate=True)
 
-                yr_sbuf = nisa.tensor_copy(psum_yr)
-                yi_sbuf = nisa.tensor_copy(psum_yi)
+                yr_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+                yi_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=yr_sbuf, src=psum_yr)
+                nisa.tensor_copy(dst=yi_sbuf, src=psum_yi)
                 if x_real.dtype != nl.float32:
                     yr_sbuf = nl.cast(yr_sbuf, dtype=x_real.dtype)
                     yi_sbuf = nl.cast(yi_sbuf, dtype=x_real.dtype)
