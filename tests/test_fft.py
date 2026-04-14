@@ -320,6 +320,72 @@ class TestDFTGEMM:
         np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
 
 
+class TestStockhamRadix4:
+    """CPU reference for radix-4 Stockham FFT (trnfft.stockham).
+
+    Validates indexing + twiddle math that the NKI port mirrors. The
+    Stockham advantage over DFT-GEMM shows up directly in FP32 error
+    scaling: log_4(N) stages of small 4x4 DFTs accumulate ~1e-6 relative
+    error at N=4096, vs DFT-GEMM's ~2% at N=1024.
+    """
+
+    @pytest.mark.parametrize("n", [16, 64, 256, 1024, 4096])
+    def test_matches_numpy(self, n):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_radix4
+
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        result = stockham_radix4(ComplexTensor(x, torch.zeros(n)), inverse=False)
+        expected = np.fft.fft(x.numpy())
+        # Stockham-FP32 is tighter than DFT-GEMM: 1e-4 works across the range.
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("n", [16, 64, 256, 1024, 4096])
+    def test_roundtrip(self, n):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_radix4
+
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        ct = ComplexTensor(x, torch.zeros(n))
+        X = stockham_radix4(ct, inverse=False)
+        back = stockham_radix4(X, inverse=True)
+        np.testing.assert_allclose(back.real.numpy(), x.numpy(), atol=1e-5)
+        np.testing.assert_allclose(back.imag.numpy(), np.zeros(n), atol=1e-5)
+
+    def test_ifft_vs_numpy(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_radix4
+
+        torch.manual_seed(42)
+        xr = torch.randn(256)
+        xi = torch.randn(256)
+        result = stockham_radix4(ComplexTensor(xr, xi), inverse=True)
+        expected = np.fft.ifft(xr.numpy() + 1j * xi.numpy())
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-4, rtol=1e-4)
+
+    def test_batched(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_radix4
+
+        torch.manual_seed(42)
+        x = torch.randn(4, 256)
+        result = stockham_radix4(ComplexTensor(x, torch.zeros_like(x)), inverse=False)
+        expected = np.fft.fft(x.numpy(), axis=-1)
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-4, rtol=1e-4)
+
+    def test_rejects_non_power_of_four(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_radix4
+
+        with pytest.raises(AssertionError, match="N=4\\^k"):
+            stockham_radix4(ComplexTensor(torch.randn(32), torch.zeros(32)))
+
+
 class TestFFT2D:
     def test_vs_numpy(self):
         rng = np.random.default_rng(42)
