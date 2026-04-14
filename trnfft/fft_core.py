@@ -254,36 +254,45 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         M = n // (4 * L)
         total_groups = B_pad * L * M
 
-        # Twiddle for this stage: T[l, k] = exp(-2π i * l * k / (4 L)).
-        # Broadcast across (B, M) to get (total_groups, 4).
+        # Pack stage-s input into (total_groups, 4) where each partition
+        # row is one 4-point DFT group and the k-axis (the four elements
+        # going through the DFT) is the free dim. CPU ref uses layout
+        # (B, L, 4, M) with k at position 2 (stride M); we permute so k
+        # is the contiguous innermost axis.
+        re_4d = re.reshape(B_pad, L, 4, M)
+        im_4d = im.reshape(B_pad, L, 4, M)
+        re_groups = re_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
+        im_groups = im_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
+
+        # Twiddle T[l, k] = exp(-2π i * l * k / (4 L)). Sign fixed at -1
+        # (inverse handled via conjugate trick).
         l_idx = torch.arange(L, dtype=x.real.dtype).view(1, L, 1, 1)
-        k_idx = torch.arange(4, dtype=x.real.dtype).view(1, 1, 4, 1)
-        # Sign is fixed at -1 — inverse is handled via the conjugate trick.
+        k_idx = torch.arange(4, dtype=x.real.dtype).view(1, 1, 1, 4)
         ang = -2.0 * math.pi * l_idx * k_idx / (4.0 * L)
-        # Broadcast to (B_pad, L, 4, M) then collapse to (B_pad * L * M, 4)
-        # matching the kernel's partition-dim layout.
-        tw_r_4d = torch.cos(ang).expand(B_pad, L, 4, M)
-        tw_i_4d = torch.sin(ang).expand(B_pad, L, 4, M)
-        tw_r = tw_r_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
-        tw_i = tw_i_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
+        tw_r = torch.cos(ang).expand(B_pad, L, M, 4).contiguous().reshape(total_groups, 4)
+        tw_i = torch.sin(ang).expand(B_pad, L, M, 4).contiguous().reshape(total_groups, 4)
 
         if use_sim:
             import nki as _nki
 
-            re_np, im_np = _nki.simulate(stockham_radix4_stage_kernel)(
-                re.detach().cpu().numpy(),
-                im.detach().cpu().numpy(),
+            out_re_np, out_im_np = _nki.simulate(stockham_radix4_stage_kernel)(
+                re_groups.detach().cpu().numpy(),
+                im_groups.detach().cpu().numpy(),
                 tw_r.detach().cpu().numpy(),
                 tw_i.detach().cpu().numpy(),
-                n,
-                s,
             )
-            re = torch.from_numpy(np.asarray(re_np))
-            im = torch.from_numpy(np.asarray(im_np))
+            out_re = torch.from_numpy(np.asarray(out_re_np))
+            out_im = torch.from_numpy(np.asarray(out_im_np))
         else:
             tw_r = tw_r.to(device)
             tw_i = tw_i.to(device)
-            re, im = stockham_radix4_stage_kernel(re, im, tw_r, tw_i, n, s)
+            out_re, out_im = stockham_radix4_stage_kernel(re_groups, im_groups, tw_r, tw_i)
+
+        # Stockham output permutation: (B, L, M, 4) -> (B, 4, L, M) -> (B, N)
+        out_re_4d = out_re.reshape(B_pad, L, M, 4)
+        out_im_4d = out_im.reshape(B_pad, L, M, 4)
+        re = out_re_4d.permute(0, 3, 1, 2).contiguous().reshape(B_pad, n)
+        im = out_im_4d.permute(0, 3, 1, 2).contiguous().reshape(B_pad, n)
 
     if not use_sim:
         re = re.to(orig_device)
