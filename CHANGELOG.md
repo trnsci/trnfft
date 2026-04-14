@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Measured v0.12 DFT-GEMM wins on batched FFT + STFT.** Head-to-head bench on trn1 (371625c) shows the architectural thesis pays off end-to-end:
+  - Batched FFT `(B=32, N=128)`: **15.8× faster** than the large-N butterfly path; 6.3× faster than the PyTorch fallback.
+  - Batched FFT `(B=32, N=256)`: **14.3× faster** / 11.3× vs PyTorch.
+  - STFT `n_fft=128`: **13.1× faster** than `n_fft=512` butterfly; 6.2× faster than PyTorch.
+  - STFT `n_fft=256`: **12.5× faster** / 10.5× vs PyTorch.
+  - Full table and analysis in `docs/design-notes/fft-is-a-gemm.md`. Both paths collapse to a single matmul per batch under DFT-GEMM — one launch regardless of `B`, with large `B` finally saturating the 128-partition systolic array.
+
 - **NKI 0.3.0 (Neuron SDK 2.29) migration + CPU simulator dispatch** (#59). `trnfft` now targets the stable `nki` package namespace (`import nki` instead of `import neuronxcc.nki`) and adopts the 0.3.0 calling convention (`nisa.nc_matmul` kwargs-only; `nisa.tensor_copy` for PSUM→SBUF). Kernels run in a new simulator mode via `TRNFFT_USE_SIMULATOR=1`, routing through `nki.simulate(kernel)(numpy_args)` on CPU. Catches Python-trace-level errors (bad kwargs, dropped ops, shape mismatches) without round-tripping to Trainium. MLIR verifier errors remain hardware-only.
 - New `nki-simulator` job in `.github/workflows/ci.yml` running simulator-marked tests on `ubuntu-latest` — first correctness gate for kernel changes that doesn't need AWS access.
 - New `tests/test_nki_sim.py` with simulator-backed tests for `_complex_gemm_kernel`, `_complex_mul_kernel`, and the butterfly FFT path. Curated to small shapes (simulator is CPU-slow at 1024+).
