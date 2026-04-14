@@ -110,6 +110,22 @@ class TestStockhamSimulator:
         np.testing.assert_allclose(sim.real.numpy(), expected.real, atol=1e-3, rtol=1e-3)
         np.testing.assert_allclose(sim.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
 
+    def test_fft_auto_routes_to_stockham_at_n1024(self):
+        """At N=1024 power-of-4, trnfft.fft() dispatches to Stockham (256 <
+        N ≤ 4096 with power-of-4 shape)."""
+        import trnfft
+
+        trnfft.set_backend("nki")
+        try:
+            torch.manual_seed(42)
+            x = torch.randn(1024)
+            result = trnfft.fft(x)
+            expected = np.fft.fft(x.numpy())
+            np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-3, rtol=1e-3)
+            np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
+        finally:
+            trnfft.set_backend("auto")
+
 
 class TestFFTSimulator:
     """FFT routes through butterfly_stage_kernel over log2(N) stages under

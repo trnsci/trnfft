@@ -340,6 +340,15 @@ def _cooley_tukey_nki_nograd(
     if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
         return _fft_via_gemm(x, inverse)
 
+    # Stockham radix-4 covers the gap above the DFT-GEMM precision ceiling
+    # and up through power-of-4 sizes where butterfly's log2(N) stages would
+    # otherwise dominate. N=1024 is 5 Stockham launches vs 10 butterfly
+    # launches; FP32 error scales as log_4(N) not N^2, so precision is safe.
+    # Kahan path stays on butterfly so the compensated 2Prod variant remains
+    # reachable for users who explicitly opt in.
+    if _is_power_of_four(n) and precision != "kahan":
+        return _fft_via_stockham_nki(x, inverse)
+
     log2n = int(math.log2(n))
     assert 1 << log2n == n, f"Not power of 2: {n}"
 
