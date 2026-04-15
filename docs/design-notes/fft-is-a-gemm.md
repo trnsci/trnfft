@@ -114,7 +114,7 @@ Small-N data (N ≤ 128): v0.11.0+6fe841c, trn1, 2026-04-13.
 Widened data (N ≤ 2048): v0.11.0+03d3ac2, trn1, 2026-04-13.
 Batched + STFT data: v0.12.0+371625c, trn1, 2026-04-14.
 
-## Radix-4 Stockham (v0.13 candidate, pending hardware verdict)
+## Radix-4 Stockham — hardware verdict
 
 The DFT-GEMM win is precision-bound at N=256. Stockham radix-4 breaks
 that ceiling by decomposing N into log₄(N) stages of small 4-point
@@ -128,33 +128,42 @@ is free (adds + real/imag swaps); per-stage cost is dominated by the
 twiddle multiply. Everything runs on the Vector engine in this POC —
 routing the twiddle onto the Tensor engine is a Thread C follow-up.
 
-Correctness validated under `nki.simulate` on CI (run 24428419440,
-`278a873`). Three-way hardware bench is pending AWS publishing the
-2.29-bundled DLAMI.
+### Three-way head-to-head (trn1, Neuron SDK 2.29.0, 2026-04-15)
 
-### Placeholder: three-way head-to-head (trn1)
+| N    | DFT-GEMM (μs) | Stockham (μs) | Butterfly (μs) | Winner              |
+| ---- | ------------- | ------------- | -------------- | ------------------- |
+| 16   | 1 831         | 3 360         | 3 337          | DFT-GEMM (1.8×)     |
+| 64   | 1 941         | 4 842         | 4 767          | DFT-GEMM (2.5×)     |
+| 256  | 2 029         | 6 153         | 6 067          | DFT-GEMM (3.0×)     |
+| 1024 | —             | 7 568         | 7 399          | Butterfly (+2.3%)   |
+| 4096 | —             | 9 742         | 9 387 †        | Butterfly (+3.8%)   |
 
-Numbers drop in after the next `run_benchmarks.sh` on the 2.29 DLAMI.
-Bench harness uses the `_FORCE_STOCKHAM` sentinel in
-`benchmarks/bench_fft.py::TestFFT1DStockham` to force path selection
-on each invocation of `trnfft.fft(x)` — same toggle pattern as the
-`_DFT_GEMM_THRESHOLD` knob that produced the small-N data above.
+"—" = DFT-GEMM out of range (FP32 O(N²) accumulation exceeds 1e-3 rel error at N ≥ 512).  
+† N=4096 butterfly from `test_fft_nki[4096]` (auto-dispatch, `_FORCE_STOCKHAM=False`).
 
-| N    | DFT-GEMM (μs) | Stockham (μs) | Butterfly (μs) | Winner |
-| ---- | ------------- | ------------- | -------------- | ------ |
-| 16   | TBD           | TBD           | TBD            | TBD    |
-| 64   | TBD           | TBD           | TBD            | TBD    |
-| 256  | TBD           | TBD           | TBD            | TBD    |
-| 1024 | —             | TBD           | TBD            | TBD    |
-| 4096 | —             | TBD           | TBD            | TBD    |
+### What the numbers mean
 
-"—" marks rows where DFT-GEMM is out of range (FP32 accumulation
-exceeds 1e-3 rel error at N ≥ 512). Stockham is only valid at
-power-of-4 N, which is a POC scope choice — mixed radix or radix-8
-would cover the full power-of-2 range and is a follow-up if the
-radix-4 numbers justify it.
+**Precision goal met, performance goal not yet met.** Stockham is
+precision-safe to N=4096+ as designed. It is not faster than butterfly —
+both are all-Vector-engine paths with the same total arithmetic. Fewer
+launches (5 vs 10 at N=1024) help in principle, but each Stockham stage
+does 4× the work, so the per-stage overhead grows proportionally and the
+launch-count savings disappear.
 
-Stockham POC data: v0.12.0+(pending), trn1, (pending 2.29 DLAMI).
+The structural fix is Thread C: routing the per-stage twiddle multiply
+onto the Tensor engine (via `nisa.nc_matmul`) while the Vector engine
+handles the W₄ matvec and output combination. That's the same Tensor +
+Vector dual-engine pattern that makes butterfly fast, applied at radix-4
+granularity. Until that lands, Stockham is dispatched only via
+`_FORCE_STOCKHAM` for bench and precision-audit use.
+
+**SDK 2.29 butterfly improvement.** The butterfly numbers here are
+1.3–2.1× better than the SDK 2.24 head-to-head above (e.g., N=256 went
+from 9 862 μs to 6 067 μs). This narrows the DFT-GEMM speedup from
+5.2× to 3.0× at N=256 — the DFT-GEMM win is still decisive, but the
+comparison baseline changed under us between SDK versions.
+
+Stockham POC data: `1504dcb`, trn1, 2026-04-15, Neuron SDK 2.29.0.
 
 ## Batched FFT + STFT: where the thesis pays off
 

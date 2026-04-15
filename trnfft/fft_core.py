@@ -354,15 +354,13 @@ def _cooley_tukey_nki_nograd(
     if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
         return _fft_via_gemm(x, inverse)
 
-    # Stockham radix-4 covers the gap above the DFT-GEMM precision ceiling
-    # and up through power-of-4 sizes where butterfly's log2(N) stages would
-    # otherwise dominate. N=1024 is 5 Stockham launches vs 10 butterfly
-    # launches; FP32 error scales as log_4(N) not N^2, so precision is safe.
-    # Kahan path stays on butterfly so the compensated 2Prod variant remains
-    # reachable for users who explicitly opt in.
-    if _is_power_of_four(n) and precision != "kahan":
-        return _fft_via_stockham_nki(x, inverse)
-
+    # Stockham radix-4 POC (hardware validated 2026-04-15, SDK 2.29, trn1):
+    # precision-safe to N=4096+ (log_4(N) accumulation), but measured ~2%
+    # slower than butterfly at all tested N. Both are all-Vector-engine paths
+    # with the same total work — fewer launches don't help when each stage
+    # costs proportionally more. Thread C (twiddle onto Tensor engine) is the
+    # structural fix; until then, Stockham is available via _FORCE_STOCKHAM
+    # for bench use and opt-in precision, not as the default dispatch path.
     log2n = int(math.log2(n))
     assert 1 << log2n == n, f"Not power of 2: {n}"
 

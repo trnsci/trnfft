@@ -7,25 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-04-15
+
 ### Added
 
-- **Measured v0.12 DFT-GEMM wins on batched FFT + STFT.** Head-to-head bench on trn1 (371625c) shows the architectural thesis pays off end-to-end:
+- **NKI 0.3.0 (Neuron SDK 2.29) migration + CPU simulator dispatch** (#59). `trnfft` now targets the stable `nki` package namespace (`import nki` instead of `import neuronxcc.nki`) and adopts the 0.3.0 calling convention (`nisa.nc_matmul` kwargs-only; `nisa.tensor_copy` for PSUM→SBUF). Kernels run in a new simulator mode via `TRNFFT_USE_SIMULATOR=1`, routing through `nki.simulate(kernel)(numpy_args)` on CPU. Catches Python-trace-level errors (bad kwargs, dropped ops, shape mismatches) without round-tripping to Trainium. MLIR verifier errors remain hardware-only. Hardware-validated on trn1.2xlarge, SDK 2.29.0, 2026-04-15.
+- New `nki-simulator` job in `.github/workflows/ci.yml` running simulator-marked tests on `ubuntu-latest` — first correctness gate for kernel changes that doesn't need AWS access.
+- New `tests/test_nki_sim.py` with simulator-backed tests for `_complex_gemm_kernel`, `_complex_mul_kernel`, and the butterfly FFT path.
+- New `scripts/run_simulator_tests.sh` mirroring `run_neuron_tests.sh` but with `TRNFFT_USE_SIMULATOR=1`.
+- `docs/developing_kernels.md` — trnfft-specific kernel dev pattern.
+
+- **Stockham radix-4 POC** (Thread B). CPU reference (`trnfft/stockham.py`) and NKI kernel (`trnfft/nki/stockham.py`) validated on hardware. Precision-safe to N=4096+ (log₄(N) FP32 accumulation; CPU-reference error ~5e-5 at N=4096). Available via `_FORCE_STOCKHAM=True` bench toggle — not dispatched by default (see "Known limitations" below).
+
+- **Measured v0.12 DFT-GEMM wins on batched FFT + STFT.** Head-to-head bench on trn1 shows the architectural thesis pays off end-to-end:
   - Batched FFT `(B=32, N=128)`: **15.8× faster** than the large-N butterfly path; 6.3× faster than the PyTorch fallback.
   - Batched FFT `(B=32, N=256)`: **14.3× faster** / 11.3× vs PyTorch.
   - STFT `n_fft=128`: **13.1× faster** than `n_fft=512` butterfly; 6.2× faster than PyTorch.
   - STFT `n_fft=256`: **12.5× faster** / 10.5× vs PyTorch.
-  - Full table and analysis in `docs/design-notes/fft-is-a-gemm.md`. Both paths collapse to a single matmul per batch under DFT-GEMM — one launch regardless of `B`, with large `B` finally saturating the 128-partition systolic array.
-
-- **NKI 0.3.0 (Neuron SDK 2.29) migration + CPU simulator dispatch** (#59). `trnfft` now targets the stable `nki` package namespace (`import nki` instead of `import neuronxcc.nki`) and adopts the 0.3.0 calling convention (`nisa.nc_matmul` kwargs-only; `nisa.tensor_copy` for PSUM→SBUF). Kernels run in a new simulator mode via `TRNFFT_USE_SIMULATOR=1`, routing through `nki.simulate(kernel)(numpy_args)` on CPU. Catches Python-trace-level errors (bad kwargs, dropped ops, shape mismatches) without round-tripping to Trainium. MLIR verifier errors remain hardware-only.
-- New `nki-simulator` job in `.github/workflows/ci.yml` running simulator-marked tests on `ubuntu-latest` — first correctness gate for kernel changes that doesn't need AWS access.
-- New `tests/test_nki_sim.py` with simulator-backed tests for `_complex_gemm_kernel`, `_complex_mul_kernel`, and the butterfly FFT path. Curated to small shapes (simulator is CPU-slow at 1024+).
-- New `scripts/run_simulator_tests.sh` mirroring `run_neuron_tests.sh` but with `TRNFFT_USE_SIMULATOR=1` in the SSM env; still AWS-resident as a fallback when the GH-native job can't run.
-- `docs/developing_kernels.md` — trnfft-specific kernel dev pattern, with pointer to the suite-wide guide in trnsci/trnsci.
 
 ### Changed
 
 - `pyproject.toml` `[neuron]` extra pins `nki>=0.3.0` (was `neuronxcc>=2.24`). Users on pre-2.29 SDKs must upgrade the DLAMI (`terraform apply` picks up the new AMI automatically).
 - Existing `test` matrix runs with `-m "not neuron and not nki_simulator"` so each test runs on exactly one CI job.
+- **SDK 2.29 improved butterfly performance by 1.3–2.1× vs SDK 2.24.** E.g. N=256 butterfly: 9 862 μs → 6 067 μs; N=1024: 15 746 μs → 7 399 μs. DFT-GEMM speedup over butterfly at N=256 narrowed from 5.2× to 3.0×; DFT-GEMM is still the dominant path at N ≤ 256.
+
+### Known limitations
+
+- **Stockham POC is not faster than butterfly.** Hardware bench (trn1, SDK 2.29) shows Stockham ~2% slower at all tested N (16–4096). Both paths are all-Vector-engine with the same total work; fewer launches don't help when each stage costs proportionally more. Thread C (twiddle multiply onto the Tensor engine via `nisa.nc_matmul`) is the structural fix — same dual-engine pattern that gives butterfly its speed, applied at radix-4 granularity.
+- `_DFT_GEMM_THRESHOLD = 256` unchanged. Precision-bound, not perf-bound. SDK 2.29 butterfly improvement narrows but does not eliminate the DFT-GEMM lead at N ≤ 256.
 
 ## [0.12.0] - 2026-04-13
 

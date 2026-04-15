@@ -19,7 +19,7 @@ Incorporates [neuron-complex-ops](https://github.com/scttfrdmn/neuron-complex-op
 trnfft follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
 
 - **[Phase 1 — correctness](https://github.com/trnsci/trnfft/issues/51)**: **complete as of v0.8.0** (butterfly + complex GEMM kernels hardware-validated on trn1.2xlarge, 70/70 benchmark cases passing).
-- **[Phase 2 — precision](https://github.com/trnsci/trnfft/issues/52)** (next): Kahan / Neumaier compensated summation for long Bluestein chains.
+- **[Phase 2 — precision](https://github.com/trnsci/trnfft/issues/52)** (active): Kahan / Neumaier compensated summation. Partial delivery in v0.11.0 (precision-modes API + compensated butterfly). On-silicon kahan characterization (#58) and Thread C (Tensor-engine Stockham) are the remaining items.
 - **[Phase 3 — perf](https://github.com/trnsci/trnfft/issues/53)**: plan reuse, streaming large FFTs, NEFF cache reuse.
 - **[Phase 4 — multi-chip](https://github.com/trnsci/trnfft/issues/54)**: multi-chip large-N FFT (N > 2²⁰).
 - **[Phase 5 — generation](https://github.com/trnsci/trnfft/issues/55)**: trn2 larger-SBUF butterfly path.
@@ -122,7 +122,7 @@ NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https
 
 ## Status
 
-**v0.10.0** — NKI kernels validated on trn1.2xlarge. For STFT and batched FFT, `set_backend("nki")` beats vanilla `torch.fft.fft`. See [benchmarks](https://trnsci.github.io/trnfft/benchmarks/) for the full picture.
+**v0.13.0** — NKI 0.3.0 (Neuron SDK 2.29) migration validated on trn1.2xlarge. DFT-as-GEMM fast path (N ≤ 256) up to 14× on batched FFT/STFT. Stockham radix-4 POC: precision-safe to N=4096, available via bench toggle. See [benchmarks](https://trnsci.github.io/trnfft/benchmarks/) for the full picture.
 
 **API coverage** (13 common `torch.fft` functions):
 `fft`, `ifft`, `rfft`, `irfft`, `fft2`, `rfft2`, `irfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `stft`, `istft`.
