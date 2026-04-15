@@ -119,6 +119,49 @@ class TestFFT1DSmallN:
             fft_core._DFT_GEMM_THRESHOLD = old
 
 
+# Stockham radix-4 only applies to power-of-4 N. Derived fixture filters
+# small_fft_size down to {16, 64, 256, 1024, 2048-> no}, collecting only
+# those sizes where the third head-to-head variant is actually valid.
+def _is_power_of_four(n):
+    return n > 0 and (n & (n - 1)) == 0 and (n.bit_length() & 1) == 1
+
+
+@pytest.fixture(params=[16, 64, 256, 1024, 4096])
+def power_of_four_size(request):
+    return request.param
+
+
+@pytest.fixture
+def power_of_four_signal(power_of_four_size):
+    torch.manual_seed(42)
+    return torch.randn(power_of_four_size)
+
+
+class TestFFT1DStockham:
+    """Three-way head-to-head: DFT-GEMM vs Stockham radix-4 vs butterfly.
+
+    Extends the small-N probe into the regime where DFT-GEMM's FP32 O(N²)
+    accumulation blocks it (N >= 512) and where butterfly's log2(N)
+    launches dominate (N >= 1024). Stockham lives in the middle: Tensor-
+    engine-friendly at any N, precision-safe to N=4096+ (log_4(N)
+    accumulation).
+    """
+
+    @pytest.mark.neuron
+    def test_fft_nki_stockham(self, benchmark, power_of_four_signal):
+        from trnfft import fft_core
+
+        old_force = fft_core._FORCE_STOCKHAM
+        fft_core._FORCE_STOCKHAM = True
+        _set("nki")
+        try:
+            _warm(trnfft.fft, power_of_four_signal)
+            benchmark(trnfft.fft, power_of_four_signal)
+        finally:
+            _set("auto")
+            fft_core._FORCE_STOCKHAM = old_force
+
+
 # ---------------------------------------------------------------------------
 # 2D FFT
 # ---------------------------------------------------------------------------

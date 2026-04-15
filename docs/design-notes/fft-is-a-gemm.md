@@ -114,6 +114,48 @@ Small-N data (N ≤ 128): v0.11.0+6fe841c, trn1, 2026-04-13.
 Widened data (N ≤ 2048): v0.11.0+03d3ac2, trn1, 2026-04-13.
 Batched + STFT data: v0.12.0+371625c, trn1, 2026-04-14.
 
+## Radix-4 Stockham (v0.13 candidate, pending hardware verdict)
+
+The DFT-GEMM win is precision-bound at N=256. Stockham radix-4 breaks
+that ceiling by decomposing N into log₄(N) stages of small 4-point
+DFTs, each accumulating only O(r²) error (r=4). At N=4096 CPU-reference
+FP32 error is ~5e-5 — three orders of magnitude tighter than DFT-GEMM
+at N=1024 would have been.
+
+Launch-count story: at N=1024 Stockham is **5 stages** vs butterfly's
+**10**. The W_4 matrix has {1, i, -1, -i} coefficients so its matvec
+is free (adds + real/imag swaps); per-stage cost is dominated by the
+twiddle multiply. Everything runs on the Vector engine in this POC —
+routing the twiddle onto the Tensor engine is a Thread C follow-up.
+
+Correctness validated under `nki.simulate` on CI (run 24428419440,
+`278a873`). Three-way hardware bench is pending AWS publishing the
+2.29-bundled DLAMI.
+
+### Placeholder: three-way head-to-head (trn1)
+
+Numbers drop in after the next `run_benchmarks.sh` on the 2.29 DLAMI.
+Bench harness uses the `_FORCE_STOCKHAM` sentinel in
+`benchmarks/bench_fft.py::TestFFT1DStockham` to force path selection
+on each invocation of `trnfft.fft(x)` — same toggle pattern as the
+`_DFT_GEMM_THRESHOLD` knob that produced the small-N data above.
+
+| N    | DFT-GEMM (μs) | Stockham (μs) | Butterfly (μs) | Winner |
+| ---- | ------------- | ------------- | -------------- | ------ |
+| 16   | TBD           | TBD           | TBD            | TBD    |
+| 64   | TBD           | TBD           | TBD            | TBD    |
+| 256  | TBD           | TBD           | TBD            | TBD    |
+| 1024 | —             | TBD           | TBD            | TBD    |
+| 4096 | —             | TBD           | TBD            | TBD    |
+
+"—" marks rows where DFT-GEMM is out of range (FP32 accumulation
+exceeds 1e-3 rel error at N ≥ 512). Stockham is only valid at
+power-of-4 N, which is a POC scope choice — mixed radix or radix-8
+would cover the full power-of-2 range and is a follow-up if the
+radix-4 numbers justify it.
+
+Stockham POC data: v0.12.0+(pending), trn1, (pending 2.29 DLAMI).
+
 ## Batched FFT + STFT: where the thesis pays off
 
 The 1-D head-to-head sweep above proves the launch-count win exists.

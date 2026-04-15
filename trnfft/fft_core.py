@@ -136,6 +136,14 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
 #   N=256 stays inside 1e-3 tol; N=1024 exceeds (observed 2.2% rel err).
 _DFT_GEMM_THRESHOLD = 256
 
+# Debug / benchmark toggle — when True, trnfft.fft on the NKI path
+# forces Stockham radix-4 dispatch at any power-of-4 N, ignoring the
+# usual DFT-GEMM threshold. Set around bench timing blocks only; the
+# assertion inside `_fft_via_stockham_nki` is the right failure mode if
+# someone flips this on and calls with a non-power-of-4 N. Follows the
+# same pattern as `_DFT_GEMM_THRESHOLD` toggling in TestFFT1DSmallN.
+_FORCE_STOCKHAM = False
+
 
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Compute FFT as a single complex matmul: X = W @ x.
@@ -337,6 +345,12 @@ def _cooley_tukey_nki_nograd(
         import torch_xla
 
     n = x.shape[-1]
+
+    # Bench-toggle: force Stockham ahead of any threshold check. Only use
+    # inside benchmark timing blocks; see note at _FORCE_STOCKHAM definition.
+    if _FORCE_STOCKHAM and precision != "kahan":
+        return _fft_via_stockham_nki(x, inverse)
+
     if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
         return _fft_via_gemm(x, inverse)
 
