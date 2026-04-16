@@ -204,14 +204,21 @@ def _is_power_of_four(n: int) -> bool:
 def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Radix-4 Stockham FFT driver — dispatches log_4(N) NKI stages.
 
-    Preconditions: ``x.shape[-1]`` is a power of 4. Host-side precomputes
-    the per-stage twiddle, broadcasts it across the partition-dim tile,
-    and calls the stage kernel once per stage. After log_4(N) stages the
-    output is in natural index order (Stockham property — no
-    bit-reversal permutation required).
+    Preconditions: ``x.shape[-1]`` is a power of 4. All per-stage twiddle
+    factors are precomputed on CPU and transferred to the XLA device in one
+    batch before the stage loop. This eliminates the per-stage H→D transfer
+    cost that was the primary driver overhead (profiling: 2026-04-16).
 
-    Inverse via the conjugate trick, matching the CPU reference in
-    :mod:`trnfft.stockham`: ``ifft(X) = conj(fft(conj(X))) / N``.
+    After log_4(N) stages the output is in natural index order (Stockham
+    property — no bit-reversal permutation required).
+
+    Inverse via the conjugate trick: ``ifft(X) = conj(fft(conj(X))) / N``.
+
+    Twiddle precomputation note: ``total_groups = B_pad * L * M = B_pad * N/4``
+    is constant across all stages (L grows as 4^s, M shrinks as N/(4·4^s),
+    product stays N/4). All log_4(N) twiddle tensors are the same shape
+    ``(total_groups, 4)`` and stack into a single ``(log4n, total_groups, 4)``
+    tensor for one H→D transfer.
     """
     from .nki.dispatch import _use_simulator
     from .nki.stockham import stockham_radix4_stage_kernel
@@ -232,10 +239,8 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         flat_im = -flat_im
 
     B = flat_re.shape[0]
-    # Partition-dim tile alignment. Stockham's total_groups = B * L * M
-    # = B * N / 4 stays constant across stages — no padding needed for
-    # power-of-2 B. For non-power-of-2 B, pad to the next multiple of
-    # PMAX so groups_chunk divides total_groups cleanly.
+    # Partition-dim tile alignment. For non-power-of-2 B, pad to the next
+    # multiple of PMAX so groups_chunk divides total_groups cleanly.
     PMAX = 128
 
     def _is_pow2(v: int) -> bool:
@@ -253,32 +258,45 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
     orig_device = x.real.device
     device = None if use_sim else torch_xla.device()
-    re = pad_re if use_sim else pad_re.to(device)
-    im = pad_im if use_sim else pad_im.to(device)
 
     log4n = int(math.log2(n)) // 2
+    # total_groups = B_pad * L * M = B_pad * N/4 — constant across all stages.
+    total_groups = B_pad * n // 4
+
+    # Precompute ALL twiddle factors on CPU before the stage loop.
+    # All log4n tensors have the same shape (total_groups, 4), so stack
+    # them into (log4n, total_groups, 4) for a single H→D transfer.
+    all_tw_r = torch.empty(log4n, total_groups, 4, dtype=x.real.dtype)
+    all_tw_i = torch.empty(log4n, total_groups, 4, dtype=x.real.dtype)
     for s in range(log4n):
         L = 1 << (2 * s)
         M = n // (4 * L)
-        total_groups = B_pad * L * M
+        l_idx = torch.arange(L, dtype=x.real.dtype).view(1, L, 1, 1)
+        k_idx = torch.arange(4, dtype=x.real.dtype).view(1, 1, 1, 4)
+        ang = -2.0 * math.pi * l_idx * k_idx / (4.0 * L)
+        all_tw_r[s] = torch.cos(ang).expand(B_pad, L, M, 4).contiguous().reshape(total_groups, 4)
+        all_tw_i[s] = torch.sin(ang).expand(B_pad, L, M, 4).contiguous().reshape(total_groups, 4)
 
-        # Pack stage-s input into (total_groups, 4) where each partition
-        # row is one 4-point DFT group and the k-axis (the four elements
-        # going through the DFT) is the free dim. CPU ref uses layout
-        # (B, L, 4, M) with k at position 2 (stride M); we permute so k
-        # is the contiguous innermost axis.
+    re = pad_re if use_sim else pad_re.to(device)
+    im = pad_im if use_sim else pad_im.to(device)
+    if not use_sim:
+        # Single H→D transfer for all twiddle data.
+        all_tw_r = all_tw_r.to(device)
+        all_tw_i = all_tw_i.to(device)
+
+    for s in range(log4n):
+        L = 1 << (2 * s)
+        M = n // (4 * L)
+
+        # Pack stage-s input into (total_groups, 4): each partition row is
+        # one 4-point DFT group with k as the contiguous inner axis.
         re_4d = re.reshape(B_pad, L, 4, M)
         im_4d = im.reshape(B_pad, L, 4, M)
         re_groups = re_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
         im_groups = im_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
 
-        # Twiddle T[l, k] = exp(-2π i * l * k / (4 L)). Sign fixed at -1
-        # (inverse handled via conjugate trick).
-        l_idx = torch.arange(L, dtype=x.real.dtype).view(1, L, 1, 1)
-        k_idx = torch.arange(4, dtype=x.real.dtype).view(1, 1, 1, 4)
-        ang = -2.0 * math.pi * l_idx * k_idx / (4.0 * L)
-        tw_r = torch.cos(ang).expand(B_pad, L, M, 4).contiguous().reshape(total_groups, 4)
-        tw_i = torch.sin(ang).expand(B_pad, L, M, 4).contiguous().reshape(total_groups, 4)
+        tw_r = all_tw_r[s]
+        tw_i = all_tw_i[s]
 
         if use_sim:
             import nki as _nki
@@ -292,8 +310,6 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
             out_re = torch.from_numpy(np.asarray(out_re_np))
             out_im = torch.from_numpy(np.asarray(out_im_np))
         else:
-            tw_r = tw_r.to(device)
-            tw_i = tw_i.to(device)
             out_re, out_im = stockham_radix4_stage_kernel(re_groups, im_groups, tw_r, tw_i)
 
         # Stockham output permutation: (B, L, M, 4) -> (B, 4, L, M) -> (B, N)

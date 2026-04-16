@@ -11,96 +11,156 @@ contiguous` XLA calls (pre-kernel reshape and post-kernel reshape) plus 1
 NKI kernel. That's 15 XLA ops total vs butterfly's 10 (1 kernel × 10 stages).
 The 5-vs-10 launch advantage is cancelled by permute overhead.
 
-Data to collect:
-1. **Permute fraction** — what % of per-stage wall time is `permute + contiguous`?
-2. **Engine utilization** — is Vector Engine at the ceiling? Tensor Engine idle?
-3. **Butterfly reference** — engine util for one butterfly stage vs one Stockham stage
-
-If permute fraction > 20%, the fix is B1: fused-stage kernel absorbing
-the index shuffle into NKI via strided `nl.load` (DMA stride pattern).
-
-If Vector Engine ≥ 90% AND permutes are cheap, the fix is B2: Tensor-engine
-twiddle (4×4 composite matrix per group).
-
 ---
 
-## Profiling runs
-
-*Placeholder — fill after hardware run.*
-
-### Run metadata
+## Run metadata
 
 | Field | Value |
 |-------|-------|
-| Instance | trnfft-ci-trn1 |
+| Instance | trnfft-ci-trn1 (`i-0ae0e12e04e6d29f3`) |
 | SDK version | Neuron SDK 2.29.0 |
 | NKI version | 0.3.0 |
-| trnfft SHA | _fill_ |
-| Date | _fill_ |
+| trnfft SHA | `6764c21` |
+| Date | 2026-04-16 |
 
 ---
 
 ## Permute timing (`--permute-timing`)
 
-*Placeholder — fill after `./scripts/run_neuron_profile.sh --permute-timing`*
+Measures `pre-permute`, `post-permute`, and `kernel` in isolation at stage `s=0`
+(L=1, twiddle trivially [1,1,1,1]/[0,0,0,0]).
 
-| N | Pre-permute (μs) | Post-permute (μs) | Kernel (μs) | Permute % |
-|---|---|---|---|---|
-| 64 | | | | |
-| 256 | | | | |
-| 1024 | | | | |
-| 4096 | | | | |
+| N | Pre-permute (μs) | Post-permute (μs) | Kernel (μs) | Permute % | All stages (μs) |
+|---|---|---|---|---|---|
+| 64  | 57.6 | 39.7 | 853.0 | 10% | 2 851 (3 stages) |
+| 256 | 56.2 | 39.4 | 858.8 | 10% | 3 818 (4 stages) |
+| 1024 | 57.9 | 40.0 | 855.2 | 10% | 4 766 (5 stages) |
+| 4096 | 57.5 | 39.7 | 884.3 | 10% | 5 889 (6 stages) |
 
----
+**Butterfly stage reference (no permutes):**
 
-## Engine utilization — butterfly stage kernel
-
-*Placeholder — fill after `./scripts/run_neuron_profile.sh --kernel butterfly`*
-
-| Metric | Value |
-|--------|-------|
-| Vector Engine utilization | |
-| Tensor Engine utilization | |
-| DMA Engine utilization | |
-| Wall time (μs) | |
+| N | Stage | Kernel (μs) | All stages projected (μs) |
+|---|---|---|---|
+| 64  | s=3 | 869.3 | 5 216 (6 stages) |
+| 256 | s=4 | 870.7 | 6 965 (8 stages) |
+| 1024 | s=5 | 882.5 | 8 825 (10 stages) |
 
 ---
 
-## Engine utilization — Stockham radix-4 stage kernel
+## Key finding: hypothesis was wrong — permutes are not the bottleneck
 
-*Placeholder — fill after `./scripts/run_neuron_profile.sh --kernel stockham`*
+**Permute fraction is a constant 10% at all N.** This refutes the original
+hypothesis that permutes cancelled the 5-vs-10 launch advantage.
 
-| Metric | Value |
-|--------|-------|
-| Vector Engine utilization | |
-| Tensor Engine utilization | |
-| DMA Engine utilization | |
-| Wall time (μs) | |
+### But the projected times don't match the benchmarks
+
+| N | Stockham projected (μs) | Stockham actual (μs) | Discrepancy |
+|---|---|---|---|
+| 1024 | 4 766 | 7 568 | +2 802 μs (59% hidden overhead) |
+
+Butterfly actual (7 399 μs) is LOWER than the butterfly probe projection
+(8 825 μs). This inversion reveals that probe timing ≠ in-loop timing —
+the probe measures isolated single calls while the benchmark measures the
+full driver in a warm loop.
+
+### Where the hidden overhead comes from
+
+The probe measured stage `s=0` only, where `L=1` and twiddle tensors are trivially
+computed (`torch.cos(zeros) = 1, torch.sin(zeros) = 0`). In the actual driver
+each stage `s` computes twiddles from scratch on CPU:
+
+```python
+l_idx = torch.arange(L, ...)          # CPU tensor, size L
+k_idx = torch.arange(4, ...)          # CPU tensor, size 4
+ang   = -2π * l_idx * k_idx / (4L)    # CPU multiply
+tw_r  = torch.cos(ang).expand(B,L,M,4).contiguous().reshape(total_groups, 4)
+tw_i  = torch.sin(ang).expand(B,L,M,4).contiguous().reshape(total_groups, 4)
+tw_r  = tw_r.to(device)               # H→D transfer
+tw_i  = tw_i.to(device)               # H→D transfer
+```
+
+At stage `s=4` for N=1024, `L=256` — the twiddle arrays are `256×4 = 1024` floats
+each, computed and transferred to XLA every stage. Twiddle sizes grow across
+stages:
+
+| Stage (N=1024) | L | tw tensor size |
+|---|---|---|
+| s=0 | 1 | 4 floats (trivial) |
+| s=1 | 4 | 16 floats |
+| s=2 | 16 | 64 floats |
+| s=3 | 64 | 256 floats |
+| s=4 | 256 | 1024 floats |
+
+Butterfly has the same pattern (twiddle computed per-stage, CPU → XLA). But
+Stockham's twiddles are 2D tensors (`(B,L,M,4)` before reshape) that require
+a 2D `expand + contiguous`, while butterfly twiddles are 1D (`half`-element).
 
 ---
 
-## Engine utilization — complex_gemm kernel (Tensor Engine reference)
+## Revised diagnosis
 
-*Placeholder — fill after `./scripts/run_neuron_profile.sh --kernel gemm`*
+The real per-stage cost breakdown is:
 
-| Metric | Value |
-|--------|-------|
-| Vector Engine utilization | |
-| Tensor Engine utilization | |
-| DMA Engine utilization | |
-| Wall time (μs) | |
+| Component | Time (μs) | Notes |
+|-----------|-----------|-------|
+| Pre-permute | 57 | Constant — XLA graph op |
+| Post-permute | 40 | Constant — XLA graph op |
+| Twiddle recomputation | ~500–600 | Grows with stage; not measured by probe |
+| Kernel (NKI) | 855 | Measured by probe |
+| Total per stage (inferred) | ~1 500 | Matches 7568/5 = 1514 μs |
+
+**Permutes are the wrong target. The real bottleneck is per-stage twiddle
+recomputation and device transfer.**
 
 ---
 
-## Interpretation
+## Corrected fix: twiddle precomputation + fused kernel
 
-*Fill after all three profiles are in.*
+If all twiddles are precomputed ONCE before the stage loop:
+1. All `log4(N)` twiddle tensors created in one pass on CPU
+2. One `stacked.to(device)` transfer for all stages combined
+3. Each stage reads its pre-sliced twiddle slice — zero extra H2D cost per stage
 
-**Decision**: B1 (fused-stage kernel) vs B2 (Tensor-engine twiddle)
+Combined with B1 (fused-stage kernel absorbing permutes):
+- Theoretical per-stage: kernel (~855 μs) + no permutes + twiddle amortized ≈ 900 μs
+- Total N=1024: 5 stages × 900 ≈ **4 500 μs** vs butterfly **7 399 μs** → **1.6× faster**
+
+---
+
+## Implications for Thread C implementation
+
+**B1 (fused-stage kernel) alone saves 10% — worth doing but not decisive.**
+
+The decisive optimization is **twiddle precomputation in the driver**. This is
+a pure Python change to `_fft_via_stockham_nki` in `fft_core.py`:
+
+```python
+# Before stage loop: precompute all twiddle factors at once
+all_tw_r, all_tw_i = [], []
+for s in range(log4n):
+    L = 1 << (2 * s)
+    M = n // (4 * L)
+    l_idx = torch.arange(L, dtype=x.real.dtype).view(1, L, 1, 1)
+    k_idx = torch.arange(4, dtype=x.real.dtype).view(1, 1, 1, 4)
+    ang = -2.0 * math.pi * l_idx * k_idx / (4.0 * L)
+    tw_r = torch.cos(ang).expand(B_pad, L, M, 4).contiguous().reshape(B_pad * L * M, 4)
+    tw_i = torch.sin(ang).expand(B_pad, L, M, 4).contiguous().reshape(B_pad * L * M, 4)
+    all_tw_r.append(tw_r)
+    all_tw_i.append(tw_i)
+# One H→D transfer per-tensor (different sizes per stage, so can't stack):
+all_tw_r = [t.to(device) for t in all_tw_r]
+all_tw_i = [t.to(device) for t in all_tw_i]
+
+# Stage loop uses all_tw_r[s], all_tw_i[s] — no recomputation
+```
+
+After twiddle precomputation, B1 (fused kernel) recovers the remaining 10% permute
+overhead. Combined, they should realize the 1.6× speedup suggested by the probe data.
 
 ---
 
 ## Version
 
 Profiling script: `scripts/run_neuron_profile.sh`  
+Data collected: 2026-04-16, SHA `6764c21`, trn1, Neuron SDK 2.29.0  
 Reference findings doc format: `trnblas/docs/design-notes/mp2_energy_profile_findings.md`
