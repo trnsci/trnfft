@@ -103,12 +103,12 @@ SUBMIT_CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --comment "trnfft bench submit @ $SHA" \
-  --parameters "{\"commands\":[\"sudo -u ubuntu bash -c \\\"$SUBMIT_SCRIPT\\\"\"],\"executionTimeout\":[\"600\"]}" \
+  --parameters "{\"commands\":[\"sudo -u ubuntu bash -c \\\"$SUBMIT_SCRIPT\\\"\"],\"executionTimeout\":[\"1800\"]}" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 
 echo "Submit command ID: $SUBMIT_CMD_ID"
-for i in $(seq 1 20); do
+for i in $(seq 1 120); do
   STATUS=$(aws ssm get-command-invocation \
     --command-id "$SUBMIT_CMD_ID" \
     --instance-id "$INSTANCE_ID" \
