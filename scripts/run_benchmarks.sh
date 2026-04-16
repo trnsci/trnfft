@@ -93,10 +93,10 @@ CMD_ID=$(aws ssm send-command \
   --output text --query 'Command.CommandId')
 
 echo "Command ID: $CMD_ID"
-echo "Waiting for benchmarks to complete (this may take 10+ minutes)..."
+echo "Waiting for benchmarks to complete (this may take 30+ minutes)..."
 
 STATUS="InProgress"
-for i in $(seq 1 80); do
+for i in $(seq 1 160); do
   STATUS=$(aws ssm get-command-invocation \
     --command-id "$CMD_ID" \
     --instance-id "$INSTANCE_ID" \
