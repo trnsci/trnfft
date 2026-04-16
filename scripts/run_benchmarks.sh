@@ -88,7 +88,7 @@ CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --comment "trnfft benchmarks @ $SHA" \
-  --parameters "{\"commands\":[\"sudo -u ubuntu bash -c \\\"$BENCH_SCRIPT\\\"\"]}" \
+  --parameters "{\"commands\":[\"sudo -u ubuntu bash -c \\\"$BENCH_SCRIPT\\\"\"],\"executionTimeout\":[\"7200\"]}" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 

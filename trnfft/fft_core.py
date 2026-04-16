@@ -205,20 +205,22 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Radix-4 Stockham FFT driver — dispatches log_4(N) NKI stages.
 
     Preconditions: ``x.shape[-1]`` is a power of 4. All per-stage twiddle
-    factors are precomputed on CPU and transferred to the XLA device in one
-    batch before the stage loop. This eliminates the per-stage H→D transfer
-    cost that was the primary driver overhead (profiling: 2026-04-16).
+    factors are precomputed on CPU and transferred to the XLA device before
+    the stage loop. This eliminates the per-stage H→D transfer cost that was
+    the primary driver overhead (profiling: 2026-04-16).
 
     After log_4(N) stages the output is in natural index order (Stockham
     property — no bit-reversal permutation required).
 
     Inverse via the conjugate trick: ``ifft(X) = conj(fft(conj(X))) / N``.
 
-    Twiddle precomputation note: ``total_groups = B_pad * L * M = B_pad * N/4``
-    is constant across all stages (L grows as 4^s, M shrinks as N/(4·4^s),
-    product stays N/4). All log_4(N) twiddle tensors are the same shape
-    ``(total_groups, 4)`` and stack into a single ``(log4n, total_groups, 4)``
-    tensor for one H→D transfer.
+    Twiddle precomputation: ``total_groups = B_pad * L * M = B_pad * N/4`` is
+    constant across stages (L = 4^s, M = N/(4·4^s), product = N/4). All
+    log_4(N) twiddle tensors have the same shape ``(total_groups, 4)``.
+
+    Transfer strategy: separate tensors per stage (not slices of a stacked
+    tensor). XLA/Neuron slice ops on device tensors force new HLO programs and
+    bust the NEFF cache; standalone per-stage tensors reuse the cached NEFF.
     """
     from .nki.dispatch import _use_simulator
     from .nki.stockham import stockham_radix4_stage_kernel
@@ -263,26 +265,31 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     # total_groups = B_pad * L * M = B_pad * N/4 — constant across all stages.
     total_groups = B_pad * n // 4
 
-    # Precompute ALL twiddle factors on CPU before the stage loop.
-    # All log4n tensors have the same shape (total_groups, 4), so stack
-    # them into (log4n, total_groups, 4) for a single H→D transfer.
-    all_tw_r = torch.empty(log4n, total_groups, 4, dtype=x.real.dtype)
-    all_tw_i = torch.empty(log4n, total_groups, 4, dtype=x.real.dtype)
+    # Precompute ALL twiddle factors on CPU before the stage loop, then
+    # transfer to device as a list of standalone tensors — not as slices of
+    # a stacked tensor. Slicing an XLA device tensor creates DynamicSlice HLO
+    # ops that change the compiled graph and bust the NEFF cache.
+    twiddles_cpu = []
     for s in range(log4n):
         L = 1 << (2 * s)
         M = n // (4 * L)
         l_idx = torch.arange(L, dtype=x.real.dtype).view(1, L, 1, 1)
         k_idx = torch.arange(4, dtype=x.real.dtype).view(1, 1, 1, 4)
         ang = -2.0 * math.pi * l_idx * k_idx / (4.0 * L)
-        all_tw_r[s] = torch.cos(ang).expand(B_pad, L, M, 4).contiguous().reshape(total_groups, 4)
-        all_tw_i[s] = torch.sin(ang).expand(B_pad, L, M, 4).contiguous().reshape(total_groups, 4)
+        tw_r = torch.cos(ang).expand(B_pad, L, M, 4).contiguous().reshape(total_groups, 4)
+        tw_i = torch.sin(ang).expand(B_pad, L, M, 4).contiguous().reshape(total_groups, 4)
+        twiddles_cpu.append((tw_r, tw_i))
 
     re = pad_re if use_sim else pad_re.to(device)
     im = pad_im if use_sim else pad_im.to(device)
+
     if not use_sim:
-        # Single H→D transfer for all twiddle data.
-        all_tw_r = all_tw_r.to(device)
-        all_tw_i = all_tw_i.to(device)
+        # Transfer all per-stage twiddles to XLA device before the kernel loop.
+        # Each entry is an independent tensor; the kernel call sees the same
+        # (total_groups, 4) shape at every stage — NEFF cache hit guaranteed.
+        twiddles = [(tw_r.to(device), tw_i.to(device)) for tw_r, tw_i in twiddles_cpu]
+    else:
+        twiddles = twiddles_cpu
 
     for s in range(log4n):
         L = 1 << (2 * s)
@@ -295,8 +302,7 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         re_groups = re_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
         im_groups = im_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
 
-        tw_r = all_tw_r[s]
-        tw_i = all_tw_i[s]
+        tw_r, tw_i = twiddles[s]
 
         if use_sim:
             import nki as _nki
