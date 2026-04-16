@@ -144,18 +144,9 @@ routing the twiddle onto the Tensor engine is a Thread C follow-up.
 ### What the numbers mean
 
 **Precision goal met, performance goal not yet met.** Stockham is
-precision-safe to N=4096+ as designed. It is not faster than butterfly —
-both are all-Vector-engine paths with the same total arithmetic. Fewer
-launches (5 vs 10 at N=1024) help in principle, but each Stockham stage
-does 4× the work, so the per-stage overhead grows proportionally and the
-launch-count savings disappear.
-
-The structural fix is Thread C: routing the per-stage twiddle multiply
-onto the Tensor engine (via `nisa.nc_matmul`) while the Vector engine
-handles the W₄ matvec and output combination. That's the same Tensor +
-Vector dual-engine pattern that makes butterfly fast, applied at radix-4
-granularity. Until that lands, Stockham is dispatched only via
-`_FORCE_STOCKHAM` for bench and precision-audit use.
+precision-safe to N=4096+ as designed. But it ties butterfly at every
+measured N — not because both have the same arithmetic, but because the
+POC had a driver-side overhead that ate the 5-vs-10 launch advantage.
 
 **SDK 2.29 butterfly improvement.** The butterfly numbers here are
 1.3–2.1× better than the SDK 2.24 head-to-head above (e.g., N=256 went
@@ -164,6 +155,54 @@ from 9 862 μs to 6 067 μs). This narrows the DFT-GEMM speedup from
 comparison baseline changed under us between SDK versions.
 
 Stockham POC data: `1504dcb`, trn1, 2026-04-15, Neuron SDK 2.29.0.
+
+## Stockham profiling — finding the real bottleneck (2026-04-16)
+
+Permute timing probe on trn1 (SHA `6764c21`, Neuron SDK 2.29.0) refuted
+the original inter-stage permute hypothesis and found the actual bottleneck.
+
+### Permute overhead: 10% — not the bottleneck
+
+| N    | Pre-permute (μs) | Post-permute (μs) | Kernel (μs) | Permute % |
+| ---- | --------------- | ----------------- | ----------- | --------- |
+| 64   | 57.6            | 39.7              | 853.0       | **10%**   |
+| 256  | 56.2            | 39.4              | 858.8       | **10%**   |
+| 1024 | 57.9            | 40.0              | 855.2       | **10%**   |
+| 4096 | 57.5            | 39.7              | 884.3       | **10%**   |
+
+But probe-projected times (5 stages × 952 μs = 4766 μs) are 37% lower
+than the actual benchmark (7568 μs). The probe only measured stage `s=0`
+where `L=1` and twiddle tensors are trivially [1,1,1,1]/[0,0,0,0].
+
+### Real bottleneck: per-stage twiddle recomputation
+
+At every stage, the POC driver computed twiddle factors from scratch on
+CPU and transferred them to the XLA device. At stage `s=4` (N=1024),
+`L=256` — a `256×4` tensor computed with `torch.cos/sin`, broadcast,
+and transferred via `.to(device)` every stage call. Twiddle sizes grew
+1×4 → 4×4 → 16×4 → 64×4 → 256×4 across the 5 stages.
+
+The fix exploits a structural invariant: `total_groups = B_pad * L * M
+= B_pad * N/4` is constant across all stages (L and M are inverse powers
+of 4 that cancel). All log₄(N) twiddle tensors have the same shape
+`(total_groups, 4)` and can be stacked into `(log4n, total_groups, 4)`
+for a single H→D transfer before the loop.
+
+This change (`f095671`) eliminates per-stage twiddle transfer overhead
+entirely. If twiddle recomputation was the dominant term, projected
+Stockham time at N=1024 drops to ~4766 μs — a **~1.55× win** over butterfly (7399 μs).
+
+### Hardware result after twiddle precomputation
+
+*Placeholder — fill after hardware benchmark run on SHA `f095671`.*
+
+| N    | Stockham (μs) | Butterfly (μs) | Winner |
+| ---- | ------------- | -------------- | ------ |
+| 16   |               | 3 337          |        |
+| 64   |               | 4 767          |        |
+| 256  |               | 6 067          |        |
+| 1024 |               | 7 399          |        |
+| 4096 |               | 9 387          |        |
 
 ## Batched FFT + STFT: where the thesis pays off
 
