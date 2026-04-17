@@ -257,22 +257,23 @@ fi
 # well under SSM's 24K StandardOutputContent limit.
 # ---------------------------------------------------------------------------
 echo "Stripping per-sample data from benchmark JSON (reduces size for SSM fetch)..."
-# Escaping chain for the Python one-liner:
-#   run_benchmarks.sh (double-quoted bash string)  →  STRIP_CMDS variable  →  JSON  →  bash  →  Python
+# The Python strip script is base64-encoded to avoid ALL shell/JSON quoting issues.
+# Decoded script:
+#   import json
+#   f = '/tmp/trnfft_bench.json'
+#   raw = open(f, 'rb').read()
+#   d = json.loads(raw.decode('latin-1'))   # latin-1 handles µ bytes from pytest-benchmark
+#   d.pop('machine_info', None)              # ~5KB — not needed for results
+#   d.pop('commit_info', None)               # ~1KB — not needed for results
+#   for b in d.get('benchmarks', []):
+#       b.get('stats', {}).pop('data', None) # raw sample arrays — not needed
+#   open(f, 'w').write(json.dumps(d))        # ensure_ascii=True (default) → pure ASCII output
 #
-# Key rule: wrap the -c argument in double quotes (\\\" → \" in var → " in JSON → " in bash).
-# Use single quotes for ALL Python string literals — single quotes are inert inside bash double
-# quotes and need no escaping in JSON, so the Python code arrives intact.
-#
-# Previous attempts used bash single quotes for -c ('...') which made \"...\" a SyntaxError in
-# Python (backslash before a double-quote is not valid outside a Python string literal).
-# SSM does not set -e across commands in an array, so the Python exit-1 was silently swallowed
-# by the subsequent "echo STRIPPED" success — masking the failure in every prior run.
-#
-# Also strips machine_info and commit_info (adds ~5KB); without those the JSON is <2KB —
-# well under the SSM 24K StandardOutputContent base64 limit.
+# After stripping: ~200-500B (5 benchmarks × summary stats) — well under SSM 24K limit.
+# base64 string contains only [A-Za-z0-9+/=] — no quoting issues in JSON or bash.
+STRIP_B64="aW1wb3J0IGpzb24KZiA9ICcvdG1wL3RybmZmdF9iZW5jaC5qc29uJwpyYXcgPSBvcGVuKGYsICdyYicpLnJlYWQoKQpkID0ganNvbi5sb2FkcyhyYXcuZGVjb2RlKCdsYXRpbi0xJykpCmQucG9wKCdtYWNoaW5lX2luZm8nLCBOb25lKQpkLnBvcCgnY29tbWl0X2luZm8nLCBOb25lKQpmb3IgYiBpbiBkLmdldCgnYmVuY2htYXJrcycsIFtdKToKICAgIGIuZ2V0KCdzdGF0cycsIHt9KS5wb3AoJ2RhdGEnLCBOb25lKQpvcGVuKGYsICd3Jykud3JpdGUoanNvbi5kdW1wcyhkKSkK"
 STRIP_CMDS="[
-  \"python3 -c \\\"import json; f='/tmp/trnfft_bench.json'; raw=open(f,'rb').read(); d=json.loads(raw.decode('latin-1')); d.pop('machine_info',None); d.pop('commit_info',None); [b.get('stats',{}).pop('data',None) for b in d.get('benchmarks',[])]; open(f,'w').write(json.dumps(d))\\\"\",
+  \"echo $STRIP_B64 | base64 -d | python3\",
   \"echo STRIPPED\"
 ]"
 STRIP_CMD_ID=$(aws ssm send-command \
