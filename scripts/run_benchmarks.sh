@@ -187,14 +187,13 @@ aws ssm get-command-invocation --command-id "$LAUNCH_CMD_ID" --instance-id "$INS
 # ---------------------------------------------------------------------------
 echo "Polling for benchmark completion (up to 3 hours, checking every 60s)..."
 
-CHECK_SCRIPT="set -e && \
-  if [ -s $REMOTE_JSON ]; then \
-    echo JSON_READY && \
-    wc -c < $REMOTE_JSON; \
-  else \
-    echo NOT_DONE && \
-    ps aux | grep pytest | grep -v grep | awk '{print \"PYTEST_RUNNING PID=\"\$2}' || true; \
-  fi"
+# Two single-line commands — no embedded double quotes, safe in JSON parameters.
+# Previous awk-based script had literal " from \"...\" expansion that corrupted
+# the JSON, causing aws-cli to exit non-zero and set -e to kill the script.
+CHECK_CMDS="[
+  \"test -s $REMOTE_JSON && echo JSON_READY || echo NOT_DONE\",
+  \"pgrep -f bench_fft && echo PYTEST_RUNNING || echo PYTEST_GONE\"
+]"
 
 DONE=0
 for i in $(seq 1 180); do
@@ -202,9 +201,15 @@ for i in $(seq 1 180); do
     --instance-ids "$INSTANCE_ID" \
     --document-name "AWS-RunShellScript" \
     --comment "trnfft bench check $i" \
-    --parameters "{\"commands\":[\"bash -c \\\"$CHECK_SCRIPT\\\"\"],\"executionTimeout\":[\"30\"]}" \
+    --parameters "{\"commands\":$CHECK_CMDS,\"executionTimeout\":[\"30\"]}" \
     --region "$REGION" \
-    --output text --query 'Command.CommandId' 2>/dev/null)
+    --output text --query 'Command.CommandId' 2>/dev/null) || true
+
+  if [[ -z "$CHECK_CMD_ID" ]]; then
+    echo "  [$i] check dispatch failed, retrying in 30s"
+    sleep 30
+    continue
+  fi
 
   for j in $(seq 1 6); do
     STATUS=$(aws ssm get-command-invocation \
