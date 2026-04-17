@@ -254,11 +254,11 @@ fi
 # Phase 3: Fetch the JSON.
 # ---------------------------------------------------------------------------
 echo ""
-echo "Pulling results JSON via SSM (base64)..."
+echo "Pulling results JSON via SSM (gzip+base64 — avoids 24K SSM output limit)..."
 FETCH_CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
-  --parameters "{\"commands\":[\"base64 -w0 $REMOTE_JSON\"],\"executionTimeout\":[\"60\"]}" \
+  --parameters "{\"commands\":[\"gzip -c $REMOTE_JSON | base64 -w0\"],\"executionTimeout\":[\"60\"]}" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 
@@ -281,7 +281,7 @@ fi
 
 aws ssm get-command-invocation --command-id "$FETCH_CMD_ID" --instance-id "$INSTANCE_ID" \
   --region "$REGION" --query 'StandardOutputContent' --output text \
-  | tr -d '\n' | base64 --decode > "$LOCAL_OUT"
+  | tr -d '\n' | base64 --decode | gunzip > "$LOCAL_OUT"
 
 echo "Wrote $LOCAL_OUT ($(wc -c < "$LOCAL_OUT") bytes)"
 echo ""
