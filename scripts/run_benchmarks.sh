@@ -261,8 +261,10 @@ echo "Stripping per-sample data from benchmark JSON (reduces size for SSM fetch)
 #   bash \\\"  →  JSON \"  →  shell "  →  Python "
 # json.load(open(f)) fails if the JSON contains latin-1 bytes (e.g. µ from
 # pytest-benchmark's µs unit).  Read as binary and decode with latin-1 instead.
+# Also strip machine_info and commit_info — those add ~5KB and we only need
+# benchmark stats.  After stripping the file is <2KB (well under SSM 24K limit).
 STRIP_CMDS="[
-  \"python3 -c 'import json; f=\\\"/tmp/trnfft_bench.json\\\"; raw=open(f,\\\"rb\\\").read(); d=json.loads(raw.decode(\\\"latin-1\\\")); [b.get(\\\"stats\\\",{}).pop(\\\"data\\\",None) for b in d.get(\\\"benchmarks\\\",[])] ; open(f,\\\"w\\\").write(json.dumps(d))'\",
+  \"python3 -c 'import json; f=\\\"/tmp/trnfft_bench.json\\\"; raw=open(f,\\\"rb\\\").read(); d=json.loads(raw.decode(\\\"latin-1\\\")); d.pop(\\\"machine_info\\\",None); d.pop(\\\"commit_info\\\",None); [b.get(\\\"stats\\\",{}).pop(\\\"data\\\",None) for b in d.get(\\\"benchmarks\\\",[])] ; open(f,\\\"w\\\").write(json.dumps(d))'\",
   \"echo STRIPPED\"
 ]"
 STRIP_CMD_ID=$(aws ssm send-command \
