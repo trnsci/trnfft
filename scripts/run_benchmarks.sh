@@ -272,15 +272,18 @@ echo "Stripping per-sample data from benchmark JSON (reduces size for SSM fetch)
 # After stripping: ~200-500B (5 benchmarks × summary stats) — well under SSM 24K limit.
 # base64 string contains only [A-Za-z0-9+/=] — no quoting issues in JSON or bash.
 STRIP_B64="aW1wb3J0IGpzb24KZiA9ICcvdG1wL3RybmZmdF9iZW5jaC5qc29uJwpyYXcgPSBvcGVuKGYsICdyYicpLnJlYWQoKQpkID0ganNvbi5sb2FkcyhyYXcuZGVjb2RlKCdsYXRpbi0xJykpCmQucG9wKCdtYWNoaW5lX2luZm8nLCBOb25lKQpkLnBvcCgnY29tbWl0X2luZm8nLCBOb25lKQpmb3IgYiBpbiBkLmdldCgnYmVuY2htYXJrcycsIFtdKToKICAgIGIuZ2V0KCdzdGF0cycsIHt9KS5wb3AoJ2RhdGEnLCBOb25lKQpvcGVuKGYsICd3Jykud3JpdGUoanNvbi5kdW1wcyhkKSkK"
+# Single compound command with set -e so Python failure makes the whole command fail.
+# "set -e; A; B; C" — if A or B exits non-zero, shell exits; C never runs; SSM status=Failed.
+# This guarantees STATUS=="Success" iff strip actually ran and exited 0.
+# File sizes before/after let us verify the strip worked in the stdout output.
 STRIP_CMDS="[
-  \"echo $STRIP_B64 | base64 -d | python3\",
-  \"echo STRIPPED\"
+  \"set -e; ls -la $REMOTE_JSON; echo $STRIP_B64 | base64 -d | python3; ls -la $REMOTE_JSON; echo STRIPPED\"
 ]"
 STRIP_CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --comment "trnfft bench strip data" \
-  --parameters "{\"commands\":$STRIP_CMDS,\"executionTimeout\":[\"30\"]}" \
+  --parameters "{\"commands\":$STRIP_CMDS,\"executionTimeout\":[\"60\"]}" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 for i in $(seq 1 12); do
@@ -296,8 +299,15 @@ for i in $(seq 1 12); do
 done
 if [[ "$STATUS" != "Success" ]]; then
   echo "ERROR: Strip command failed ($STATUS)" >&2
+  aws ssm get-command-invocation --command-id "$STRIP_CMD_ID" --instance-id "$INSTANCE_ID" \
+    --region "$REGION" --query 'StandardOutputContent' --output text >&2
+  aws ssm get-command-invocation --command-id "$STRIP_CMD_ID" --instance-id "$INSTANCE_ID" \
+    --region "$REGION" --query 'StandardErrorContent' --output text >&2
   exit 1
 fi
+# Print strip output (shows before/after file sizes)
+aws ssm get-command-invocation --command-id "$STRIP_CMD_ID" --instance-id "$INSTANCE_ID" \
+  --region "$REGION" --query 'StandardOutputContent' --output text
 echo "JSON stripped."
 
 # ---------------------------------------------------------------------------
