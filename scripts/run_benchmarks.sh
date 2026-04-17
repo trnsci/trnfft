@@ -251,74 +251,38 @@ if [[ "$DONE" -ne 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 2.5: Strip per-sample timing data from JSON before fetch.
-# pytest-benchmark stores every raw sample (~40K at 3ms/call × max-time).
-# Stripping .stats.data leaves only summary statistics (~3-5 KB for 5 tests),
-# well under SSM's 24K StandardOutputContent limit.
-# ---------------------------------------------------------------------------
-echo "Stripping per-sample data from benchmark JSON (reduces size for SSM fetch)..."
-# The Python strip script is base64-encoded to avoid ALL shell/JSON quoting issues.
-# Decoded script:
-#   import json
+# Phase 3: Fetch + strip in one step (replaces former Phase 2.5 + Phase 3).
+#
+# All nine attempts at a separate strip-then-fetch approach produced 17997 bytes
+# (SSM base64 truncation) because the strip never persisted the modified file —
+# the stdout was empty every time, cause unknown.
+#
+# New design: a single SSM command runs a base64-encoded Python script that
+#   1. reads /tmp/trnfft_bench.json (latin-1 to handle µs bytes from pytest-benchmark)
+#   2. strips machine_info, commit_info, stats.data arrays IN MEMORY
+#   3. writes base64(json.dumps(stripped)) directly to stdout
+#
+# SSM stdout receives ~300-500 chars (well under 24K).  No file write needed.
+# Decoded locally: ~200-400 B valid JSON with 5 benchmark summaries.
+#
+# Python script (decoded from FETCH_B64):
+#   import json, base64, sys
 #   f = '/tmp/trnfft_bench.json'
 #   raw = open(f, 'rb').read()
-#   d = json.loads(raw.decode('latin-1'))   # latin-1 handles µ bytes from pytest-benchmark
-#   d.pop('machine_info', None)              # ~5KB — not needed for results
-#   d.pop('commit_info', None)               # ~1KB — not needed for results
+#   d = json.loads(raw.decode('latin-1'))
+#   d.pop('machine_info', None)
+#   d.pop('commit_info', None)
 #   for b in d.get('benchmarks', []):
-#       b.get('stats', {}).pop('data', None) # raw sample arrays — not needed
-#   open(f, 'w').write(json.dumps(d))        # ensure_ascii=True (default) → pure ASCII output
-#
-# After stripping: ~200-500B (5 benchmarks × summary stats) — well under SSM 24K limit.
-# base64 string contains only [A-Za-z0-9+/=] — no quoting issues in JSON or bash.
-STRIP_B64="aW1wb3J0IGpzb24KZiA9ICcvdG1wL3RybmZmdF9iZW5jaC5qc29uJwpyYXcgPSBvcGVuKGYsICdyYicpLnJlYWQoKQpkID0ganNvbi5sb2FkcyhyYXcuZGVjb2RlKCdsYXRpbi0xJykpCmQucG9wKCdtYWNoaW5lX2luZm8nLCBOb25lKQpkLnBvcCgnY29tbWl0X2luZm8nLCBOb25lKQpmb3IgYiBpbiBkLmdldCgnYmVuY2htYXJrcycsIFtdKToKICAgIGIuZ2V0KCdzdGF0cycsIHt9KS5wb3AoJ2RhdGEnLCBOb25lKQpvcGVuKGYsICd3Jykud3JpdGUoanNvbi5kdW1wcyhkKSkK"
-# Single compound command with set -e so Python failure makes the whole command fail.
-# "set -e; A; B; C" — if A or B exits non-zero, shell exits; C never runs; SSM status=Failed.
-# This guarantees STATUS=="Success" iff strip actually ran and exited 0.
-# File sizes before/after let us verify the strip worked in the stdout output.
-STRIP_CMDS="[
-  \"set -e; ls -la $REMOTE_JSON; echo $STRIP_B64 | base64 -d | python3; ls -la $REMOTE_JSON; echo STRIPPED\"
-]"
-STRIP_CMD_ID=$(aws ssm send-command \
-  --instance-ids "$INSTANCE_ID" \
-  --document-name "AWS-RunShellScript" \
-  --comment "trnfft bench strip data" \
-  --parameters "{\"commands\":$STRIP_CMDS,\"executionTimeout\":[\"60\"]}" \
-  --region "$REGION" \
-  --output text --query 'Command.CommandId')
-for i in $(seq 1 12); do
-  STATUS=$(aws ssm get-command-invocation \
-    --command-id "$STRIP_CMD_ID" \
-    --instance-id "$INSTANCE_ID" \
-    --region "$REGION" \
-    --query 'Status' --output text 2>/dev/null || echo "Unknown")
-  case "$STATUS" in
-    Success|Failed|TimedOut|Cancelled) break ;;
-  esac
-  sleep 5
-done
-if [[ "$STATUS" != "Success" ]]; then
-  echo "ERROR: Strip command failed ($STATUS)" >&2
-  aws ssm get-command-invocation --command-id "$STRIP_CMD_ID" --instance-id "$INSTANCE_ID" \
-    --region "$REGION" --query 'StandardOutputContent' --output text >&2
-  aws ssm get-command-invocation --command-id "$STRIP_CMD_ID" --instance-id "$INSTANCE_ID" \
-    --region "$REGION" --query 'StandardErrorContent' --output text >&2
-  exit 1
-fi
-# Print strip output (shows before/after file sizes)
-aws ssm get-command-invocation --command-id "$STRIP_CMD_ID" --instance-id "$INSTANCE_ID" \
-  --region "$REGION" --query 'StandardOutputContent' --output text
-echo "JSON stripped."
-
-# ---------------------------------------------------------------------------
-# Phase 3: Fetch the JSON (plain base64 — stripped JSON is ~3-5 KB).
+#       b.get('stats', {}).pop('data', None)
+#   sys.stdout.buffer.write(base64.b64encode(json.dumps(d).encode('ascii')))
 # ---------------------------------------------------------------------------
 echo ""
-echo "Pulling results JSON via SSM (base64)..."
+echo "Fetching + stripping results JSON (combined strip+encode via SSM stdout)..."
+FETCH_B64="aW1wb3J0IGpzb24sIGJhc2U2NCwgc3lzCmYgPSAnL3RtcC90cm5mZnRfYmVuY2guanNvbicKcmF3ID0gb3BlbihmLCAncmInKS5yZWFkKCkKZCA9IGpzb24ubG9hZHMocmF3LmRlY29kZSgnbGF0aW4tMScpKQpkLnBvcCgnbWFjaGluZV9pbmZvJywgTm9uZSkKZC5wb3AoJ2NvbW1pdF9pbmZvJywgTm9uZSkKZm9yIGIgaW4gZC5nZXQoJ2JlbmNobWFya3MnLCBbXSk6CiAgICBiLmdldCgnc3RhdHMnLCB7fSkucG9wKCdkYXRhJywgTm9uZSkKc3lzLnN0ZG91dC5idWZmZXIud3JpdGUoYmFzZTY0LmI2NGVuY29kZShqc29uLmR1bXBzKGQpLmVuY29kZSgnYXNjaWknKSkpCg=="
 FETCH_CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
-  --parameters "{\"commands\":[\"base64 -w0 $REMOTE_JSON\"],\"executionTimeout\":[\"60\"]}" \
+  --parameters "{\"commands\":[\"echo $FETCH_B64 | base64 -d | python3\"],\"executionTimeout\":[\"60\"]}" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 
@@ -335,7 +299,9 @@ for i in $(seq 1 12); do
 done
 
 if [[ "$STATUS" != "Success" ]]; then
-  echo "ERROR: Could not fetch JSON. Status: $STATUS" >&2
+  echo "ERROR: Fetch+strip failed ($STATUS)" >&2
+  aws ssm get-command-invocation --command-id "$FETCH_CMD_ID" --instance-id "$INSTANCE_ID" \
+    --region "$REGION" --query 'StandardErrorContent' --output text >&2
   exit 1
 fi
 
