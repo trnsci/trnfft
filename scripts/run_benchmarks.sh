@@ -251,14 +251,51 @@ if [[ "$DONE" -ne 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 3: Fetch the JSON.
+# Phase 2.5: Strip per-sample timing data from JSON before fetch.
+# pytest-benchmark stores every raw sample (~40K at 3ms/call × max-time).
+# Stripping .stats.data leaves only summary statistics (~3-5 KB for 5 tests),
+# well under SSM's 24K StandardOutputContent limit.
+# ---------------------------------------------------------------------------
+echo "Stripping per-sample data from benchmark JSON (reduces size for SSM fetch)..."
+# Python code uses double-quoted strings; escaping chain:
+#   bash \\\"  →  JSON \"  →  shell "  →  Python "
+STRIP_CMDS="[
+  \"python3 -c 'import json; f=\\\"/tmp/trnfft_bench.json\\\"; d=json.load(open(f)); [b.get(\\\"stats\\\", {}).pop(\\\"data\\\", None) for b in d.get(\\\"benchmarks\\\", [])]; open(f, \\\"w\\\").write(json.dumps(d))'\",
+  \"echo STRIPPED\"
+]"
+STRIP_CMD_ID=$(aws ssm send-command \
+  --instance-ids "$INSTANCE_ID" \
+  --document-name "AWS-RunShellScript" \
+  --comment "trnfft bench strip data" \
+  --parameters "{\"commands\":$STRIP_CMDS,\"executionTimeout\":[\"30\"]}" \
+  --region "$REGION" \
+  --output text --query 'Command.CommandId')
+for i in $(seq 1 12); do
+  STATUS=$(aws ssm get-command-invocation \
+    --command-id "$STRIP_CMD_ID" \
+    --instance-id "$INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'Status' --output text 2>/dev/null || echo "Unknown")
+  case "$STATUS" in
+    Success|Failed|TimedOut|Cancelled) break ;;
+  esac
+  sleep 5
+done
+if [[ "$STATUS" != "Success" ]]; then
+  echo "ERROR: Strip command failed ($STATUS)" >&2
+  exit 1
+fi
+echo "JSON stripped."
+
+# ---------------------------------------------------------------------------
+# Phase 3: Fetch the JSON (plain base64 — stripped JSON is ~3-5 KB).
 # ---------------------------------------------------------------------------
 echo ""
-echo "Pulling results JSON via SSM (gzip+base64 — avoids 24K SSM output limit)..."
+echo "Pulling results JSON via SSM (base64)..."
 FETCH_CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
-  --parameters "{\"commands\":[\"gzip -c $REMOTE_JSON | base64 -w0\"],\"executionTimeout\":[\"60\"]}" \
+  --parameters "{\"commands\":[\"base64 -w0 $REMOTE_JSON\"],\"executionTimeout\":[\"60\"]}" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 
@@ -281,7 +318,7 @@ fi
 
 aws ssm get-command-invocation --command-id "$FETCH_CMD_ID" --instance-id "$INSTANCE_ID" \
   --region "$REGION" --query 'StandardOutputContent' --output text \
-  | tr -d '\n' | base64 --decode | gunzip > "$LOCAL_OUT"
+  | tr -d '\n' | base64 --decode > "$LOCAL_OUT"
 
 echo "Wrote $LOCAL_OUT ($(wc -c < "$LOCAL_OUT") bytes)"
 echo ""
