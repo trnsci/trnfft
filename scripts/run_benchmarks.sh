@@ -259,8 +259,10 @@ fi
 echo "Stripping per-sample data from benchmark JSON (reduces size for SSM fetch)..."
 # Python code uses double-quoted strings; escaping chain:
 #   bash \\\"  →  JSON \"  →  shell "  →  Python "
+# json.load(open(f)) fails if the JSON contains latin-1 bytes (e.g. µ from
+# pytest-benchmark's µs unit).  Read as binary and decode with latin-1 instead.
 STRIP_CMDS="[
-  \"python3 -c 'import json; f=\\\"/tmp/trnfft_bench.json\\\"; d=json.load(open(f)); [b.get(\\\"stats\\\", {}).pop(\\\"data\\\", None) for b in d.get(\\\"benchmarks\\\", [])]; open(f, \\\"w\\\").write(json.dumps(d))'\",
+  \"python3 -c 'import json; f=\\\"/tmp/trnfft_bench.json\\\"; raw=open(f,\\\"rb\\\").read(); d=json.loads(raw.decode(\\\"latin-1\\\")); [b.get(\\\"stats\\\",{}).pop(\\\"data\\\",None) for b in d.get(\\\"benchmarks\\\",[])] ; open(f,\\\"w\\\").write(json.dumps(d))'\",
   \"echo STRIPPED\"
 ]"
 STRIP_CMD_ID=$(aws ssm send-command \
