@@ -8,10 +8,14 @@
 # Default instance_type is trn1. Produces:
 #   - benchmark_results.json (raw pytest-benchmark output)
 #
-# Design: two-phase to avoid local timeout killing the benchmark.
+# Design: separated setup + launch to avoid pip-install timeout busting the bench.
 #
-#   Phase 1 (submit, ~2 min): SSM command installs deps and starts pytest
-#     as a nohup background process. Returns as soon as pytest is launched.
+#   Phase 1a (setup, up to 60 min): SSM command runs git fetch/checkout + pip
+#     install. Slow; allowed 3600s. Returns when SETUP_DONE is echoed.
+#
+#   Phase 1b (launch, < 30s): SSM command nohup-launches pytest as a detached
+#     background process (disown ensures it survives shell exit). Returns as
+#     soon as SUBMITTED_PID is echoed.
 #
 #   Phase 2 (poll, up to 3 h): Short-lived SSM "check" commands poll for
 #     /tmp/trnfft_bench.json to become non-empty (pytest-benchmark writes it
@@ -82,35 +86,32 @@ for i in $(seq 1 30); do
 done
 
 # ---------------------------------------------------------------------------
-# Phase 1: Submit benchmark as a background nohup process.
-# The SSM command installs deps, removes any stale JSON, launches pytest in
-# the background, and exits immediately. No long-running SSM command.
+# Phase 1a: Setup — git fetch/checkout + pip install.
+# Separated from the launch step so pip can take as long as it needs
+# (up to 60 min) without interfering with the quick nohup launch.
 # ---------------------------------------------------------------------------
-echo "Submitting benchmark (SHA=$SHA) as background process..."
+echo "Setting up repo at SHA=$SHA (git fetch + pip install, up to 60 min)..."
 
-SUBMIT_SCRIPT="set -e && \
+SETUP_SCRIPT="set -e && \
   source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate && \
   cd /home/ubuntu/trnfft && \
   git fetch --all && \
   git checkout $SHA && \
   pip install -e '.[dev]' --quiet && \
-  rm -f $REMOTE_JSON $REMOTE_LOG && \
-  nohup pytest benchmarks/bench_fft.py --benchmark-only --benchmark-json=$REMOTE_JSON --tb=short \
-    > $REMOTE_LOG 2>&1 & \
-  echo SUBMITTED_PID=\$!"
+  echo SETUP_DONE"
 
-SUBMIT_CMD_ID=$(aws ssm send-command \
+SETUP_CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
-  --comment "trnfft bench submit @ $SHA" \
-  --parameters "{\"commands\":[\"sudo -u ubuntu bash -c \\\"$SUBMIT_SCRIPT\\\"\"],\"executionTimeout\":[\"1800\"]}" \
+  --comment "trnfft bench setup @ $SHA" \
+  --parameters "{\"commands\":[\"sudo -u ubuntu bash -c \\\"$SETUP_SCRIPT\\\"\"],\"executionTimeout\":[\"3600\"]}" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 
-echo "Submit command ID: $SUBMIT_CMD_ID"
-for i in $(seq 1 120); do
+echo "Setup command ID: $SETUP_CMD_ID"
+for i in $(seq 1 240); do
   STATUS=$(aws ssm get-command-invocation \
-    --command-id "$SUBMIT_CMD_ID" \
+    --command-id "$SETUP_CMD_ID" \
     --instance-id "$INSTANCE_ID" \
     --region "$REGION" \
     --query 'Status' --output text 2>/dev/null || echo "Unknown")
@@ -121,14 +122,59 @@ for i in $(seq 1 120); do
 done
 
 if [[ "$STATUS" != "Success" ]]; then
-  echo "ERROR: Submit command failed ($STATUS)" >&2
-  aws ssm get-command-invocation --command-id "$SUBMIT_CMD_ID" --instance-id "$INSTANCE_ID" \
+  echo "ERROR: Setup command failed ($STATUS)" >&2
+  aws ssm get-command-invocation --command-id "$SETUP_CMD_ID" --instance-id "$INSTANCE_ID" \
+    --region "$REGION" --query 'StandardErrorContent' --output text >&2
+  exit 1
+fi
+echo "Setup complete."
+
+# ---------------------------------------------------------------------------
+# Phase 1b: Launch — nohup pytest as detached background process.
+# Quick command (< 10s); the heavy work was done in Phase 1a.
+# `disown` detaches pytest from the bash shell so it survives the shell exit.
+# ---------------------------------------------------------------------------
+echo "Launching benchmark as background process..."
+
+LAUNCH_SCRIPT="source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate && \
+  cd /home/ubuntu/trnfft && \
+  rm -f $REMOTE_JSON $REMOTE_LOG && \
+  nohup pytest benchmarks/bench_fft.py --benchmark-only --benchmark-json=$REMOTE_JSON --tb=short \
+    > $REMOTE_LOG 2>&1 & \
+  BG_PID=\$! && \
+  disown \$BG_PID && \
+  echo SUBMITTED_PID=\$BG_PID"
+
+LAUNCH_CMD_ID=$(aws ssm send-command \
+  --instance-ids "$INSTANCE_ID" \
+  --document-name "AWS-RunShellScript" \
+  --comment "trnfft bench launch @ $SHA" \
+  --parameters "{\"commands\":[\"sudo -u ubuntu bash -c \\\"$LAUNCH_SCRIPT\\\"\"],\"executionTimeout\":[\"60\"]}" \
+  --region "$REGION" \
+  --output text --query 'Command.CommandId')
+
+echo "Launch command ID: $LAUNCH_CMD_ID"
+for i in $(seq 1 20); do
+  STATUS=$(aws ssm get-command-invocation \
+    --command-id "$LAUNCH_CMD_ID" \
+    --instance-id "$INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'Status' --output text 2>/dev/null || echo "Unknown")
+  case "$STATUS" in
+    Success|Failed|TimedOut|Cancelled) break ;;
+  esac
+  sleep 5
+done
+
+if [[ "$STATUS" != "Success" ]]; then
+  echo "ERROR: Launch command failed ($STATUS)" >&2
+  aws ssm get-command-invocation --command-id "$LAUNCH_CMD_ID" --instance-id "$INSTANCE_ID" \
     --region "$REGION" --query 'StandardErrorContent' --output text >&2
   exit 1
 fi
 
 echo "Benchmark launched. Output: $REMOTE_LOG"
-aws ssm get-command-invocation --command-id "$SUBMIT_CMD_ID" --instance-id "$INSTANCE_ID" \
+aws ssm get-command-invocation --command-id "$LAUNCH_CMD_ID" --instance-id "$INSTANCE_ID" \
   --region "$REGION" --query 'StandardOutputContent' --output text
 
 # ---------------------------------------------------------------------------
