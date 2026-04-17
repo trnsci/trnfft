@@ -13,9 +13,10 @@
 #   Phase 1a (setup, up to 60 min): SSM command runs git fetch/checkout + pip
 #     install. Slow; allowed 3600s. Returns when SETUP_DONE is echoed.
 #
-#   Phase 1b (launch, < 30s): SSM command nohup-launches pytest as a detached
-#     background process (disown ensures it survives shell exit). Returns as
-#     soon as SUBMITTED_PID is echoed.
+#   Phase 1b (launch, < 10s): Three single-line SSM commands — rm stale files,
+#     setsid launch (new OS session, SSM cannot track), echo LAUNCHED.
+#     Avoids the bash `cmd1 && cmd2 & cmd3` → `(chain) & cmd3` precedence bug
+#     that caused previous nohup/$! attempts to background the whole chain.
 #
 #   Phase 2 (poll, up to 3 h): Short-lived SSM "check" commands poll for
 #     /tmp/trnfft_bench.json to become non-empty (pytest-benchmark writes it
@@ -92,12 +93,15 @@ done
 # ---------------------------------------------------------------------------
 echo "Setting up repo at SHA=$SHA (git fetch + pip install, up to 60 min)..."
 
+RUNNER="/tmp/trnfft_bench_runner.sh"
 SETUP_SCRIPT="set -e && \
   source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate && \
   cd /home/ubuntu/trnfft && \
   git fetch --all && \
   git checkout $SHA && \
   pip install -e '.[dev]' --quiet && \
+  printf '#!/bin/bash\nsource /opt/aws_neuronx_venv_pytorch_2_9/bin/activate\ncd /home/ubuntu/trnfft\nexec pytest benchmarks/bench_fft.py --benchmark-only --benchmark-json=$REMOTE_JSON --tb=short >$REMOTE_LOG 2>&1\n' > $RUNNER && \
+  chmod +x $RUNNER && \
   echo SETUP_DONE"
 
 SETUP_CMD_ID=$(aws ssm send-command \
@@ -130,31 +134,31 @@ fi
 echo "Setup complete."
 
 # ---------------------------------------------------------------------------
-# Phase 1b: Launch — nohup pytest as detached background process.
-# Quick command (< 10s); the heavy work was done in Phase 1a.
-# `disown` detaches pytest from the bash shell so it survives the shell exit.
+# Phase 1b: Launch — setsid creates a new OS session so SSM cannot track
+# pytest's process group.  Three independent SSM commands (each is a single
+# shell line) avoids the bash operator-precedence bug where
+#   cmd1 && cmd2 & cmd3
+# backgrounds the ENTIRE chain instead of just cmd2.
 # ---------------------------------------------------------------------------
-echo "Launching benchmark as background process..."
+echo "Launching benchmark (setsid, new session)..."
 
-LAUNCH_SCRIPT="source /opt/aws_neuronx_venv_pytorch_2_9/bin/activate && \
-  cd /home/ubuntu/trnfft && \
-  rm -f $REMOTE_JSON $REMOTE_LOG && \
-  nohup pytest benchmarks/bench_fft.py --benchmark-only --benchmark-json=$REMOTE_JSON --tb=short \
-    > $REMOTE_LOG 2>&1 & \
-  BG_PID=\$! && \
-  disown \$BG_PID && \
-  echo SUBMITTED_PID=\$BG_PID"
+# Build three-element commands JSON: rm stale files, setsid launch, confirm.
+LAUNCH_CMDS="[
+  \"sudo -u ubuntu rm -f $REMOTE_JSON $REMOTE_LOG\",
+  \"sudo -u ubuntu setsid $RUNNER </dev/null >/dev/null 2>&1 &\",
+  \"echo LAUNCHED\"
+]"
 
 LAUNCH_CMD_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name "AWS-RunShellScript" \
   --comment "trnfft bench launch @ $SHA" \
-  --parameters "{\"commands\":[\"sudo -u ubuntu bash -c \\\"$LAUNCH_SCRIPT\\\"\"],\"executionTimeout\":[\"60\"]}" \
+  --parameters "{\"commands\":$LAUNCH_CMDS,\"executionTimeout\":[\"120\"]}" \
   --region "$REGION" \
   --output text --query 'Command.CommandId')
 
 echo "Launch command ID: $LAUNCH_CMD_ID"
-for i in $(seq 1 20); do
+for i in $(seq 1 30); do
   STATUS=$(aws ssm get-command-invocation \
     --command-id "$LAUNCH_CMD_ID" \
     --instance-id "$INSTANCE_ID" \
