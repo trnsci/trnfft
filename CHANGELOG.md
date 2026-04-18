@@ -31,10 +31,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Existing `test` matrix runs with `-m "not neuron and not nki_simulator"` so each test runs on exactly one CI job.
 - **SDK 2.29 improved butterfly performance by 1.3–2.1× vs SDK 2.24.** E.g. N=256 butterfly: 9 862 μs → 6 067 μs; N=1024: 15 746 μs → 7 399 μs. DFT-GEMM speedup over butterfly at N=256 narrowed from 5.2× to 3.0×; DFT-GEMM is still the dominant path at N ≤ 256.
 
-### Known limitations
+### Changed (continued)
 
-- **Stockham POC is not faster than butterfly.** Hardware bench (trn1, SDK 2.29) shows Stockham ~2% slower at all tested N (16–4096). Both paths are all-Vector-engine with the same total work; fewer launches don't help when each stage costs proportionally more. Thread C (twiddle multiply onto the Tensor engine via `nisa.nc_matmul`) is the structural fix — same dual-engine pattern that gives butterfly its speed, applied at radix-4 granularity.
-- `_DFT_GEMM_THRESHOLD = 256` unchanged. Precision-bound, not perf-bound. SDK 2.29 butterfly improvement narrows but does not eliminate the DFT-GEMM lead at N ≤ 256.
+- **Stockham twiddle precomputation (SHA `a74b697`) makes Stockham the default path for power-of-four N > 256.** Precomputing all log₄(N) twiddle tensors before the stage loop eliminates per-stage H→D transfer overhead — the dominant cost term in the pre-precompute baseline. Hardware bench (trn1, SDK 2.29, 2026-04-17): Stockham is **6–9% faster than butterfly** at all tested N (16–4096). `trnfft` now auto-dispatches power-of-four N above `_DFT_GEMM_THRESHOLD` through the Stockham kernel. `_DFT_GEMM_THRESHOLD = 256` unchanged — DFT-GEMM is still ~3× faster than Stockham at N ≤ 256.
+
+| N    | Stockham (μs) | Butterfly (μs) | Delta    |
+| ---- | ------------- | -------------- | -------- |
+| 16   | 3 121         | 3 337          | −6%      |
+| 64   | 4 322         | 4 767          | −9%      |
+| 256  | 5 700         | 6 067          | −6%      |
+| 1024 | 6 850         | 7 399          | −7%      |
+| 4096 | 8 632         | 9 387          | −8%      |
 
 ## [0.12.0] - 2026-04-13
 

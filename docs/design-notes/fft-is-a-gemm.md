@@ -194,15 +194,20 @@ Stockham time at N=1024 drops to ~4766 μs — a **~1.55× win** over butterfly 
 
 ### Hardware result after twiddle precomputation
 
-*Placeholder — fill after hardware benchmark run on SHA `f095671`.*
+Hardware bench on trn1, SDK 2.29, 2026-04-17 (SHA `a74b697`):
 
-| N    | Stockham (μs) | Butterfly (μs) | Winner |
-| ---- | ------------- | -------------- | ------ |
-| 16   |               | 3 337          |        |
-| 64   |               | 4 767          |        |
-| 256  |               | 6 067          |        |
-| 1024 |               | 7 399          |        |
-| 4096 |               | 9 387          |        |
+| N    | Stockham (μs) | Butterfly (μs) | Winner   |
+| ---- | ------------- | -------------- | -------- |
+| 16   | 3 121         | 3 337          | Stockham |
+| 64   | 4 322         | 4 767          | Stockham |
+| 256  | 5 700         | 6 067          | Stockham |
+| 1024 | 6 850         | 7 399          | Stockham |
+| 4096 | 8 632         | 9 387          | Stockham |
+
+Stockham wins by 6–9% at every tested N. Twiddle precomputation was the
+dominant overhead term: eliminating per-stage H→D transfer turned the ~2%
+deficit into a consistent lead. `trnfft` now auto-dispatches power-of-four
+N > 256 through the Stockham path.
 
 ## Batched FFT + STFT: where the thesis pays off
 
