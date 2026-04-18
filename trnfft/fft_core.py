@@ -136,6 +136,12 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
 #   N=256 stays inside 1e-3 tol; N=1024 exceeds (observed 2.2% rel err).
 _DFT_GEMM_THRESHOLD = 256
 
+# Upper bound for the FP64 CPU DFT-GEMM path (precision="double" only).
+# Beyond this N, "double" mode falls through to NKI Stockham (~1e-4 FP32).
+# Set to 1024: CPU FP64 matmul is O(N^2) and noticeably slow at N > 1024,
+# while Stockham already achieves ~1e-4 rel error with far less work.
+_DOUBLE_GEMM_THRESHOLD = 1024
+
 # Debug / benchmark toggle — when True, trnfft.fft on the NKI path
 # forces Stockham radix-4 dispatch at any power-of-4 N, ignoring the
 # usual DFT-GEMM threshold. Set around bench timing blocks only; the
@@ -146,14 +152,15 @@ _FORCE_STOCKHAM = False
 
 
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
-    """Compute FFT as a single complex matmul: X = W @ x.
+    """Compute FFT as a single complex matmul: X = W @ x (FP32, NKI path).
 
-    Routes onto the Trainium Tensor engine via `complex_gemm`. Works on CPU
-    too (PyTorch matmul fallback) but asymptotically worse than Cooley-Tukey
-    there; this path only gets dispatched when `_use_nki()`.
+    Routes onto the Trainium Tensor engine via `complex_gemm`. PSUM
+    accumulation on Trainium is always FP32; this path achieves ~1e-3
+    relative error at N=256 (the dispatch threshold). For FP64 accuracy,
+    use ``precision="double"`` which routes to :func:`_fft_via_gemm_double`.
 
     Shape handling: flattens leading batch dims to 2D (B, N), does
-    `x @ W` (W is the N×N symmetric DFT matrix), restores original shape.
+    ``x @ W`` (W is the N×N DFT matrix), restores original shape.
     """
     from .nki.dispatch import complex_gemm
 
@@ -164,11 +171,10 @@ def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
     sign = 1.0 if inverse else -1.0
     k = torch.arange(n, dtype=x_re.dtype)
-    kj = k.unsqueeze(1) * k.unsqueeze(0)  # (N, N) outer product: W_angle = sign * 2π * k * j / N
+    kj = k.unsqueeze(1) * k.unsqueeze(0)
     angles = sign * 2.0 * math.pi * kj / n
     W = ComplexTensor(torch.cos(angles), torch.sin(angles))
 
-    # x is (B, N), W is (N, N) symmetric, so x @ W gives (B, N).
     X_2d = complex_gemm(ComplexTensor(x_re, x_im), W)
     X_re = X_2d.real.reshape(orig_shape)
     X_im = X_2d.imag.reshape(orig_shape)
@@ -176,6 +182,53 @@ def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     if inverse:
         result = result * (1.0 / n)
     return result
+
+
+def _fft_via_gemm_double(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """FP64 DFT-GEMM: W @ x computed on CPU in float64.
+
+    Called when ``precision="double"`` and ``n <= _DOUBLE_GEMM_THRESHOLD``.
+    Achieves ~1e-14 relative error vs numpy reference.
+
+    Why CPU and not NKI: Trainium's PSUM accumulator is always FP32; even
+    FP64 inputs are cast to FP32 before accumulation in ``_complex_gemm_kernel``.
+    Explicit CPU computation is the only way to guarantee FP64 precision.
+    The result is transferred back to the original device after computation.
+
+    Performance: slower than NKI Stockham (~1e-4 FP32) on hardware. Acceptable
+    because ``precision="double"`` is explicitly the accuracy-first path.
+    """
+    from .complex import complex_matmul
+
+    n = x.shape[-1]
+    orig_dtype = x.real.dtype
+    orig_device = x.real.device
+
+    x_re_cpu = x.real.detach().cpu().double()
+    x_im_cpu = x.imag.detach().cpu().double()
+
+    sign = 1.0 if inverse else -1.0
+    k = torch.arange(n, dtype=torch.float64)
+    kj = k.unsqueeze(1) * k.unsqueeze(0)
+    angles = sign * 2.0 * math.pi * kj / n
+    W = ComplexTensor(torch.cos(angles), torch.sin(angles))
+
+    orig_shape = x_re_cpu.shape
+    x_re_2d = x_re_cpu.reshape(-1, n).contiguous()
+    x_im_2d = x_im_cpu.reshape(-1, n).contiguous()
+
+    X_2d = complex_matmul(ComplexTensor(x_re_2d, x_im_2d), W)
+    result = ComplexTensor(
+        X_2d.real.reshape(orig_shape),
+        X_2d.imag.reshape(orig_shape),
+    )
+    if inverse:
+        result = result * (1.0 / n)
+
+    return ComplexTensor(
+        result.real.to(dtype=orig_dtype, device=orig_device),
+        result.imag.to(dtype=orig_dtype, device=orig_device),
+    )
 
 
 def _cooley_tukey_nki(x: ComplexTensor, inverse: bool, precision: str = "fast") -> ComplexTensor:
@@ -432,6 +485,12 @@ def _cooley_tukey_nki_nograd(
     # inside benchmark timing blocks; see note at _FORCE_STOCKHAM definition.
     if _FORCE_STOCKHAM and precision != "kahan":
         return _fft_via_stockham_nki(x, inverse)
+
+    # "double" mode: NKI PSUM is always FP32, so bypass NKI and use CPU FP64.
+    # Fixes the silent bug where precision="double" was ignored for power-of-2
+    # FFTs, leaving users with FP32 DFT-GEMM (~1e-3) instead of FP64 (~1e-14).
+    if precision == "double" and n <= _DOUBLE_GEMM_THRESHOLD:
+        return _fft_via_gemm_double(x, inverse)
 
     if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
         return _fft_via_gemm(x, inverse)

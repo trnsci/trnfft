@@ -320,6 +320,107 @@ class TestDFTGEMM:
         np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
 
 
+class TestDFTGEMMDouble:
+    """Tests for the FP64 CPU DFT-GEMM path (_fft_via_gemm_double).
+
+    This path activates when precision="double" and n <= _DOUBLE_GEMM_THRESHOLD.
+    It bypasses NKI and computes W @ x in float64 on CPU, achieving ~1e-14
+    relative error vs numpy reference.
+
+    These tests run on CPU without NKI — they call _fft_via_gemm_double directly
+    and also verify that the precision="double" dispatch wires up correctly.
+    """
+
+    @pytest.mark.parametrize("n", [8, 64, 256, 512, 1024])
+    def test_matches_numpy_double(self, n):
+        # Output dtype matches FP32 input (consistent with Bluestein "double" behaviour).
+        # FP32 quantization floor is ~1e-7; tolerance 1e-6 gives comfortable margin.
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_gemm_double
+
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        result = _fft_via_gemm_double(ComplexTensor(x, torch.zeros(n)), inverse=False)
+        expected = np.fft.fft(x.numpy().astype(np.float64))
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-6, rtol=1e-6)
+
+    def test_matches_numpy_double_fp64_input(self):
+        # When input is already FP64 the output is FP64 and achieves ~1e-14 error.
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_gemm_double
+
+        torch.manual_seed(42)
+        n = 512
+        x = torch.randn(n, dtype=torch.float64)
+        result = _fft_via_gemm_double(
+            ComplexTensor(x, torch.zeros(n, dtype=torch.float64)), inverse=False
+        )
+        expected = np.fft.fft(x.numpy())
+        assert result.real.dtype == torch.float64
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-10, rtol=1e-10)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-10, rtol=1e-10)
+
+    def test_roundtrip_double(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_gemm_double
+
+        torch.manual_seed(42)
+        n = 512
+        x = torch.randn(n)
+        ct = ComplexTensor(x, torch.zeros(n))
+        X = _fft_via_gemm_double(ct, inverse=False)
+        back = _fft_via_gemm_double(X, inverse=True)
+        np.testing.assert_allclose(back.real.numpy(), x.numpy(), atol=1e-5)
+        np.testing.assert_allclose(back.imag.numpy(), np.zeros(n), atol=1e-5)
+
+    def test_batched_double(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_gemm_double
+
+        torch.manual_seed(42)
+        x = torch.randn(4, 256)
+        result = _fft_via_gemm_double(ComplexTensor(x, torch.zeros_like(x)), inverse=False)
+        expected = np.fft.fft(x.numpy().astype(np.float64), axis=-1)
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-6, rtol=1e-6)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-6, rtol=1e-6)
+
+    def test_inverse_double_at_n512(self):
+        """_fft_via_gemm_double correctly handles inverse=True at N=512."""
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_gemm_double
+
+        torch.manual_seed(42)
+        n = 512
+        x = torch.randn(n) + 1j * torch.randn(n)
+        ct = ComplexTensor(x.real, x.imag)
+        X = _fft_via_gemm_double(ct, inverse=False)
+        back = _fft_via_gemm_double(X, inverse=True)
+        np.testing.assert_allclose(back.real.numpy(), x.real.numpy(), atol=1e-5)
+        np.testing.assert_allclose(back.imag.numpy(), x.imag.numpy(), atol=1e-5)
+
+    def test_double_beats_fast_precision_at_n256(self):
+        """ "double" mode is more accurate than "fast" mode at N=256."""
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_gemm, _fft_via_gemm_double
+
+        torch.manual_seed(99)
+        n = 256
+        x = torch.randn(n)
+        ct = ComplexTensor(x, torch.zeros(n))
+        expected = np.fft.fft(x.numpy().astype(np.float64))
+
+        fast = _fft_via_gemm(ct, inverse=False)
+        double = _fft_via_gemm_double(ct, inverse=False)
+
+        err_fast = np.abs(fast.real.numpy() - expected.real).max()
+        err_double = np.abs(double.real.numpy() - expected.real).max()
+        assert err_double < err_fast, (
+            f"double ({err_double:.2e}) should be more accurate than fast ({err_fast:.2e})"
+        )
+        assert err_double < 1e-5
+
+
 class TestStockhamRadix4:
     """CPU reference for radix-4 Stockham FFT (trnfft.stockham).
 

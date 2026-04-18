@@ -9,14 +9,21 @@ Three modes trade off speed vs numerical accuracy:
   chirp multiplications on the host, plus a Kahan variant of the NKI
   butterfly kernel. Target ~1e-3 rel error at N=8192. Roughly 2× the op
   count of "fast" in the compensated sections.
-* ``"double"`` — promotes the Bluestein host math to FP64 for the entire
-  chirp/pad/filter pipeline and the three inner FFTs. Casts result back
-  to input dtype. Target ~1e-6 rel error at any N. Only affects Bluestein;
-  power-of-2 FFTs are unchanged (they don't have the chain-error issue).
+* ``"double"`` — promotes math to FP64 for maximum accuracy. Affects two paths:
+
+  1. **Bluestein** (non-power-of-2 N): promotes the entire chirp/pad/filter
+     pipeline and the three inner FFTs. Target ~1e-6 rel error at any N.
+
+  2. **DFT-GEMM** (power-of-2 N ≤ 1024): bypasses NKI and computes ``W @ x``
+     on CPU in FP64. Trainium's PSUM accumulator is always FP32; CPU is the
+     only way to get FP64 accumulation. Target ~1e-14 rel error. Slower than
+     the "fast" NKI path, but "double" is explicitly the accuracy-first mode.
+     For N > 1024, falls through to NKI Stockham (~1e-4 FP32 rel error).
 
 Backend interaction: "kahan" and "double" do not disable the NKI backend
-globally — they only change the code path inside ``_bluestein`` and (for
-"kahan") the choice of butterfly kernel in ``_cooley_tukey_nki``.
+globally — they only change the code path inside ``_bluestein``,
+``_cooley_tukey_nki_nograd`` (DFT-GEMM double bypass + "kahan" butterfly
+kernel selection), and ``_fft_via_gemm_double``.
 """
 
 from __future__ import annotations

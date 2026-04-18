@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`precision="double"` was silently ignored for power-of-2 FFTs.** `_fft_via_gemm`
+  received no precision parameter; users calling `set_precision("double")` for small-N
+  accuracy got FP32 DFT-GEMM (~1e-3 error) instead of FP64 (~1e-6 for FP32 inputs,
+  ~1e-12 for FP64 inputs). Fixed by routing `precision="double"` through a new
+  `_fft_via_gemm_double()` function that:
+  - Computes `W @ x` on CPU in FP64 (bypasses NKI — Trainium PSUM is always FP32)
+  - Activates for N ≤ `_DOUBLE_GEMM_THRESHOLD = 1024`
+  - Casts result back to input dtype (consistent with Bluestein "double" behaviour)
+  - For N > 1024 in "double" mode: falls through to NKI Stockham (~1e-4 FP32)
+
 ### Added
 
 - `_stockham_perm_indices(log4n, B_pad, n)` utility in `fft_core.py` — precomputes
