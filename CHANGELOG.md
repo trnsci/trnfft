@@ -7,19 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Added
 
-- **Thread C phase 1: precomputed permutation indices in Stockham driver.** Replaces the
-  `reshape + permute + .contiguous() + reshape` chain (2× per stage) with a single
-  flat-index gather using precomputed `int64` index tensors. New helper
-  `_stockham_perm_indices(log4n, B_pad, n)` computes `(pack_idx, unpack_idx)` per stage
-  on CPU before the loop; indices are transferred to device once alongside twiddles.
-  Reduces per-stage XLA graph node count from 8 materializing ops to 2. Hardware bench
-  (v0.14) will quantify the wall-clock improvement.
+- `_stockham_perm_indices(log4n, B_pad, n)` utility in `fft_core.py` — precomputes
+  flat pack/unpack index tensors for all Stockham stages (CPU int64). Not used in the
+  hot path (see note below) but available for testing, profiling, and future
+  NKI gather experiments when cross-partition addressing becomes available.
 - `trnfft/nki/stockham.py`: documents `stockham_radix4_fused_kernel` as a named stub
   (Thread C phase 2) with the architectural constraint that blocks it: cross-partition
-  scatter in NKI is not supported for the N values where Stockham dispatches (N > 256,
-  total_groups > PMAX).
+  scatter in NKI is not supported for the N values where Stockham dispatches.
+
+### Research note — Thread C phase 1 (gather approach measured slower)
+
+Hardware bench (trn1, SDK 2.29, 2026-04-18) showed that replacing `permute+contiguous`
+(transpose HLO) with a precomputed flat-index gather (GatherOp HLO) is **11–39% slower**
+across all tested N:
+
+| N    | v0.13 (µs) | v0.14 gather (µs) | delta |
+|------|------------|-------------------|-------|
+| 16   | 3 121      | 3 493             | +12%  |
+| 64   | 4 322      | 4 796             | +11%  |
+| 256  | 5 700      | 6 103             | +7%   |
+| 1024 | 6 850      | 7 950             | +16%  |
+| 4096 | 8 632      | 11 991            | +39%  |
+
+Neuron's transpose HLO is hardware-optimized; the GatherOp for non-affine indices is not.
+The driver reverts to the `permute+contiguous` approach. `_stockham_perm_indices` is kept
+as a utility. The permute overhead (~97 µs/stage) is an irreducible cost until true
+SBUF-resident stage fusion is possible (Thread C phase 2).
 
 ## [0.13.0] - 2026-04-15
 

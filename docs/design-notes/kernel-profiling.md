@@ -180,7 +180,22 @@ means the inter-stage permutation scatters elements across partition tiles. NKI'
 affine_range model requires contiguous partition addressing; cross-tile indirect
 scatter is not supported as of NKI 0.3.0.
 
-**Hardware result (v0.14):** *fill after bench run — see `benchmark_results.json`.*
+**Hardware result (v0.14, trn1, SDK 2.29, 2026-04-18):** The gather approach is
+**11–39% slower** than `permute+contiguous` — a clear regression.
+
+| N    | v0.13 permute (µs) | v0.14 gather (µs) | delta |
+|------|--------------------|--------------------|-------|
+| 16   | 3 121              | 3 493              | +12%  |
+| 64   | 4 322              | 4 796              | +11%  |
+| 256  | 5 700              | 6 103              | +7%   |
+| 1024 | 6 850              | 7 950              | +16%  |
+| 4096 | 8 632              | 11 991             | +39%  |
+
+**Why:** Neuron's XLA backend has a highly-optimized transpose HLO that likely maps to
+a hardware DMA permute path. GatherOp with non-affine indices has no such fast path —
+it resolves to scalar loads from random HBM addresses. The driver reverts to
+`permute+contiguous`. Thread C phase 2 (SBUF-resident fusion) remains the only path to
+eliminating this overhead, and is blocked on NKI cross-partition scatter support.
 
 ---
 

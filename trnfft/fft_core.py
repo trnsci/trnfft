@@ -324,9 +324,10 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     # total_groups = B_pad * L * M = B_pad * N/4 — constant across all stages.
     total_groups = B_pad * n // 4
 
-    # Precompute ALL twiddle factors and pack/unpack permutation indices on CPU
-    # before the stage loop, then transfer to device as standalone tensors.
-    # Slicing XLA device tensors creates DynamicSlice HLO ops that bust NEFF cache.
+    # Precompute ALL twiddle factors on CPU before the stage loop, then
+    # transfer to device as a list of standalone tensors — not as slices of
+    # a stacked tensor. Slicing an XLA device tensor creates DynamicSlice HLO
+    # ops that change the compiled graph and bust the NEFF cache.
     twiddles_cpu = []
     for s in range(log4n):
         L = 1 << (2 * s)
@@ -338,28 +339,30 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         tw_i = torch.sin(ang).expand(B_pad, L, M, 4).contiguous().reshape(total_groups, 4)
         twiddles_cpu.append((tw_r, tw_i))
 
-    perm_indices_cpu = _stockham_perm_indices(log4n, B_pad, n)
-
     re = pad_re if use_sim else pad_re.to(device)
     im = pad_im if use_sim else pad_im.to(device)
 
     if not use_sim:
-        # Transfer all per-stage twiddles and permutation indices to XLA device.
-        # Each entry is an independent tensor — NEFF cache hit guaranteed.
+        # Transfer all per-stage twiddles to XLA device before the kernel loop.
+        # Each entry is an independent tensor; the kernel call sees the same
+        # (total_groups, 4) shape at every stage — NEFF cache hit guaranteed.
         twiddles = [(tw_r.to(device), tw_i.to(device)) for tw_r, tw_i in twiddles_cpu]
-        perm_indices = [(p.to(device), u.to(device)) for p, u in perm_indices_cpu]
     else:
         twiddles = twiddles_cpu
-        perm_indices = perm_indices_cpu
 
     for s in range(log4n):
-        pack_idx, unpack_idx = perm_indices[s]
+        L = 1 << (2 * s)
+        M = n // (4 * L)
         tw_r, tw_i = twiddles[s]
 
-        # Pack: replace reshape+permute+contiguous+reshape with a single gather.
-        # Reduces per-stage XLA graph from 4 ops to 1 (Thread C phase 1).
-        re_groups = re.view(-1)[pack_idx].reshape(total_groups, 4)
-        im_groups = im.view(-1)[pack_idx].reshape(total_groups, 4)
+        # Pack stage-s input into (total_groups, 4): each partition row is
+        # one 4-point DFT group with k as the contiguous inner axis.
+        # Transpose HLO (permute+contiguous) is faster than GatherOp on Neuron —
+        # gather was measured 11–39% slower in the v0.14 Thread C experiment.
+        re_4d = re.reshape(B_pad, L, 4, M)
+        im_4d = im.reshape(B_pad, L, 4, M)
+        re_groups = re_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
+        im_groups = im_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
 
         if use_sim:
             import nki as _nki
@@ -375,9 +378,11 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         else:
             out_re, out_im = stockham_radix4_stage_kernel(re_groups, im_groups, tw_r, tw_i)
 
-        # Unpack: single gather, replaces reshape+permute+contiguous+reshape.
-        re = out_re.view(-1)[unpack_idx].reshape(B_pad, n)
-        im = out_im.view(-1)[unpack_idx].reshape(B_pad, n)
+        # Stockham output permutation: (B, L, M, 4) -> (B, 4, L, M) -> (B, N)
+        out_re_4d = out_re.reshape(B_pad, L, M, 4)
+        out_im_4d = out_im.reshape(B_pad, L, M, 4)
+        re = out_re_4d.permute(0, 3, 1, 2).contiguous().reshape(B_pad, n)
+        im = out_im_4d.permute(0, 3, 1, 2).contiguous().reshape(B_pad, n)
 
     if not use_sim:
         re = re.to(orig_device)
