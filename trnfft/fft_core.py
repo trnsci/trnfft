@@ -201,6 +201,65 @@ def _is_power_of_four(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0 and (int(math.log2(n)) & 1) == 0
 
 
+def _stockham_perm_indices(
+    log4n: int, B_pad: int, n: int
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Precompute pack/unpack flat permutation indices for all Stockham stages.
+
+    Returns ``[(pack_idx_s, unpack_idx_s), ...]`` (CPU int64), one pair per stage.
+
+    These replace the reshape+permute+contiguous+reshape chain in the stage loop:
+
+    .. code-block:: python
+
+        # Pack (B_pad*n → total_groups*4):
+        re_groups = re.view(-1)[pack_idx].reshape(total_groups, 4)
+        # Unpack (total_groups*4 → B_pad*n):
+        re = out_re.view(-1)[unpack_idx].reshape(B_pad, n)
+
+    Index derivation
+    ----------------
+    Pack: ``re_groups[g, k] = re.view(-1)[b*n + l*(4M) + k*M + m]``
+    where ``b = g//(L*M)``, ``l = (g%(L*M))//M``, ``m = g%M``.
+
+    Unpack: ``re.view(-1)[b*n + j] = out_re.view(-1)[b*n + g_j*4 + k_j]``
+    where ``k_j = j//(L*M)``, ``l_j = (j%(L*M))//M``, ``m_j = j%M``,
+    ``g_j = l_j*M + m_j``.  The batch offset in ``out_re.view(-1)`` is also
+    ``b*n`` because ``total_groups * 4 = B_pad * n``.
+    """
+    total_groups = B_pad * n // 4
+    result: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    for s in range(log4n):
+        L = 1 << (2 * s)
+        M = n // (4 * L)
+
+        # Pack indices — shape (total_groups * 4,)
+        g = torch.arange(total_groups, dtype=torch.int64)
+        b_g = g // (L * M)
+        l_g = (g % (L * M)) // M
+        m_g = g % M
+        k4 = torch.arange(4, dtype=torch.int64)
+        # flat_pack[g, k] = b*n + l*(4M) + k*M + m
+        flat_pack = (b_g * n + l_g * (4 * M) + m_g).unsqueeze(1) + k4.unsqueeze(0) * M
+        pack_idx = flat_pack.reshape(-1)
+
+        # Unpack indices — shape (B_pad * n,)
+        j = torch.arange(n, dtype=torch.int64)
+        k_j = j // (L * M)
+        l_j = (j % (L * M)) // M
+        m_j = j % M
+        g_j = l_j * M + m_j  # group index within one batch
+        per_b = g_j * 4 + k_j  # flat index within one batch's slice of out_re
+        b_all = torch.arange(B_pad, dtype=torch.int64)
+        flat_unpack = b_all.unsqueeze(1) * n + per_b.unsqueeze(0)  # (B_pad, n)
+        unpack_idx = flat_unpack.reshape(-1)
+
+        result.append((pack_idx, unpack_idx))
+
+    return result
+
+
 def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Radix-4 Stockham FFT driver — dispatches log_4(N) NKI stages.
 
@@ -265,10 +324,9 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     # total_groups = B_pad * L * M = B_pad * N/4 — constant across all stages.
     total_groups = B_pad * n // 4
 
-    # Precompute ALL twiddle factors on CPU before the stage loop, then
-    # transfer to device as a list of standalone tensors — not as slices of
-    # a stacked tensor. Slicing an XLA device tensor creates DynamicSlice HLO
-    # ops that change the compiled graph and bust the NEFF cache.
+    # Precompute ALL twiddle factors and pack/unpack permutation indices on CPU
+    # before the stage loop, then transfer to device as standalone tensors.
+    # Slicing XLA device tensors creates DynamicSlice HLO ops that bust NEFF cache.
     twiddles_cpu = []
     for s in range(log4n):
         L = 1 << (2 * s)
@@ -280,29 +338,28 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         tw_i = torch.sin(ang).expand(B_pad, L, M, 4).contiguous().reshape(total_groups, 4)
         twiddles_cpu.append((tw_r, tw_i))
 
+    perm_indices_cpu = _stockham_perm_indices(log4n, B_pad, n)
+
     re = pad_re if use_sim else pad_re.to(device)
     im = pad_im if use_sim else pad_im.to(device)
 
     if not use_sim:
-        # Transfer all per-stage twiddles to XLA device before the kernel loop.
-        # Each entry is an independent tensor; the kernel call sees the same
-        # (total_groups, 4) shape at every stage — NEFF cache hit guaranteed.
+        # Transfer all per-stage twiddles and permutation indices to XLA device.
+        # Each entry is an independent tensor — NEFF cache hit guaranteed.
         twiddles = [(tw_r.to(device), tw_i.to(device)) for tw_r, tw_i in twiddles_cpu]
+        perm_indices = [(p.to(device), u.to(device)) for p, u in perm_indices_cpu]
     else:
         twiddles = twiddles_cpu
+        perm_indices = perm_indices_cpu
 
     for s in range(log4n):
-        L = 1 << (2 * s)
-        M = n // (4 * L)
-
-        # Pack stage-s input into (total_groups, 4): each partition row is
-        # one 4-point DFT group with k as the contiguous inner axis.
-        re_4d = re.reshape(B_pad, L, 4, M)
-        im_4d = im.reshape(B_pad, L, 4, M)
-        re_groups = re_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
-        im_groups = im_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
-
+        pack_idx, unpack_idx = perm_indices[s]
         tw_r, tw_i = twiddles[s]
+
+        # Pack: replace reshape+permute+contiguous+reshape with a single gather.
+        # Reduces per-stage XLA graph from 4 ops to 1 (Thread C phase 1).
+        re_groups = re.view(-1)[pack_idx].reshape(total_groups, 4)
+        im_groups = im.view(-1)[pack_idx].reshape(total_groups, 4)
 
         if use_sim:
             import nki as _nki
@@ -318,11 +375,9 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         else:
             out_re, out_im = stockham_radix4_stage_kernel(re_groups, im_groups, tw_r, tw_i)
 
-        # Stockham output permutation: (B, L, M, 4) -> (B, 4, L, M) -> (B, N)
-        out_re_4d = out_re.reshape(B_pad, L, M, 4)
-        out_im_4d = out_im.reshape(B_pad, L, M, 4)
-        re = out_re_4d.permute(0, 3, 1, 2).contiguous().reshape(B_pad, n)
-        im = out_im_4d.permute(0, 3, 1, 2).contiguous().reshape(B_pad, n)
+        # Unpack: single gather, replaces reshape+permute+contiguous+reshape.
+        re = out_re.view(-1)[unpack_idx].reshape(B_pad, n)
+        im = out_im.view(-1)[unpack_idx].reshape(B_pad, n)
 
     if not use_sim:
         re = re.to(orig_device)

@@ -118,5 +118,33 @@ if HAS_NKI:
             nl.store(out_im[p_off:p_end, 3:4], value=y3i)
 
         return out_re, out_im
+
+    # ---------------------------------------------------------------------------
+    # Thread C phase 2 — fused multi-stage kernel (NOT YET IMPLEMENTED).
+    #
+    # Intent: run all log_4(N) Stockham stages in a single NKI kernel call,
+    # keeping intermediate results in SBUF between stages to eliminate the
+    # per-stage HBM round-trip that the driver's gather-based pack/unpack still
+    # incurs (Thread C phase 1 reduced XLA graph ops but not HBM traffic).
+    #
+    # Architectural constraint: for dispatched N values (N > 256, so
+    # total_groups = B*N/4 > 64), the inter-stage permutation scatters elements
+    # across partition tiles (each tile covers PMAX=128 consecutive groups).
+    # NKI's affine_range model does not support cross-tile indirect addressing;
+    # a cross-tile gather would require nki.language.gather with runtime indices,
+    # which as of NKI 0.3.0 is not validated for this access pattern.
+    #
+    # Unblocking conditions:
+    #   1. NKI gains a cross-tile indirect-load primitive, OR
+    #   2. The kernel is restructured to work in a block layout where inter-stage
+    #      permutations are intra-tile (requires reordering twiddles, not data).
+    # ---------------------------------------------------------------------------
+    def stockham_radix4_fused_kernel(*args, **kwargs):
+        raise NotImplementedError(
+            "stockham_radix4_fused_kernel (Thread C phase 2) is not yet implemented. "
+            "Use stockham_radix4_stage_kernel via _fft_via_stockham_nki instead."
+        )
+
 else:
     stockham_radix4_stage_kernel = None  # type: ignore[assignment]
+    stockham_radix4_fused_kernel = None  # type: ignore[assignment]

@@ -159,6 +159,31 @@ overhead. Combined, they should realize the 1.6× speedup suggested by the probe
 
 ---
 
+## Thread C phase 1: driver permutation precompute (v0.14)
+
+**What changed:** `_stockham_perm_indices()` precomputes flat `int64` pack/unpack index
+tensors for all stages on CPU before the stage loop. The per-stage pack/unpack sequence:
+
+```python
+# Old (2 materializing copies per stage):
+re_groups = re.reshape(B, L, 4, M).permute(0,1,3,2).contiguous().reshape(G, 4)
+re = out.reshape(B, L, M, 4).permute(0,3,1,2).contiguous().reshape(B, n)
+
+# New (2 gather ops per stage):
+re_groups = re.view(-1)[pack_idx].reshape(G, 4)
+re = out.view(-1)[unpack_idx].reshape(B, n)
+```
+
+**Constraint acknowledged:** True SBUF-resident stage fusion (Thread C phase 2) is
+blocked for all dispatched N values (N > 256) because `total_groups = B*N/4 > PMAX`
+means the inter-stage permutation scatters elements across partition tiles. NKI's
+affine_range model requires contiguous partition addressing; cross-tile indirect
+scatter is not supported as of NKI 0.3.0.
+
+**Hardware result (v0.14):** *fill after bench run — see `benchmark_results.json`.*
+
+---
+
 ## Version
 
 Profiling script: `scripts/run_neuron_profile.sh`  
