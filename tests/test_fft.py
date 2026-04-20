@@ -487,6 +487,73 @@ class TestStockhamRadix4:
             stockham_radix4(ComplexTensor(torch.randn(32), torch.zeros(32)))
 
 
+class TestStockhamRadix8:
+    """CPU reference for radix-8 Stockham FFT (Thread B).
+
+    N=512 is the primary new coverage: currently routes to 9 butterfly stages;
+    radix-8 uses 3 stages. N=4096 drops from 6 radix-4 stages to 4 stages.
+    The NKI port uses nc_matmul (Tensor engine) for the W_8 DFT matvec.
+    """
+
+    @pytest.mark.parametrize("n", [8, 64, 512, 4096])
+    def test_matches_numpy(self, n):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_radix8
+
+        # W_8 has irrational entries (±√2/2 ± i√2/2) requiring real FP32 multiplications.
+        # N=4096 (4 stages of 8×8 matmuls) accumulates slightly more error than radix-4.
+        tol = 5e-4 if n >= 4096 else 1e-4
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        result = stockham_radix8(ComplexTensor(x, torch.zeros(n)), inverse=False)
+        expected = np.fft.fft(x.numpy())
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=tol, rtol=tol)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=tol, rtol=tol)
+
+    @pytest.mark.parametrize("n", [8, 64, 512])
+    def test_roundtrip(self, n):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_radix8
+
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        ct = ComplexTensor(x, torch.zeros(n))
+        X = stockham_radix8(ct, inverse=False)
+        back = stockham_radix8(X, inverse=True)
+        np.testing.assert_allclose(back.real.numpy(), x.numpy(), atol=1e-5)
+        np.testing.assert_allclose(back.imag.numpy(), np.zeros(n), atol=1e-5)
+
+    def test_ifft_vs_numpy(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_radix8
+
+        torch.manual_seed(42)
+        xr = torch.randn(512)
+        xi = torch.randn(512)
+        result = stockham_radix8(ComplexTensor(xr, xi), inverse=True)
+        expected = np.fft.ifft(xr.numpy() + 1j * xi.numpy())
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-4, rtol=1e-4)
+
+    def test_batched(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_radix8
+
+        torch.manual_seed(42)
+        x = torch.randn(4, 64)
+        result = stockham_radix8(ComplexTensor(x, torch.zeros_like(x)), inverse=False)
+        expected = np.fft.fft(x.numpy(), axis=-1)
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-4, rtol=1e-4)
+
+    def test_rejects_non_power_of_eight(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_radix8
+
+        with pytest.raises(AssertionError, match="N=8\\^k"):
+            stockham_radix8(ComplexTensor(torch.randn(32), torch.zeros(32)))
+
+
 class TestFFT2D:
     def test_vs_numpy(self):
         rng = np.random.default_rng(42)

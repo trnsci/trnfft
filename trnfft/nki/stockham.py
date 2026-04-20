@@ -47,6 +47,7 @@ from .dispatch import HAS_NKI
 
 if HAS_NKI:
     import nki
+    import nki.isa as nisa
     import nki.language as nl
 
     PMAX = 128
@@ -145,6 +146,118 @@ if HAS_NKI:
             "Use stockham_radix4_stage_kernel via _fft_via_stockham_nki instead."
         )
 
+    # ---------------------------------------------------------------------------
+    # Thread B: radix-8 stage kernel — Tensor-engine W_8 matmul
+    #
+    # Replaces the radix-4 Vector-engine add/sub W_4 butterfly with an
+    # nc_matmul on the 8×8 DFT matrix W_8.  W_8 entries are non-trivial
+    # (±√2/2 ± i√2/2), so the Tensor engine earns its keep here unlike W_4.
+    #
+    # Kernel structure (two phases in one kernel call):
+    #
+    #   Phase 1 — twiddle multiply (Vector engine):
+    #     Same as radix-4: element-wise complex multiply per (groups_chunk, 8)
+    #     tile.  Result written to an HBM scratch buffer.
+    #
+    #   Phase 2 — W_8 matmul (Tensor engine):
+    #     Reads scratch via nl.load_transpose2d (HBM → transposed SBUF tile)
+    #     then accumulates 4 nc_matmul calls (standard complex GEMM pattern).
+    #
+    #   The HBM scratch round-trip between phases is the cost of using
+    #   nl.load_transpose2d (NKI requires HBM source for transpose loads).
+    #   Hardware bench will determine if the Tensor-engine W_8 win plus
+    #   fewer stages (log_8(N) vs log_4(N)) outweighs the scratch cost.
+    #
+    # Input/output layout
+    # --------------------
+    # - x_re, x_im, tw_re, tw_im : (total_groups, 8) HBM
+    # - w8_re, w8_im              : (8, 8) HBM — shared W_8 DFT matrix
+    #   W_8[k, n] = exp(-2πi·k·n/8). Symmetric so W_8^T = W_8; stored as
+    #   (K=8, N=8) to match the nc_matmul moving-tile convention.
+    # - out_re, out_im            : (total_groups, 8) HBM
+    # ---------------------------------------------------------------------------
+
+    @nki.jit
+    def stockham_radix8_stage_kernel(x_re, x_im, tw_re, tw_im, w8_re, w8_im):
+        """Radix-8 Stockham stage: twiddle (Vector) + W_8 (Tensor engine).
+
+        All x/tw tensors are ``(total_groups, 8)``; w8 tensors are ``(8, 8)``.
+        Returns ``(total_groups, 8)`` post-stage tensors.
+        """
+        total_groups, _ = x_re.shape
+
+        out_re = nl.ndarray((total_groups, 8), dtype=x_re.dtype, buffer=nl.shared_hbm)
+        out_im = nl.ndarray((total_groups, 8), dtype=x_im.dtype, buffer=nl.shared_hbm)
+
+        # Scratch buffers: twiddle-applied data stored here so Phase 2 can
+        # read it back via nl.load_transpose2d (requires HBM source).
+        scratch_re = nl.ndarray((total_groups, 8), dtype=x_re.dtype, buffer=nl.shared_hbm)
+        scratch_im = nl.ndarray((total_groups, 8), dtype=x_im.dtype, buffer=nl.shared_hbm)
+
+        groups_chunk = total_groups if total_groups <= PMAX else PMAX
+        assert total_groups % groups_chunk == 0, (
+            f"total_groups={total_groups} not divisible by chunk size {groups_chunk}"
+        )
+        n_partition_tiles = total_groups // groups_chunk
+
+        # ── Phase 1: twiddle multiply (Vector engine) ──────────────────────
+        for p in nl.affine_range(n_partition_tiles):
+            p_off = p * groups_chunk
+            p_end = p_off + groups_chunk
+
+            x_r = nl.load(x_re[p_off:p_end, :])  # (groups_chunk, 8)
+            x_i = nl.load(x_im[p_off:p_end, :])
+            t_r = nl.load(tw_re[p_off:p_end, :])
+            t_i = nl.load(tw_im[p_off:p_end, :])
+
+            a_r = nl.subtract(nl.multiply(x_r, t_r), nl.multiply(x_i, t_i))
+            a_i = nl.add(nl.multiply(x_r, t_i), nl.multiply(x_i, t_r))
+
+            nl.store(scratch_re[p_off:p_end, :], a_r)
+            nl.store(scratch_im[p_off:p_end, :], a_i)
+
+        # ── Phase 2: W_8 matmul (Tensor engine) ────────────────────────────
+        # nc_matmul shape convention: stationary (K, M), moving (K, N) → PSUM (M, N)
+        # Here K=8 (contraction), M=groups_chunk (partition/batch), N=8 (output).
+        TILE_K = 8
+        TILE_N = 8
+
+        # W_8 is fixed across all partition tiles; load once outside the loop.
+        w8_r = nl.load(w8_re[:TILE_K, :TILE_N])  # (8, 8)
+        w8_i = nl.load(w8_im[:TILE_K, :TILE_N])
+        neg_w8_i = nl.negative(w8_i)
+
+        for m in nl.affine_range(n_partition_tiles):
+            m_off = m * groups_chunk
+
+            psum_cr = nl.zeros((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            psum_ci = nl.zeros((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.psum)
+
+            # Load scratch with transpose: (groups_chunk, 8) → (K=8, groups_chunk)
+            ar_t = nl.load_transpose2d(scratch_re[m_off : m_off + groups_chunk, :TILE_K])
+            ai_t = nl.load_transpose2d(scratch_im[m_off : m_off + groups_chunk, :TILE_K])
+
+            # C_real = A_real @ W_8_real − A_imag @ W_8_imag
+            nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=w8_r, accumulate=True)
+            nisa.nc_matmul(dst=psum_cr, stationary=ai_t, moving=neg_w8_i, accumulate=True)
+
+            # C_imag = A_real @ W_8_imag + A_imag @ W_8_real
+            nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=w8_i, accumulate=True)
+            nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=w8_r, accumulate=True)
+
+            cr_sbuf = nl.ndarray((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+            ci_sbuf = nl.ndarray((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=cr_sbuf, src=psum_cr)
+            nisa.tensor_copy(dst=ci_sbuf, src=psum_ci)
+            if x_re.dtype != nl.float32:
+                cr_sbuf = nl.cast(cr_sbuf, dtype=x_re.dtype)
+                ci_sbuf = nl.cast(ci_sbuf, dtype=x_re.dtype)
+            nl.store(out_re[m_off : m_off + groups_chunk, :], value=cr_sbuf)
+            nl.store(out_im[m_off : m_off + groups_chunk, :], value=ci_sbuf)
+
+        return out_re, out_im
+
 else:
     stockham_radix4_stage_kernel = None  # type: ignore[assignment]
     stockham_radix4_fused_kernel = None  # type: ignore[assignment]
+    stockham_radix8_stage_kernel = None  # type: ignore[assignment]

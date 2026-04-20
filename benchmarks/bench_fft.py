@@ -162,6 +162,44 @@ class TestFFT1DStockham:
             fft_core._FORCE_STOCKHAM = old_force
 
 
+@pytest.fixture(params=[8, 64, 512, 4096])
+def power_of_eight_size(request):
+    return request.param
+
+
+@pytest.fixture
+def power_of_eight_signal(power_of_eight_size):
+    torch.manual_seed(42)
+    return torch.randn(power_of_eight_size)
+
+
+class TestFFT1DStockhamR8:
+    """Radix-8 Stockham benchmark (Thread B).
+
+    Primary targets:
+      N=512: 3 radix-8 stages vs 9 butterfly stages (new coverage).
+      N=4096: 4 radix-8 stages vs 6 radix-4 stages (improvement).
+
+    Each stage uses nc_matmul (Tensor engine) for W_8, plus a Vector-engine
+    twiddle multiply.  Hardware bench determines if Tensor-engine W_8 plus
+    fewer stages outweigh the HBM scratch round-trip per stage.
+    """
+
+    @pytest.mark.neuron
+    def test_fft_nki_stockham_r8(self, benchmark, power_of_eight_signal):
+        from trnfft import fft_core
+
+        old_force = fft_core._FORCE_STOCKHAM_R8
+        fft_core._FORCE_STOCKHAM_R8 = True
+        _set("nki")
+        try:
+            _warm(trnfft.fft, power_of_eight_signal)
+            benchmark(trnfft.fft, power_of_eight_signal)
+        finally:
+            _set("auto")
+            fft_core._FORCE_STOCKHAM_R8 = old_force
+
+
 # ---------------------------------------------------------------------------
 # 2D FFT
 # ---------------------------------------------------------------------------

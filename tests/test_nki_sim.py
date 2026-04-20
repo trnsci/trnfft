@@ -127,12 +127,58 @@ class TestStockhamSimulator:
             trnfft.set_backend("auto")
 
 
+class TestStockhamR8Simulator:
+    """Radix-8 Stockham kernel under nki.simulate (Thread B).
+
+    Validates the NKI port (twiddle Vector + W_8 Tensor nc_matmul) agrees
+    with the CPU reference. N=8 and N=64 only — simulator is slow at 512+.
+    """
+
+    @pytest.mark.parametrize("n", [8, 64])
+    def test_stockham_r8_nki_matches_cpu(self, n):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_stockham_nki_r8
+        from trnfft.stockham import stockham_radix8
+
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        ct = ComplexTensor(x, torch.zeros(n))
+        sim = _fft_via_stockham_nki_r8(ct, inverse=False)
+        cpu = stockham_radix8(ct, inverse=False)
+        np.testing.assert_allclose(sim.real.numpy(), cpu.real.numpy(), atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(sim.imag.numpy(), cpu.imag.numpy(), atol=1e-4, rtol=1e-4)
+
+    def test_stockham_r8_nki_matches_numpy_n64(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_stockham_nki_r8
+
+        torch.manual_seed(42)
+        x = torch.randn(64)
+        sim = _fft_via_stockham_nki_r8(ComplexTensor(x, torch.zeros(64)), inverse=False)
+        expected = np.fft.fft(x.numpy())
+        np.testing.assert_allclose(sim.real.numpy(), expected.real, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(sim.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
+
+    def test_inverse_r8_roundtrip(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_stockham_nki_r8
+
+        torch.manual_seed(42)
+        x = torch.randn(64)
+        ct = ComplexTensor(x, torch.zeros(64))
+        X = _fft_via_stockham_nki_r8(ct, inverse=False)
+        back = _fft_via_stockham_nki_r8(X, inverse=True)
+        np.testing.assert_allclose(back.real.numpy(), x.numpy(), atol=1e-4)
+        np.testing.assert_allclose(back.imag.numpy(), np.zeros(64), atol=1e-4)
+
+
 class TestFFTSimulator:
     """FFT routes through butterfly_stage_kernel over log2(N) stages under
     nki.simulate. Small N only — simulator is not fast at 1024+."""
 
     @pytest.mark.parametrize("n", [512, 1024])
     def test_fft_vs_numpy(self, n):
+        # N=512 routes to radix-8 Stockham (3 stages); N=1024 routes to butterfly.
         import trnfft
 
         trnfft.set_backend("nki")
