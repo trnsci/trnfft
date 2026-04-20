@@ -474,7 +474,7 @@ def _fft_via_stockham_nki_r8(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     and lower stage count outweigh the scratch round-trip cost.
     """
     from .nki.dispatch import _use_simulator
-    from .nki.stockham import stockham_radix8_stage_kernel
+    from .nki.stockham import stockham_radix8_w8_kernel
 
     n = x.shape[-1]
     assert _is_power_of_eight(n), f"Radix-8 requires N=8^k; got N={n}"
@@ -557,23 +557,24 @@ def _fft_via_stockham_nki_r8(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         re_groups = re_8d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 8)
         im_groups = im_8d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 8)
 
+        # Twiddle multiply (XLA element-wise, same as radix-4 driver).
+        # nl.load_transpose2d requires external HBM args; twiddle stays in PyTorch.
+        pre_re = re_groups * tw_r - im_groups * tw_i
+        pre_im = re_groups * tw_i + im_groups * tw_r
+
         if use_sim:
             import nki as _nki
 
-            out_re_np, out_im_np = _nki.simulate(stockham_radix8_stage_kernel)(
-                re_groups.detach().cpu().numpy(),
-                im_groups.detach().cpu().numpy(),
-                tw_r.detach().cpu().numpy(),
-                tw_i.detach().cpu().numpy(),
+            out_re_np, out_im_np = _nki.simulate(stockham_radix8_w8_kernel)(
+                pre_re.detach().cpu().numpy(),
+                pre_im.detach().cpu().numpy(),
                 w8_re.detach().cpu().numpy(),
                 w8_im.detach().cpu().numpy(),
             )
             out_re = torch.from_numpy(np.asarray(out_re_np))
             out_im = torch.from_numpy(np.asarray(out_im_np))
         else:
-            out_re, out_im = stockham_radix8_stage_kernel(
-                re_groups, im_groups, tw_r, tw_i, w8_re, w8_im
-            )
+            out_re, out_im = stockham_radix8_w8_kernel(pre_re, pre_im, w8_re, w8_im)
 
         # Stockham output permutation: (B, L, M, 8) → (B, 8, L, M) → (B, N)
         out_re_8d = out_re.reshape(B_pad, L, M, 8)
