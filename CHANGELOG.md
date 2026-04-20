@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-04-20
+
+### Added
+
+- **Thread B: radix-8 Stockham FFT with Tensor-engine W_8** (`_fft_via_stockham_nki_r8`).
+  New coverage for N=512 (= 8³, previously routed to 9 butterfly stages → now 3 radix-8
+  stages). Improved coverage for N=4096 (= 8⁴, previously 6 radix-4 stages → now 4
+  radix-8 stages). Auto-dispatched for all power-of-8 N > 256.
+
+  Per-stage structure: twiddle multiply via PyTorch element-wise on XLA device, then
+  `stockham_radix8_w8_kernel` applies the W_8 DFT matrix via `nc_matmul` (Tensor engine).
+  W_8 entries are non-trivial (±√2/2 ± i√2/2), so the Tensor engine earns its keep
+  unlike W_4 (which has {1, -1, i, -i} coefficients and only needs adds/swaps).
+
+  Hardware results (trn1, SDK 2.29, 2026-04-20):
+
+  | N    | Radix-8 (µs) | Radix-4 (µs) | Butterfly (µs) | vs r4  | vs butterfly |
+  | ---- | ------------ | ------------ | -------------- | ------ | ------------ |
+  | 64   | 3 402        | 4 254        | 4 767          | −20%   | −29%         |
+  | 512  | 4 483        | —            | ~6 600 (est.)  | —      | ~−32%        |
+  | 4096 | 5 917        | 8 424        | 9 387          | −30%   | −37%         |
+
+- `_is_power_of_eight(n)`, `_FORCE_STOCKHAM_R8` bench toggle, `stockham_radix8` CPU
+  reference, `_w8_matvec` helper (`trnfft/stockham.py`).
+- `stockham_radix8_w8_kernel` NKI kernel (`trnfft/nki/stockham.py`).
+
+### Engineering note — NKI scratch buffer constraint
+
+Initial implementation used a kernel-internal `nl.ndarray(buffer=nl.shared_hbm)` scratch
+to bridge twiddle-multiply and W_8 matmul phases in one kernel call. This failed NEFF
+compilation: `nl.load_transpose2d` in NKI 0.3.0 only accepts **function-argument** HBM
+tensors as source, not kernel-local allocations. Fixed by moving twiddle multiply to the
+PyTorch driver (XLA element-wise op) and making the NKI kernel W_8-only.
+
 ## [0.14.0] - 2026-04-20
 
 ### Fixed
