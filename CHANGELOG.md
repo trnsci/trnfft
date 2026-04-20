@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-04-20
+
 ### Fixed
 
 - **`precision="double"` was silently ignored for power-of-2 FFTs.** `_fft_via_gemm`
