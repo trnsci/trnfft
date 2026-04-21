@@ -31,3 +31,6 @@ files*.zip
 .coverage
 coverage.xml
 benchmark_results.json
+
+# Local-only notes (not for sharing)
+.claude/aws-compiler-artifacts-instructions.md

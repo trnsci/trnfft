@@ -263,3 +263,82 @@ def stockham_radix8(x: ComplexTensor, inverse: bool = False) -> ComplexTensor:
         result_re = result_re / n
         result_im = result_im / n
     return ComplexTensor(result_re, result_im)
+
+
+# ---------------------------------------------------------------------------
+# Mixed-radix reference implementation
+# ---------------------------------------------------------------------------
+
+
+def _mixed_radix_plan(n: int) -> list[int]:
+    """Optimal [8^a, 4^b] stage sequence for power-of-2 n.
+
+    Minimises total stage count for n = 8^a × 4^b by maximising a.
+    All power-of-2 n ≥ 4 can be expressed this way (by the Chicken-McNugget
+    theorem for 2 and 3; only n=2 cannot, but n≤256 goes to DFT-GEMM anyway).
+    """
+    if n <= 0 or (n & (n - 1)) != 0:
+        raise ValueError(f"n must be a positive power of 2; got {n}")
+    k = int(math.log2(n))
+    a = k // 3
+    while (k - 3 * a) % 2 != 0:
+        a -= 1
+    b = (k - 3 * a) // 2
+    return [8] * a + [4] * b
+
+
+def stockham_mixed_radix(x: ComplexTensor, inverse: bool = False) -> ComplexTensor:
+    """Iterative mixed-radix [8^a, 4^b] Stockham FFT along the last dimension.
+
+    Requires ``x.shape[-1]`` to be a power of 2 ≥ 4. Computes the optimal
+    radix decomposition: e.g. N=1024 → [8,8,4,4] (4 stages vs radix-4's 5),
+    N=2048 → [8,8,8,4] (4 stages vs butterfly's 11).
+
+    Each stage applies the appropriate DFT matvec (_w8_matvec or _w4_matvec)
+    after a twiddle multiply, then the Stockham output permutation.
+    """
+    n = x.shape[-1]
+    plan = _mixed_radix_plan(n)
+
+    batch_shape = x.shape[:-1]
+    x_re = x.real.reshape(-1, n).contiguous()
+    x_im = x.imag.reshape(-1, n).contiguous()
+    B = x_re.shape[0]
+
+    if inverse:
+        x_im = -x_im
+
+    sign = -1.0
+    a = ComplexTensor(x_re.clone(), x_im.clone())
+    L = 1
+    for r in plan:
+        M = n // (r * L)
+        ar = a.real.reshape(B, L, r, M)
+        ai = a.imag.reshape(B, L, r, M)
+
+        l_idx = torch.arange(L, dtype=ar.dtype).view(1, L, 1, 1)
+        k_idx = torch.arange(r, dtype=ar.dtype).view(1, 1, r, 1)
+        ang = sign * 2.0 * math.pi * l_idx * k_idx / (float(r) * L)
+        tw_r = torch.cos(ang)
+        tw_i = torch.sin(ang)
+        pre_r = ar * tw_r - ai * tw_i
+        pre_i = ar * tw_i + ai * tw_r
+
+        pre = ComplexTensor(pre_r, pre_i)
+        if r == 8:
+            mid = _w8_matvec(pre)
+        else:
+            mid = _w4_matvec(pre)
+
+        out_r = mid.real.permute(0, 2, 1, 3).contiguous().reshape(B, n)
+        out_i = mid.imag.permute(0, 2, 1, 3).contiguous().reshape(B, n)
+        a = ComplexTensor(out_r, out_i)
+        L *= r
+
+    result_re = a.real.reshape(*batch_shape, n)
+    result_im = a.imag.reshape(*batch_shape, n)
+    if inverse:
+        result_im = -result_im
+        result_re = result_re / n
+        result_im = result_im / n
+    return ComplexTensor(result_re, result_im)

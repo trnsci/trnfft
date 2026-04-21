@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-04-21
+
+### Added
+
+- **Mixed-radix Stockham FFT** (`_fft_via_stockham_nki_mixed`). Computes the optimal
+  `[8^a, 4^b]` stage decomposition for any power-of-2 N. Key wins:
+  - **N=1024**: `[8,8,4,4]` = 4 stages (vs radix-4's 5 stages, −20%)
+  - **N=2048**: `[8,8,8,4]` = 4 stages (vs butterfly's 11 stages — **new Stockham coverage**)
+  No new NKI kernels: driver interleaves the existing `stockham_radix8_w8_kernel` (for r=8
+  stages, Tensor engine W₈) and `stockham_radix4_stage_kernel` (for r=4 stages). Auto-
+  dispatched for power-of-2 N where mixed gives fewer stages than the current best path.
+  `stockham_mixed_radix` CPU reference added to `trnfft/stockham.py`.
+
+- **`hfft` and `ihfft`** — completes the `torch.fft` API surface. These were the only two
+  functions missing:
+  - `hfft(x, n)`: FFT of a Hermitian-symmetric signal; returns real output of length `n`.
+    Implemented as `irfft(x.conj(), n) * n` (irfft uses backward norm; hfft uses forward).
+  - `ihfft(x, n)`: inverse of `hfft`; returns one-sided complex spectrum of length `n//2+1`.
+    Implemented as `conj(rfft(x, n)) / n`.
+
+- **`TestKahanButterflyCharacterization`** in `tests/test_precision_modes.py` — hardware
+  test that measures actual on-silicon rel error for `precision="kahan"` butterfly at
+  N ∈ {256, 512, 1024, 4096}. Forces butterfly path (`_DFT_GEMM_THRESHOLD=0`) and prints
+  fast vs kahan error + improvement ratio. Fills the known gap in `precision.py` docstring
+  (previously said "Target ~1e-3" without measured data).
+
 ## [0.15.0] - 2026-04-20
 
 ### Added

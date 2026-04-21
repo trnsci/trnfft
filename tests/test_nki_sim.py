@@ -172,6 +172,39 @@ class TestStockhamR8Simulator:
         np.testing.assert_allclose(back.imag.numpy(), np.zeros(64), atol=1e-4)
 
 
+class TestStockhamMixedSimulator:
+    """Mixed-radix Stockham driver under nki.simulate (v0.16).
+
+    N=64 → plan=[8,4] (2 stages: one r8 + one r4). Small enough for simulator.
+    Validates that the two-kernel interleaving in _fft_via_stockham_nki_mixed
+    produces results matching the CPU reference.
+    """
+
+    def test_mixed_nki_matches_cpu_n64(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_stockham_nki_mixed
+        from trnfft.stockham import stockham_mixed_radix
+
+        torch.manual_seed(42)
+        x = torch.randn(64)
+        ct = ComplexTensor(x, torch.zeros(64))
+        sim = _fft_via_stockham_nki_mixed(ct, inverse=False)
+        cpu = stockham_mixed_radix(ct, inverse=False)
+        np.testing.assert_allclose(sim.real.numpy(), cpu.real.numpy(), atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(sim.imag.numpy(), cpu.imag.numpy(), atol=1e-4, rtol=1e-4)
+
+    def test_mixed_nki_matches_numpy_n64(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_stockham_nki_mixed
+
+        torch.manual_seed(42)
+        x = torch.randn(64)
+        sim = _fft_via_stockham_nki_mixed(ComplexTensor(x, torch.zeros(64)), inverse=False)
+        expected = np.fft.fft(x.numpy())
+        np.testing.assert_allclose(sim.real.numpy(), expected.real, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(sim.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
+
+
 class TestFFTSimulator:
     """FFT routes through butterfly_stage_kernel over log2(N) stages under
     nki.simulate. Small N only — simulator is not fast at 1024+."""

@@ -153,6 +153,9 @@ _FORCE_STOCKHAM = False
 # Same bench toggle for the radix-8 path (Thread B).
 _FORCE_STOCKHAM_R8 = False
 
+# Same bench toggle for the mixed-radix path (v0.16, N=1024/2048).
+_FORCE_STOCKHAM_MIXED = False
+
 
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Compute FFT as a single complex matmul: X = W @ x (FP32, NKI path).
@@ -457,6 +460,15 @@ def _is_power_of_eight(n: int) -> bool:
     return n > 0 and (n & (n - 1)) == 0 and int(math.log2(n)) % 3 == 0
 
 
+def _mixed_radix_plan(n: int) -> list[int]:
+    """Optimal [8^a, 4^b] stage sequence for power-of-2 n (same as stockham.py)."""
+    k = int(math.log2(n))
+    a = k // 3
+    while (k - 3 * a) % 2 != 0:
+        a -= 1
+    return [8] * a + [4] * ((k - 3 * a) // 2)
+
+
 def _fft_via_stockham_nki_r8(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Radix-8 Stockham FFT driver — dispatches log_8(N) NKI stages.
 
@@ -595,6 +607,151 @@ def _fft_via_stockham_nki_r8(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     return ComplexTensor(re, im)
 
 
+def _fft_via_stockham_nki_mixed(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """Mixed-radix [8^a, 4^b] Stockham FFT driver.
+
+    Computes the optimal stage decomposition for any power-of-2 N, then
+    executes the stages by alternating between the radix-8 Tensor-engine
+    kernel and the radix-4 Vector-engine kernel as dictated by the plan.
+
+    Coverage that improves over existing paths:
+      N=1024: [8,8,4,4] = 4 stages  (vs radix-4's 5)
+      N=2048: [8,8,8,4] = 4 stages  (vs butterfly's 11 — new Stockham coverage)
+
+    All per-stage twiddles are precomputed on CPU and transferred once before
+    the loop (same NEFF-cache-safe pattern as the pure radix drivers).
+    W₈ is precomputed once and shared across all radix-8 stages.
+    """
+    from .nki.dispatch import _use_simulator
+    from .nki.stockham import stockham_radix4_stage_kernel, stockham_radix8_w8_kernel
+
+    n = x.shape[-1]
+    plan = _mixed_radix_plan(n)
+
+    use_sim = _use_simulator()
+    if not use_sim:
+        import torch_xla
+
+    orig_shape = x.real.shape
+    flat_re = x.real.reshape(-1, n).contiguous()
+    flat_im = x.imag.reshape(-1, n).contiguous()
+
+    if inverse:
+        flat_im = -flat_im
+
+    B = flat_re.shape[0]
+    PMAX = 128
+
+    def _is_pow2(v: int) -> bool:
+        return v > 0 and (v & (v - 1)) == 0
+
+    if _is_pow2(B):
+        B_pad, pad_re, pad_im = B, flat_re, flat_im
+    else:
+        B_pad = ((B + PMAX - 1) // PMAX) * PMAX
+        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype)
+        pad_re = torch.cat([flat_re, padding], dim=0)
+        pad_im = torch.cat([flat_im, padding], dim=0)
+
+    orig_device = x.real.device
+    device = None if use_sim else torch_xla.device()
+
+    # Precompute W₈ (shared for all r=8 stages, if any).
+    has_r8 = any(r == 8 for r in plan)
+    if has_r8:
+        k8 = torch.arange(8, dtype=x.real.dtype)
+        ang_w8 = -2.0 * math.pi * k8.unsqueeze(1) * k8.unsqueeze(0) / 8
+        w8_re_cpu = torch.cos(ang_w8)
+        w8_im_cpu = torch.sin(ang_w8)
+    else:
+        w8_re_cpu = w8_im_cpu = None
+
+    # Precompute per-stage twiddles on CPU. L evolves with each stage.
+    twiddles_cpu = []
+    L_pre = 1
+    for r in plan:
+        M = n // (r * L_pre)
+        total_groups_s = B_pad * L_pre * M
+        l_idx = torch.arange(L_pre, dtype=x.real.dtype).view(1, L_pre, 1, 1)
+        k_idx = torch.arange(r, dtype=x.real.dtype).view(1, 1, 1, r)
+        ang = -2.0 * math.pi * l_idx * k_idx / (float(r) * L_pre)
+        tw_r = torch.cos(ang).expand(B_pad, L_pre, M, r).contiguous().reshape(total_groups_s, r)
+        tw_i = torch.sin(ang).expand(B_pad, L_pre, M, r).contiguous().reshape(total_groups_s, r)
+        twiddles_cpu.append((tw_r, tw_i))
+        L_pre *= r
+
+    re = pad_re if use_sim else pad_re.to(device)
+    im = pad_im if use_sim else pad_im.to(device)
+
+    if not use_sim:
+        twiddles = [(tw_r.to(device), tw_i.to(device)) for tw_r, tw_i in twiddles_cpu]
+        w8_re = w8_re_cpu.to(device) if has_r8 else None
+        w8_im = w8_im_cpu.to(device) if has_r8 else None
+    else:
+        twiddles = twiddles_cpu
+        w8_re, w8_im = w8_re_cpu, w8_im_cpu
+
+    L = 1
+    for s, r in enumerate(plan):
+        M = n // (r * L)
+        tw_r, tw_i = twiddles[s]
+        total_groups_s = B_pad * L * M
+
+        re_rd = re.reshape(B_pad, L, r, M)
+        im_rd = im.reshape(B_pad, L, r, M)
+        re_groups = re_rd.permute(0, 1, 3, 2).contiguous().reshape(total_groups_s, r)
+        im_groups = im_rd.permute(0, 1, 3, 2).contiguous().reshape(total_groups_s, r)
+
+        if r == 8:
+            pre_re = re_groups * tw_r - im_groups * tw_i
+            pre_im = re_groups * tw_i + im_groups * tw_r
+            if use_sim:
+                import nki as _nki
+
+                out_re_np, out_im_np = _nki.simulate(stockham_radix8_w8_kernel)(
+                    pre_re.detach().cpu().numpy(),
+                    pre_im.detach().cpu().numpy(),
+                    w8_re.detach().cpu().numpy(),
+                    w8_im.detach().cpu().numpy(),
+                )
+                out_re = torch.from_numpy(np.asarray(out_re_np))
+                out_im = torch.from_numpy(np.asarray(out_im_np))
+            else:
+                out_re, out_im = stockham_radix8_w8_kernel(pre_re, pre_im, w8_re, w8_im)
+        else:
+            if use_sim:
+                import nki as _nki
+
+                out_re_np, out_im_np = _nki.simulate(stockham_radix4_stage_kernel)(
+                    re_groups.detach().cpu().numpy(),
+                    im_groups.detach().cpu().numpy(),
+                    tw_r.detach().cpu().numpy(),
+                    tw_i.detach().cpu().numpy(),
+                )
+                out_re = torch.from_numpy(np.asarray(out_re_np))
+                out_im = torch.from_numpy(np.asarray(out_im_np))
+            else:
+                out_re, out_im = stockham_radix4_stage_kernel(re_groups, im_groups, tw_r, tw_i)
+
+        out_re_rd = out_re.reshape(B_pad, L, M, r)
+        out_im_rd = out_im.reshape(B_pad, L, M, r)
+        re = out_re_rd.permute(0, 3, 1, 2).contiguous().reshape(B_pad, n)
+        im = out_im_rd.permute(0, 3, 1, 2).contiguous().reshape(B_pad, n)
+        L *= r
+
+    if not use_sim:
+        re = re.to(orig_device)
+        im = im.to(orig_device)
+    re = re[:B].reshape(orig_shape)
+    im = im[:B].reshape(orig_shape)
+
+    if inverse:
+        im = -im
+        re = re / n
+        im = im / n
+    return ComplexTensor(re, im)
+
+
 def _cooley_tukey_nki_nograd(
     x: ComplexTensor, inverse: bool, precision: str = "fast"
 ) -> ComplexTensor:
@@ -627,28 +784,36 @@ def _cooley_tukey_nki_nograd(
     n = x.shape[-1]
 
     # Bench-toggles: force a specific Stockham path ahead of all threshold checks.
+    if _FORCE_STOCKHAM_MIXED and precision != "kahan":
+        return _fft_via_stockham_nki_mixed(x, inverse)
     if _FORCE_STOCKHAM_R8 and precision != "kahan":
         return _fft_via_stockham_nki_r8(x, inverse)
     if _FORCE_STOCKHAM and precision != "kahan":
         return _fft_via_stockham_nki(x, inverse)
 
     # "double" mode: NKI PSUM is always FP32, so bypass NKI and use CPU FP64.
-    # Fixes the silent bug where precision="double" was ignored for power-of-2
-    # FFTs, leaving users with FP32 DFT-GEMM (~1e-3) instead of FP64 (~1e-14).
     if precision == "double" and n <= _DOUBLE_GEMM_THRESHOLD:
         return _fft_via_gemm_double(x, inverse)
 
     if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
         return _fft_via_gemm(x, inverse)
 
-    # Radix-8 Stockham (Thread B): covers N=512 (3 stages vs 9 butterfly) and
-    # N=4096 (4 stages vs 6 radix-4). W_8 via Tensor-engine nc_matmul.
-    # Checked before radix-4 so N=4096 (a power of both 4 and 8) prefers r=8.
+    # Mixed-radix Stockham (v0.16): optimal [8^a, 4^b] plan for any power-of-2.
+    # Only dispatched when mixed gives fewer stages than the best pure alternative.
+    # Key cases: N=1024 (4 vs 5 radix-4 stages) and N=2048 (4 vs 11 butterfly).
+    if n > 1 and (n & (n - 1)) == 0 and precision != "kahan":
+        _plan = _mixed_radix_plan(n)
+        _r8 = int(math.log2(n)) // 3 if _is_power_of_eight(n) else None
+        _r4 = int(math.log2(n)) // 2 if _is_power_of_four(n) else None
+        _best = min(s for s in [_r8, _r4, int(math.log2(n))] if s is not None)
+        if len(_plan) < _best:
+            return _fft_via_stockham_nki_mixed(x, inverse)
+
+    # Radix-8 Stockham (Thread B): N=512 (3 stages) and N=4096 (4 stages).
     if _is_power_of_eight(n) and precision != "kahan":
         return _fft_via_stockham_nki_r8(x, inverse)
 
-    # Radix-4 Stockham: hardware-validated, 6–9% faster than butterfly at all
-    # power-of-four N (trn1, SDK 2.29, 2026-04-17).
+    # Radix-4 Stockham: hardware-validated, 6–9% faster than butterfly.
     if _is_power_of_four(n) and precision != "kahan":
         return _fft_via_stockham_nki(x, inverse)
     log2n = int(math.log2(n))

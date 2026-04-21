@@ -200,6 +200,39 @@ class TestFFT1DStockhamR8:
             fft_core._FORCE_STOCKHAM_R8 = old_force
 
 
+@pytest.fixture(params=[1024, 2048])
+def mixed_radix_size(request):
+    return request.param
+
+
+@pytest.fixture
+def mixed_radix_signal(mixed_radix_size):
+    torch.manual_seed(42)
+    return torch.randn(mixed_radix_size)
+
+
+class TestFFT1DStockhamMixed:
+    """Mixed-radix Stockham benchmark (v0.16).
+
+    N=1024: [8,8,4,4] = 4 stages (vs radix-4's 5).
+    N=2048: [8,8,8,4] = 4 stages (vs butterfly's 11 — new Stockham coverage).
+    """
+
+    @pytest.mark.neuron
+    def test_fft_nki_stockham_mixed(self, benchmark, mixed_radix_signal):
+        from trnfft import fft_core
+
+        old_force = fft_core._FORCE_STOCKHAM_MIXED
+        fft_core._FORCE_STOCKHAM_MIXED = True
+        _set("nki")
+        try:
+            _warm(trnfft.fft, mixed_radix_signal)
+            benchmark(trnfft.fft, mixed_radix_signal)
+        finally:
+            _set("auto")
+            fft_core._FORCE_STOCKHAM_MIXED = old_force
+
+
 # ---------------------------------------------------------------------------
 # 2D FFT
 # ---------------------------------------------------------------------------

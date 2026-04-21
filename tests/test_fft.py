@@ -554,6 +554,120 @@ class TestStockhamRadix8:
             stockham_radix8(ComplexTensor(torch.randn(32), torch.zeros(32)))
 
 
+class TestStockhamMixed:
+    """CPU reference for mixed-radix [8^a, 4^b] Stockham FFT (v0.16).
+
+    Key coverage: N=1024 ([8,8,4,4] = 4 stages vs radix-4's 5) and
+    N=2048 ([8,8,8,4] = 4 stages vs butterfly's 11 — new Stockham coverage).
+    """
+
+    @pytest.mark.parametrize("n", [64, 1024, 2048])
+    def test_matches_numpy(self, n):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_mixed_radix
+
+        tol = 5e-4 if n >= 2048 else 1e-4
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        result = stockham_mixed_radix(ComplexTensor(x, torch.zeros(n)), inverse=False)
+        expected = np.fft.fft(x.numpy())
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=tol, rtol=tol)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=tol, rtol=tol)
+
+    @pytest.mark.parametrize("n", [64, 1024, 2048])
+    def test_roundtrip(self, n):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_mixed_radix
+
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        ct = ComplexTensor(x, torch.zeros(n))
+        X = stockham_mixed_radix(ct, inverse=False)
+        back = stockham_mixed_radix(X, inverse=True)
+        np.testing.assert_allclose(back.real.numpy(), x.numpy(), atol=1e-4)
+        np.testing.assert_allclose(back.imag.numpy(), np.zeros(n), atol=1e-4)
+
+    def test_ifft_n2048(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_mixed_radix
+
+        torch.manual_seed(42)
+        xr, xi = torch.randn(2048), torch.randn(2048)
+        result = stockham_mixed_radix(ComplexTensor(xr, xi), inverse=True)
+        expected = np.fft.ifft(xr.numpy() + 1j * xi.numpy())
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=5e-4, rtol=5e-4)
+
+    def test_batched(self):
+        from trnfft.complex import ComplexTensor
+        from trnfft.stockham import stockham_mixed_radix
+
+        torch.manual_seed(42)
+        x = torch.randn(4, 1024)
+        result = stockham_mixed_radix(ComplexTensor(x, torch.zeros_like(x)), inverse=False)
+        expected = np.fft.fft(x.numpy(), axis=-1)
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-4, rtol=1e-4)
+
+
+class TestHFFT:
+    """Tests for hfft and ihfft (Hermitian FFT pair, v0.16)."""
+
+    def test_hfft_matches_numpy(self):
+        import trnfft
+        from trnfft.complex import ComplexTensor
+
+        torch.manual_seed(42)
+        n = 16
+        # Build a Hermitian one-sided spectrum (length n//2+1 = 9)
+        half = n // 2 + 1
+        xr = torch.randn(half)
+        xi = torch.randn(half)
+        # DC and Nyquist must be real for strict Hermitian
+        xi[0] = 0.0
+        if n % 2 == 0:
+            xi[-1] = 0.0
+        ct = ComplexTensor(xr, xi)
+        result = trnfft.hfft(ct, n=n)
+        expected = np.fft.hfft(xr.numpy() + 1j * xi.numpy(), n=n)
+        assert result.shape[-1] == n
+        np.testing.assert_allclose(result.numpy(), expected, atol=1e-4, rtol=1e-4)
+
+    def test_ihfft_matches_numpy(self):
+        import trnfft
+
+        torch.manual_seed(42)
+        n = 16
+        x = torch.randn(n)
+        result = trnfft.ihfft(x, n=n)
+        expected = np.fft.ihfft(x.numpy(), n=n)
+        assert result.shape[-1] == n // 2 + 1
+        np.testing.assert_allclose(result.real.numpy(), expected.real, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-4, rtol=1e-4)
+
+    def test_hfft_ihfft_roundtrip(self):
+        import trnfft
+
+        torch.manual_seed(42)
+        n = 32
+        x = torch.randn(n)
+        result = trnfft.hfft(trnfft.ihfft(x, n=n), n=n)
+        np.testing.assert_allclose(result.numpy(), x.numpy(), atol=1e-4)
+
+    def test_hfft_batched(self):
+        import trnfft
+        from trnfft.complex import ComplexTensor
+
+        torch.manual_seed(42)
+        n, half = 32, 17
+        xr = torch.randn(4, half)
+        xi = torch.randn(4, half)
+        xi[..., 0] = 0.0
+        xi[..., -1] = 0.0
+        ct = ComplexTensor(xr, xi)
+        result = trnfft.hfft(ct, n=n)
+        expected = np.fft.hfft(xr.numpy() + 1j * xi.numpy(), n=n)
+        np.testing.assert_allclose(result.numpy(), expected, atol=1e-4, rtol=1e-4)
+
+
 class TestFFT2D:
     def test_vs_numpy(self):
         rng = np.random.default_rng(42)

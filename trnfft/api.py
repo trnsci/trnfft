@@ -68,6 +68,40 @@ def irfft(input: ComplexTensor, n: int | None = None) -> torch.Tensor:
     return result.real
 
 
+def hfft(input: ComplexTensor, n: int | None = None) -> torch.Tensor:
+    """FFT of a Hermitian-symmetric signal; returns a real frequency-domain output.
+
+    ``input`` is the one-sided representation of length ``n//2+1``. Output is
+    real-valued of length ``n``.
+
+    Implementation: ``irfft(input.conj(), n) * n``. This matches NumPy/PyTorch
+    semantics: hfft uses the "forward" norm convention for irfft (no 1/n factor),
+    so the standard irfft result (which divides by n) must be multiplied back by n.
+
+    Inverse of :func:`ihfft`.
+    """
+    if n is None:
+        n = 2 * (input.shape[-1] - 1)
+    conj_input = ComplexTensor(input.real, -input.imag)
+    return irfft(conj_input, n=n) * n
+
+
+def ihfft(input: torch.Tensor, n: int | None = None) -> ComplexTensor:
+    """IFFT of a real signal; returns one-sided Hermitian spectrum of length n//2+1.
+
+    Implementation: ``rfft(input, n) / n``. This matches NumPy/PyTorch semantics:
+    ihfft uses the "forward" norm convention for rfft (1/n scaling on the forward
+    transform), so the standard rfft result is divided by n.
+
+    Inverse of :func:`hfft`.
+    """
+    n_actual = input.shape[-1] if n is None else n
+    result = rfft(input, n=n_actual)
+    # ihfft uses the "forward" (opposite-direction) rfft convention:
+    # conj(rfft(x)) / n — imaginary part is negated relative to rfft.
+    return ComplexTensor(result.real / n_actual, -result.imag / n_actual)
+
+
 def fft2(input: torch.Tensor | ComplexTensor, s: tuple[int, int] | None = None) -> ComplexTensor:
     """2-D FFT along last two dimensions."""
     s_arg = None if s is None else tuple(s)

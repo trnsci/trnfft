@@ -128,3 +128,35 @@ class TestKahanCharacterization:
             rtol=1e-2,
             err_msg="kahan imag diverged from fast beyond FP32 tolerance",
         )
+
+
+@pytest.mark.neuron
+class TestKahanButterflyCharacterization:
+    """On-silicon error characterization for precision="kahan" butterfly.
+
+    Forces the butterfly path (zeros _DFT_GEMM_THRESHOLD) so DFT-GEMM and
+    Stockham are bypassed.  Records fast vs kahan rel error at power-of-2
+    sizes and asserts kahan does not regress.
+
+    Run on hardware to fill the "Target ~1e-3" placeholder in precision.py.
+    """
+
+    @pytest.mark.parametrize("n", [256, 512, 1024, 4096])
+    def test_kahan_butterfly_error_vs_fp64(self, n):
+        from trnfft import fft_core
+
+        old_thr = fft_core._DFT_GEMM_THRESHOLD
+        fft_core._DFT_GEMM_THRESHOLD = 0  # force butterfly path
+        try:
+            fast_err = _bluestein_rel_error(n, "fast")
+            kahan_err = _bluestein_rel_error(n, "kahan")
+            ratio = fast_err / kahan_err if kahan_err > 0 else float("inf")
+            print(
+                f"\nN={n} (butterfly): fast={fast_err:.2e}  "
+                f"kahan={kahan_err:.2e}  improvement={ratio:.1f}×"
+            )
+            assert kahan_err <= fast_err * 1.5, (
+                f"N={n}: kahan ({kahan_err:.2e}) regressed vs fast ({fast_err:.2e})"
+            )
+        finally:
+            fft_core._DFT_GEMM_THRESHOLD = old_thr
