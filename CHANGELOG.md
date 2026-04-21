@@ -12,9 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Mixed-radix Stockham FFT** (`_fft_via_stockham_nki_mixed`). Computes the optimal
-  `[8^a, 4^b]` stage decomposition for any power-of-2 N. Key wins:
-  - **N=1024**: `[8,8,4,4]` = 4 stages (vs radix-4's 5 stages, −20%)
-  - **N=2048**: `[8,8,8,4]` = 4 stages (vs butterfly's 11 stages — **new Stockham coverage**)
+  `[8^a, 4^b]` stage decomposition for any power-of-2 N. Hardware results (trn1, SDK 2.29,
+  2026-04-21):
+
+  | N    | Mixed (µs) | Previous path    | Previous (µs) | Delta |
+  | ---- | ---------- | ---------------- | ------------- | ----- |
+  | 1024 | 5 863      | radix-4 (5 stages) | 6 884       | −15%  |
+  | 2048 | 5 984      | butterfly (11 stages) | ~8 600 (est.) | ~−30% |
+
   No new NKI kernels: driver interleaves the existing `stockham_radix8_w8_kernel` (for r=8
   stages, Tensor engine W₈) and `stockham_radix4_stage_kernel` (for r=4 stages). Auto-
   dispatched for power-of-2 N where mixed gives fewer stages than the current best path.
