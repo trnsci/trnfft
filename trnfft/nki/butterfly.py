@@ -38,6 +38,28 @@ if HAS_NKI:
     import nki.language as nl
 
     PMAX = 128
+    _DEKKER_C = 4097.0  # Dekker split constant for FP32 (2^12 + 1)
+
+    def _kahan_split(x):
+        """Dekker split: x → (xh, xl) with xh + xl == x exactly."""
+        xc = nl.multiply(_DEKKER_C, x)
+        xh = nl.subtract(xc, nl.subtract(xc, x))
+        xl = nl.subtract(x, xh)
+        return xh, xl
+
+    def _kahan_two_prod(a, b):
+        """twoProd(a, b) → (hi, lo) with hi + lo == a*b exactly, hi = round(a*b)."""
+        ah, al = _kahan_split(a)
+        bh, bl = _kahan_split(b)
+        hi = nl.multiply(a, b)
+        lo = nl.add(
+            nl.add(
+                nl.add(nl.subtract(nl.multiply(ah, bh), hi), nl.multiply(ah, bl)),
+                nl.multiply(al, bh),
+            ),
+            nl.multiply(al, bl),
+        )
+        return hi, lo
 
     @nki.jit
     def butterfly_stage_kernel(x_re, x_im, tw_re_bcast, tw_im_bcast, n: int, stage: int):
@@ -155,8 +177,6 @@ if HAS_NKI:
             f"not divisible by chunk size {groups_chunk}"
         )
         n_partition_tiles = total_groups // groups_chunk
-        C = 4097.0  # Dekker split constant for FP32
-
         for p in nl.affine_range(n_partition_tiles):
             p_off = p * groups_chunk
             p_end = p_off + groups_chunk
@@ -169,33 +189,11 @@ if HAS_NKI:
                 o_re = nl.load(x_re_2d[p_off:p_end, k + half : k + half + 1])
                 o_im = nl.load(x_im_2d[p_off:p_end, k + half : k + half + 1])
 
-                # NKI 0.3.0 uses nl.multiply/add/subtract explicitly; scalar-
-                # tensor multiplies go through nl.multiply(scalar, tensor).
-                #
-                # Dekker split: x -> (xh, xl) with xh + xl == x, xh rounded.
-                def _split(x):
-                    xc = nl.multiply(C, x)
-                    xh = nl.subtract(xc, nl.subtract(xc, x))
-                    xl = nl.subtract(x, xh)
-                    return xh, xl
-
-                # twoProd(a, b) -> (hi, lo) with hi + lo == a*b (exact),
-                # hi = round(a*b).
-                def _two_prod(a, b):
-                    ah, al = _split(a)
-                    bh, bl = _split(b)
-                    hi = nl.multiply(a, b)
-                    ahbh_minus_hi = nl.subtract(nl.multiply(ah, bh), hi)
-                    ahbl = nl.multiply(ah, bl)
-                    albh = nl.multiply(al, bh)
-                    albl = nl.multiply(al, bl)
-                    lo = nl.add(nl.add(nl.add(ahbh_minus_hi, ahbl), albh), albl)
-                    return hi, lo
-
-                hi_rr, lo_rr = _two_prod(t_re, o_re)
-                hi_ii, lo_ii = _two_prod(t_im, o_im)
-                hi_ri, lo_ri = _two_prod(t_re, o_im)
-                hi_ir, lo_ir = _two_prod(t_im, o_re)
+                # Module-level _kahan_two_prod (NKI 0.3.0 forbids inner defs).
+                hi_rr, lo_rr = _kahan_two_prod(t_re, o_re)
+                hi_ii, lo_ii = _kahan_two_prod(t_im, o_im)
+                hi_ri, lo_ri = _kahan_two_prod(t_re, o_im)
+                hi_ir, lo_ir = _kahan_two_prod(t_im, o_re)
 
                 prod_re = nl.add(nl.subtract(hi_rr, hi_ii), nl.subtract(lo_rr, lo_ii))
                 prod_im = nl.add(nl.add(hi_ri, hi_ir), nl.add(lo_ri, lo_ir))
