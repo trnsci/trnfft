@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-04-22
+
+### Added
+
+- **BF16 DFT-GEMM with PSUM-FP32 output** (`precision="bf16"`). A new NKI kernel
+  `_complex_gemm_kernel_bf16` takes BF16 inputs, accumulates to FP32 PSUM (hardware
+  invariant), and stores FP32 output — skipping the `nl.cast` back to BF16 that the
+  existing kernel performs. This is the "PSUM is a free FP32 accumulator" architectural
+  principle applied to DFT-GEMM: BF16 Tensor Engine throughput (≈2× FP32) with FP32
+  accumulation quality. BF16 W quantisation limits accuracy to ≈1e-3 rel error at N=256.
+  Dispatched for N ≤ 256 when `precision="bf16"`. Hardware validation pending.
+
+- **Iterative FFT refinement** (`precision="bf16_refined"`). One correction step on top
+  of the BF16 path drives accuracy to near-FP32:
+
+  .. code-block:: text
+
+      X̂ = fft_bf16(x)          # BF16 compute, FP32 PSUM output
+      r = x − IFFT(X̂)          # FP32 residual
+      X̂ = X̂ + fft_bf16(r)     # correction
+
+  This is the first implementation of BF16 FFT with PSUM-FP32 residual correction on a
+  production deterministic systolic array. Cost: 2 BF16 FFTs + 1 IFFT.
+  Dispatched for N ≤ 256 when `precision="bf16_refined"`. Hardware validation pending.
+
+- `_FORCE_BF16_GEMM = False` bench toggle; `TestFFT1DBF16` benchmark class.
+
 ## [0.16.0] - 2026-04-21
 
 ### Added

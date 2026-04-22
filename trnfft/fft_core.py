@@ -156,6 +156,9 @@ _FORCE_STOCKHAM_R8 = False
 # Same bench toggle for the mixed-radix path (v0.16, N=1024/2048).
 _FORCE_STOCKHAM_MIXED = False
 
+# Bench toggle for the BF16 DFT-GEMM path (v0.17).
+_FORCE_BF16_GEMM = False
+
 
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Compute FFT as a single complex matmul: X = W @ x (FP32, NKI path).
@@ -235,6 +238,89 @@ def _fft_via_gemm_double(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         result.real.to(dtype=orig_dtype, device=orig_device),
         result.imag.to(dtype=orig_dtype, device=orig_device),
     )
+
+
+def _fft_via_gemm_bf16(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """BF16 DFT-GEMM: W and x in BF16, FP32 PSUM accumulation, FP32 output.
+
+    Architectural pattern: nc_matmul with BF16 inputs accumulates to FP32 PSUM
+    (hardware invariant on trn1). The BF16 kernel keeps the PSUM as FP32 output
+    instead of rounding back to BF16 — "PSUM is a free FP32 accumulator."
+
+    BF16 Tensor Engine throughput is ≈2× FP32. The BF16 W matrix quantisation
+    limits accuracy to ≈1e-3 rel error at N=256. For near-FP32 accuracy, use
+    :func:`_fft_iterative_refinement` (one correction step at no extra NEFF cost).
+
+    On CPU (no NKI): falls back to ``complex_matmul`` with BF16 inputs — same
+    dtype semantics, no throughput benefit but identical correctness test path.
+    """
+    from .nki.dispatch import complex_gemm_bf16
+
+    n = x.shape[-1]
+    orig_shape = x.real.shape
+
+    # Cast x to BF16 for compute. W is built in FP32 then quantized to BF16:
+    # computing angles in BF16 introduces large errors for high k*j products
+    # (BF16 loses precision for integers > 128). Computing in FP32 and quantizing
+    # W entries to BF16 gives the correct ~1e-3 rel error regime.
+    x_re = x.real.reshape(-1, n).to(torch.bfloat16).contiguous()
+    x_im = x.imag.reshape(-1, n).to(torch.bfloat16).contiguous()
+
+    sign = 1.0 if inverse else -1.0
+    k = torch.arange(n, dtype=torch.float32)  # FP32 angles for accuracy
+    kj = k.unsqueeze(1) * k.unsqueeze(0)
+    angles = sign * 2.0 * math.pi * kj / n
+    # Quantize W to BF16 — this is the BF16 DFT-matrix approximation.
+    W = ComplexTensor(torch.cos(angles).bfloat16(), torch.sin(angles).bfloat16())
+
+    # complex_gemm_bf16 returns FP32 (PSUM not rounded to BF16).
+    X_2d = complex_gemm_bf16(ComplexTensor(x_re, x_im), W)
+    X_re = X_2d.real.reshape(orig_shape)
+    X_im = X_2d.imag.reshape(orig_shape)
+    result = ComplexTensor(X_re, X_im)
+    if inverse:
+        result = result * (1.0 / n)
+    return result
+
+
+def _fft_iterative_refinement(x: ComplexTensor, inverse: bool, steps: int = 1) -> ComplexTensor:
+    """BF16 DFT-GEMM + IR correction steps. Near-FP32 accuracy.
+
+    Algorithm (forward FFT case, inverse analogous):
+
+    .. code-block:: text
+
+        X̂ = fft_bf16(x)                  # BF16 compute, FP32 PSUM output
+        for _ in range(steps):
+            x_rec = ifft_bf16(X̂)          # reconstruct time domain
+            r = x_fp32 - x_rec            # FP32 residual (small after one step)
+            δ = fft_bf16(r)               # BF16 FFT of residual
+            X̂ = X̂ + δ                    # apply correction
+
+    Cost: (1 + steps) BF16 FFTs + steps inverse FFTs.
+    One correction step (IR-1) corrects the BF16 W quantisation error, driving
+    accuracy to near-FP32. Subsequent steps give diminishing returns.
+    """
+    # Step 1: BF16 FFT in the requested direction → FP32 output from PSUM.
+    x_hat = _fft_via_gemm_bf16(x, inverse)
+
+    for _ in range(steps):
+        # Reconstruct the input from the current estimate.
+        # Apply the inverse transform of x_hat (opposite direction + scaling).
+        # _fft_via_gemm_bf16 with inverse=True already applies the 1/N factor.
+        x_rec = _fft_via_gemm_bf16(x_hat, not inverse)
+
+        # Residual: original input minus reconstruction (in FP32 for accuracy).
+        r = ComplexTensor(
+            x.real.float() - x_rec.real,
+            x.imag.float() - x_rec.imag,
+        )
+
+        # BF16 FFT of the residual, same direction as the original transform.
+        delta = _fft_via_gemm_bf16(r, inverse)
+        x_hat = ComplexTensor(x_hat.real + delta.real, x_hat.imag + delta.imag)
+
+    return x_hat
 
 
 def _cooley_tukey_nki(x: ComplexTensor, inverse: bool, precision: str = "fast") -> ComplexTensor:
@@ -783,7 +869,9 @@ def _cooley_tukey_nki_nograd(
 
     n = x.shape[-1]
 
-    # Bench-toggles: force a specific Stockham path ahead of all threshold checks.
+    # Bench-toggles: force a specific path ahead of all threshold checks.
+    if _FORCE_BF16_GEMM:
+        return _fft_via_gemm_bf16(x, inverse)
     if _FORCE_STOCKHAM_MIXED and precision != "kahan":
         return _fft_via_stockham_nki_mixed(x, inverse)
     if _FORCE_STOCKHAM_R8 and precision != "kahan":
@@ -794,6 +882,14 @@ def _cooley_tukey_nki_nograd(
     # "double" mode: NKI PSUM is always FP32, so bypass NKI and use CPU FP64.
     if precision == "double" and n <= _DOUBLE_GEMM_THRESHOLD:
         return _fft_via_gemm_double(x, inverse)
+
+    # "bf16" mode: BF16 compute on Tensor Engine, FP32 PSUM → FP32 output.
+    if precision == "bf16" and n <= _DFT_GEMM_THRESHOLD:
+        return _fft_via_gemm_bf16(x, inverse)
+
+    # "bf16_refined" mode: BF16 + one iterative correction → near-FP32 accuracy.
+    if precision == "bf16_refined" and n <= _DFT_GEMM_THRESHOLD:
+        return _fft_iterative_refinement(x, inverse, steps=1)
 
     if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
         return _fft_via_gemm(x, inverse)

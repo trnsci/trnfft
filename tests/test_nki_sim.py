@@ -224,3 +224,54 @@ class TestFFTSimulator:
             np.testing.assert_allclose(result.imag.numpy(), expected.imag, atol=1e-3, rtol=1e-3)
         finally:
             trnfft.set_backend("auto")
+
+
+class TestBF16GEMMSimulator:
+    """BF16 complex GEMM kernel smoke test under nki.simulate (v0.17).
+
+    Validates that _complex_gemm_kernel_bf16 compiles and runs in the NKI
+    simulator with BF16 inputs and produces FP32 output. Small N only.
+    """
+
+    def test_bf16_kernel_output_is_fp32(self):
+        """Kernel returns FP32 output tensors for BF16 inputs."""
+        from trnfft.nki.dispatch import _complex_gemm_kernel_bf16, _simulate_kernel
+
+        torch.manual_seed(42)
+        n = 64
+        a = torch.randn(1, n, dtype=torch.bfloat16)
+        a_i = torch.zeros(1, n, dtype=torch.bfloat16)
+        b = torch.randn(n, n, dtype=torch.bfloat16)
+        b_i = torch.zeros(n, n, dtype=torch.bfloat16)
+
+        c_r, c_i = _simulate_kernel(_complex_gemm_kernel_bf16, a, a_i, b, b_i)
+        assert c_r.dtype == torch.float32, f"Expected FP32 output, got {c_r.dtype}"
+        assert c_i.dtype == torch.float32
+
+    def test_bf16_gemm_matches_fp32_within_bf16_budget(self):
+        """BF16 GEMM result agrees with FP32 reference within BF16 quantisation budget."""
+        from trnfft.complex import ComplexTensor, complex_matmul
+        from trnfft.nki.dispatch import _complex_gemm_kernel_bf16, _simulate_kernel
+
+        torch.manual_seed(42)
+        m, k, n = 128, 64, 64
+        a_r = torch.randn(m, k, dtype=torch.bfloat16)
+        a_i = torch.zeros(m, k, dtype=torch.bfloat16)
+        b_r = torch.randn(k, n, dtype=torch.bfloat16)
+        b_i = torch.zeros(k, n, dtype=torch.bfloat16)
+
+        # Simulator result
+        c_r, c_i = _simulate_kernel(_complex_gemm_kernel_bf16, a_r, a_i, b_r, b_i)
+
+        # FP32 reference with BF16-quantised inputs (simulates FP32 PSUM)
+        ref = complex_matmul(
+            ComplexTensor(a_r.float(), a_i.float()),
+            ComplexTensor(b_r.float(), b_i.float()),
+        )
+        np.testing.assert_allclose(
+            c_r.numpy(),
+            ref.real.numpy(),
+            atol=1e-1,
+            rtol=1e-1,
+            err_msg="BF16 GEMM sim result diverges from FP32 reference beyond BF16 budget",
+        )
