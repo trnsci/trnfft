@@ -5,10 +5,19 @@ Three modes trade off speed vs numerical accuracy:
 * ``"fast"`` (default) — straight FP32 throughout. Matches the behavior of
   every trnfft release prior to v0.11.0. Bluestein at N ≥ 500 accumulates
   ~2e-2 relative error from the 3-FFT chain.
-* ``"kahan"`` — compensated complex multiply (2Prod + 2Sum) in the Bluestein
+* ``"kahan"`` — compensated complex multiply (Dekker 2Prod) in the Bluestein
   chirp multiplications on the host, plus a Kahan variant of the NKI
-  butterfly kernel. Target ~1e-3 rel error at N=8192. Roughly 2× the op
-  count of "fast" in the compensated sections.
+  butterfly kernel. Measured butterfly rel error (trn1, SDK 2.29, 2026-04-22):
+
+  .. code-block:: text
+
+     N=256:  fast=1.41e-6  kahan=1.92e-7  (7.3× improvement)
+     N=512:  fast=2.15e-6  kahan=2.69e-7  (8.0× improvement)
+     N=1024: fast=2.04e-6  kahan=3.02e-7  (6.8× improvement)
+     N=4096: fast=3.60e-6  kahan=4.55e-7  (7.9× improvement)
+
+  Roughly 2× the op count of "fast" in the compensated sections. Use when
+  forward-error budget for butterfly stages is ≤ 3e-7 (vs "fast"'s ≤ 4e-6).
 * ``"double"`` — promotes math to FP64 for maximum accuracy. Affects two paths:
 
   1. **Bluestein** (non-power-of-2 N): promotes the entire chirp/pad/filter
