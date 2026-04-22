@@ -29,21 +29,35 @@ Three modes trade off speed vs numerical accuracy:
      the "fast" NKI path, but "double" is explicitly the accuracy-first mode.
      For N > 1024, falls through to NKI Stockham (~1e-4 FP32 rel error).
 
+* ``"bf16"`` — BF16 DFT-GEMM for N ≤ 256 on NKI hardware. W and x computed
+  in BF16 on the Tensor Engine; the FP32 PSUM accumulator is preserved as
+  output rather than rounded back to BF16 ("PSUM is a free FP32 accumulator").
+  ≈2× Tensor Engine throughput vs "fast". BF16 W quantisation limits accuracy
+  to ≈1e-3 rel error at N=256. Hardware validation pending (v0.17).
+
+* ``"bf16_refined"`` — BF16 DFT-GEMM + one iterative correction step (IR-1).
+  Algorithm: X̂ = fft_bf16(x); r = x − IFFT(X̂); X̂ += fft_bf16(r). The
+  residual r corrects the BF16 W quantisation error, driving accuracy to
+  near-FP32 at ≈1.5-2× BF16 cost. Suitable for chained FFT pipelines where
+  accumulated rounding matters. Hardware validation pending (v0.17).
+
 Backend interaction: "kahan" and "double" do not disable the NKI backend
 globally — they only change the code path inside ``_bluestein``,
 ``_cooley_tukey_nki_nograd`` (DFT-GEMM double bypass + "kahan" butterfly
-kernel selection), and ``_fft_via_gemm_double``.
+kernel selection), and ``_fft_via_gemm_double``. The "bf16" and "bf16_refined"
+modes route through ``_fft_via_gemm_bf16`` and ``_fft_iterative_refinement``
+respectively, which call ``complex_gemm_bf16`` (the PSUM-FP32 kernel).
 """
 
 from __future__ import annotations
 
-_VALID = ("fast", "kahan", "double")
+_VALID = ("fast", "kahan", "double", "bf16", "bf16_refined")
 
 _precision: str = "fast"
 
 
 def set_precision(mode: str) -> None:
-    """Set the global precision mode. One of {"fast", "kahan", "double"}."""
+    """Set the global precision mode. One of {"fast", "kahan", "double", "bf16", "bf16_refined"}."""
     global _precision
     if mode not in _VALID:
         raise ValueError(f"precision mode must be one of {_VALID}; got {mode!r}")

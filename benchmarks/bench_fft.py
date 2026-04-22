@@ -233,6 +233,40 @@ class TestFFT1DStockhamMixed:
             fft_core._FORCE_STOCKHAM_MIXED = old_force
 
 
+@pytest.fixture(params=[64, 128, 256])
+def bf16_size(request):
+    return request.param
+
+
+@pytest.fixture
+def bf16_signal(bf16_size):
+    torch.manual_seed(42)
+    return torch.randn(bf16_size)
+
+
+class TestFFT1DBF16:
+    """BF16 DFT-GEMM benchmark (v0.17).
+
+    Measures throughput of the BF16 PSUM-FP32 path vs the FP32 "fast" path.
+    Expected: ≈2× speedup on the Tensor Engine for BF16 compute.
+    Both paths cover N ∈ {64, 128, 256} (DFT-GEMM threshold).
+    """
+
+    @pytest.mark.neuron
+    def test_fft_bf16_gemm(self, benchmark, bf16_signal):
+        from trnfft import fft_core
+
+        old = fft_core._FORCE_BF16_GEMM
+        fft_core._FORCE_BF16_GEMM = True
+        _set("nki")
+        try:
+            _warm(trnfft.fft, bf16_signal)
+            benchmark(trnfft.fft, bf16_signal)
+        finally:
+            _set("auto")
+            fft_core._FORCE_BF16_GEMM = old
+
+
 # ---------------------------------------------------------------------------
 # 2D FFT
 # ---------------------------------------------------------------------------

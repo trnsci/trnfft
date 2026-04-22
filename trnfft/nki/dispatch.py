@@ -84,6 +84,10 @@ def complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     return complex_matmul(a, b)
 
 
+# complex_gemm_bf16 is defined later in the file (after the NKI kernels),
+# because it references _complex_gemm_kernel_bf16 which only exists when HAS_NKI.
+
+
 def complex_linear(x: ComplexTensor, w_real: torch.Tensor, w_imag: torch.Tensor) -> ComplexTensor:
     """Complex linear forward: y = x @ W^T (complex) with backend dispatch.
 
@@ -190,6 +194,71 @@ if HAS_NKI:
                 if a_real.dtype != nl.float32:
                     cr_sbuf = nl.cast(cr_sbuf, dtype=a_real.dtype)
                     ci_sbuf = nl.cast(ci_sbuf, dtype=a_real.dtype)
+                nl.store(c_real[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=cr_sbuf)
+                nl.store(c_imag[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=ci_sbuf)
+
+        return c_real, c_imag
+
+    @nki.jit
+    def _complex_gemm_kernel_bf16(a_real, a_imag, b_real, b_imag):
+        """BF16 Complex GEMM: BF16 inputs → FP32 PSUM → FP32 output.
+
+        Architectural pattern: nc_matmul accumulates into FP32 PSUM regardless
+        of input dtype (hardware invariant on trn1). By allocating output as
+        FP32 and *not* casting the PSUM back to BF16, we keep the full FP32
+        accumulation quality while computing in BF16 (≈2× Tensor Engine throughput).
+
+        This is the "PSUM is a free FP32 accumulator" principle:
+          BF16 compute speed × FP32 accumulation precision.
+
+        Inputs a_real, a_imag, b_real, b_imag are expected to be BF16.
+        Output c_real, c_imag are always FP32 — the PSUM result, not rounded.
+
+        The only difference from _complex_gemm_kernel: output dtype is nl.float32
+        (not a_real.dtype) and no nl.cast is applied after nisa.tensor_copy.
+        """
+        M, K = a_real.shape
+        _, N = b_real.shape
+
+        TILE_M = min(M, 128)
+        TILE_K = min(K, 128)
+        TILE_N = min(N, 512)
+
+        # Output is always FP32 — we keep the PSUM without rounding back to BF16.
+        c_real = nl.ndarray((M, N), dtype=nl.float32, buffer=nl.shared_hbm)
+        c_imag = nl.ndarray((M, N), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(N // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
+
+                psum_cr = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                psum_ci = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+
+                for k in nl.affine_range(K // TILE_K):
+                    k_off = k * TILE_K
+
+                    ar_t = nl.load_transpose2d(
+                        a_real[m_off : m_off + TILE_M, k_off : k_off + TILE_K]
+                    )
+                    ai_t = nl.load_transpose2d(
+                        a_imag[m_off : m_off + TILE_M, k_off : k_off + TILE_K]
+                    )
+                    br = nl.load(b_real[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                    bi = nl.load(b_imag[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                    neg_bi = nl.negative(bi)
+
+                    nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=br, accumulate=True)
+                    nisa.nc_matmul(dst=psum_cr, stationary=ai_t, moving=neg_bi, accumulate=True)
+                    nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=bi, accumulate=True)
+                    nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=br, accumulate=True)
+
+                cr_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+                ci_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=cr_sbuf, src=psum_cr)
+                nisa.tensor_copy(dst=ci_sbuf, src=psum_ci)
+                # No nl.cast — output remains FP32 from PSUM (the key difference).
                 nl.store(c_real[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=cr_sbuf)
                 nl.store(c_imag[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=ci_sbuf)
 
@@ -387,6 +456,39 @@ def _nki_complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
 
     c_real, c_imag = complex_gemm_autograd(a.real, a.imag, b.real, b.imag)
     return ComplexTensor(c_real, c_imag)
+
+
+def complex_gemm_bf16(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
+    """BF16 complex GEMM: BF16 inputs → FP32 PSUM → FP32 output.
+
+    On NKI hardware: uses ``_complex_gemm_kernel_bf16`` which skips the
+    PSUM→BF16 cast, preserving FP32 accumulation quality at BF16 throughput.
+    On CPU (no NKI): falls back to ``complex_matmul`` with whatever dtype
+    the inputs carry (correctness path; no throughput benefit on CPU).
+    """
+    if _use_nki() and not _use_simulator():
+        import torch_xla
+
+        device = torch_xla.device()
+        a_re = a.real.to(device)
+        a_im = a.imag.to(device)
+        b_re = b.real.to(device)
+        b_im = b.imag.to(device)
+        c_real, c_imag = _complex_gemm_kernel_bf16(a_re, a_im, b_re, b_im)
+        return ComplexTensor(c_real, c_imag)
+    if _use_simulator():
+        c_real, c_imag = _simulate_kernel(_complex_gemm_kernel_bf16, a.real, a.imag, b.real, b.imag)
+        return ComplexTensor(c_real, c_imag)
+    # CPU fallback: simulate FP32 PSUM behaviour by casting BF16 inputs to
+    # FP32 before the matmul. On hardware, nc_matmul accumulates BF16 products
+    # into a FP32 PSUM; on CPU torch.matmul accumulates in BF16 without the
+    # FP32 PSUM, giving ~50% error at N=64. Casting to FP32 first matches the
+    # hardware's FP32 accumulation quality at the cost of BF16 quantisation of
+    # W and x (which is the intended accuracy regime: ~1e-3 rel error at N=256).
+    a_fp32 = ComplexTensor(a.real.float(), a.imag.float())
+    b_fp32 = ComplexTensor(b.real.float(), b.imag.float())
+    result = complex_matmul(a_fp32, b_fp32)
+    return ComplexTensor(result.real, result.imag)  # already FP32
 
 
 def _nki_complex_linear(
