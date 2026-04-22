@@ -100,7 +100,7 @@ SETUP_SCRIPT="set -e && \
   git fetch --all && \
   git checkout $SHA && \
   pip install -e '.[dev]' --quiet && \
-  printf '#!/bin/bash\nsource /opt/aws_neuronx_venv_pytorch_2_9/bin/activate\ncd /home/ubuntu/trnfft\nexec pytest benchmarks/bench_fft.py::TestFFT1DStockham benchmarks/bench_fft.py::TestFFT1DStockhamR8 benchmarks/bench_fft.py::TestFFT1DStockhamMixed -v --benchmark-only --benchmark-json=$REMOTE_JSON --benchmark-min-rounds=1 --benchmark-max-time=120 --tb=short >$REMOTE_LOG 2>&1\n' > $RUNNER && \
+  printf '#!/bin/bash\nsource /opt/aws_neuronx_venv_pytorch_2_9/bin/activate\ncd /home/ubuntu/trnfft\nexec pytest benchmarks/bench_fft.py::TestFFT1DStockham benchmarks/bench_fft.py::TestFFT1DStockhamR8 benchmarks/bench_fft.py::TestFFT1DStockhamMixed benchmarks/bench_fft.py::TestFFT1DBF16 -v --benchmark-only --benchmark-json=$REMOTE_JSON --benchmark-min-rounds=1 --benchmark-max-time=120 --tb=short >$REMOTE_LOG 2>&1\n' > $RUNNER && \
   chmod +x $RUNNER && \
   echo SETUP_DONE"
 
