@@ -540,17 +540,12 @@ def complex_gemm_ozaki(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     hl = _gemm(a_r_h, a_i_h, b_r_l, b_i_l)
     lh = _gemm(a_r_l, a_i_l, b_r_h, b_i_h)
 
-    # Accumulate in FP64 on CPU — Trainium XLA does not support FP64.
-    # The three FP32 PSUM results are individually accurate; FP64 accumulation
-    # prevents catastrophic cancellation when summing near-equal terms.
-    def _cpu_f64(t: ComplexTensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return t.real.detach().cpu().double(), t.imag.detach().cpu().double()
-
-    r_hh, i_hh = _cpu_f64(hh)
-    r_hl, i_hl = _cpu_f64(hl)
-    r_lh, i_lh = _cpu_f64(lh)
-    out_r = (r_hh + r_hl + r_lh).float()
-    out_i = (i_hh + i_hl + i_lh).float()
+    # Accumulate in FP32 on-device. The dominant error is O(u_bf16^2) from
+    # the input split — not from FP32 accumulation of 3 terms (which adds
+    # only ~3×u_fp32 ≈ 4e-7 per element, negligible vs the 1e-5 split error).
+    # Keeping accumulation on-device avoids XLA→CPU round-trips.
+    out_r = hh.real + hl.real + lh.real
+    out_i = hh.imag + hl.imag + lh.imag
     return ComplexTensor(out_r, out_i)
 
 
