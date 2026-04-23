@@ -41,6 +41,13 @@ Three modes trade off speed vs numerical accuracy:
   near-FP32 at ≈1.5-2× BF16 cost. Suitable for chained FFT pipelines where
   accumulated rounding matters. Hardware validation pending (v0.17).
 
+* ``"ozaki"`` — 2-level Ozaki-scheme DFT-GEMM for N ≤ 256 on NKI hardware.
+  Splits W and x into BF16 high/low parts (Ogita–Rump–Oishi split), runs 3
+  BF16 matmuls (W_high@x_high + W_high@x_low + W_low@x_high), and accumulates
+  in FP64 before returning FP32. Expected O(u_bf16^2) ≈ 1.6e-5 rel error at
+  N=256. Cost ≈ 2× FP32 DFT-GEMM. Faster than ``"double"`` (no CPU roundtrip).
+
+
 Backend interaction: "kahan" and "double" do not disable the NKI backend
 globally — they only change the code path inside ``_bluestein``,
 ``_cooley_tukey_nki_nograd`` (DFT-GEMM double bypass + "kahan" butterfly
@@ -51,7 +58,7 @@ respectively, which call ``complex_gemm_bf16`` (the PSUM-FP32 kernel).
 
 from __future__ import annotations
 
-_VALID = ("fast", "kahan", "double", "bf16", "bf16_refined")
+_VALID = ("fast", "kahan", "double", "bf16", "bf16_refined", "ozaki")
 
 _precision: str = "fast"
 

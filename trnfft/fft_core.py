@@ -159,6 +159,9 @@ _FORCE_STOCKHAM_MIXED = False
 # Bench toggle for the BF16 DFT-GEMM path (v0.17).
 _FORCE_BF16_GEMM = False
 
+# Bench toggle for the Ozaki-scheme path (v0.18).
+_FORCE_OZAKI = False
+
 
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Compute FFT as a single complex matmul: X = W @ x (FP32, NKI path).
@@ -321,6 +324,47 @@ def _fft_iterative_refinement(x: ComplexTensor, inverse: bool, steps: int = 1) -
         x_hat = ComplexTensor(x_hat.real + delta.real, x_hat.imag + delta.imag)
 
     return x_hat
+
+
+def _ozaki_split_bf16(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split FP32 tensor into BF16 high + low parts (matches dispatch._ozaki_split_bf16)."""
+    x_high = x.bfloat16()
+    x_low = (x - x_high.float()).bfloat16()
+    return x_high, x_low
+
+
+def _fft_via_ozaki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """Ozaki-scheme DFT-GEMM: 1-level BF16 split, 3 matmuls, FP64 accumulation.
+
+    Splits W and x into BF16 high/low parts and computes 3 cross-term matmuls,
+    accumulating in FP64 for ~1e-5 relative error at N=64–256. Returns FP32.
+
+    Expected accuracy: O(sqrt(N) * u_bf16^2) ≈ 8e-6–1.6e-5 rel error at N=64–256.
+    Cost: 3 BF16 matmuls ≈ 2× FP32 DFT-GEMM. Faster than ``precision="double"``
+    (no CPU roundtrip). Deterministic error bound suitable for the
+    ``target_forward_error`` API contract.
+    """
+    from .nki.dispatch import complex_gemm_ozaki
+
+    n = x.shape[-1]
+    orig_shape = x.real.shape
+
+    sign = 1.0 if inverse else -1.0
+    k = torch.arange(n, dtype=torch.float32)
+    kj = k.unsqueeze(1) * k.unsqueeze(0)
+    angles = sign * 2.0 * math.pi * kj / n
+    W = ComplexTensor(torch.cos(angles), torch.sin(angles))  # FP32, split inside ozaki
+
+    x_re = x.real.reshape(-1, n).contiguous()
+    x_im = x.imag.reshape(-1, n).contiguous()
+
+    X_2d = complex_gemm_ozaki(ComplexTensor(x_re, x_im), W)
+    X_re = X_2d.real.reshape(orig_shape)
+    X_im = X_2d.imag.reshape(orig_shape)
+    result = ComplexTensor(X_re, X_im)
+    if inverse:
+        result = result * (1.0 / n)
+    return result
 
 
 def _cooley_tukey_nki(x: ComplexTensor, inverse: bool, precision: str = "fast") -> ComplexTensor:
@@ -870,6 +914,8 @@ def _cooley_tukey_nki_nograd(
     n = x.shape[-1]
 
     # Bench-toggles: force a specific path ahead of all threshold checks.
+    if _FORCE_OZAKI:
+        return _fft_via_ozaki(x, inverse, levels=2)
     if _FORCE_BF16_GEMM:
         return _fft_via_gemm_bf16(x, inverse)
     if _FORCE_STOCKHAM_MIXED and precision != "kahan":
@@ -890,6 +936,10 @@ def _cooley_tukey_nki_nograd(
     # "bf16_refined" mode: BF16 + one iterative correction → near-FP32 accuracy.
     if precision == "bf16_refined" and n <= _DFT_GEMM_THRESHOLD:
         return _fft_iterative_refinement(x, inverse, steps=1)
+
+    # "ozaki" mode: 1-level BF16 split, 3 matmuls, O(sqrt(N)*u_bf16^2) error.
+    if precision == "ozaki" and n <= _DFT_GEMM_THRESHOLD:
+        return _fft_via_ozaki(x, inverse)
 
     if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
         return _fft_via_gemm(x, inverse)
