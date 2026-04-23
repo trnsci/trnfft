@@ -252,3 +252,79 @@ class TestBF16Precision:
             _ = trnfft.fft(x)
         finally:
             trnfft.set_precision(old)
+
+
+class TestOzakiPrecision:
+    """Tests for precision="ozaki" and precision="ozaki_hq" (v0.18).
+
+    CPU-runnable: the CPU fallback in complex_gemm_bf16 casts BF16→FP32 before
+    matmul, so Ozaki on CPU uses FP32 arithmetic throughout. This gives near-FP64
+    accuracy on CPU (no BF16 quantisation) and validates the algorithm structure.
+    On hardware, expected O(u_bf16^2) ≈ 1e-5 for "ozaki" and O(u_bf16^3) ≈ 1e-8
+    for "ozaki_hq".
+    """
+
+    @pytest.mark.parametrize("n", [64, 128, 256])
+    def test_ozaki_output_dtype_is_fp32(self, n):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_ozaki
+
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        result = _fft_via_ozaki(ComplexTensor(x, torch.zeros(n)), inverse=False)
+        assert result.real.dtype == torch.float32
+        assert result.imag.dtype == torch.float32
+
+    @pytest.mark.parametrize("n", [64, 128, 256])
+    def test_ozaki_error_better_than_bf16(self, n):
+        """Ozaki rel error should be significantly smaller than single BF16 on CPU.
+
+        Uses relative error (absolute / |DFT|_max) since DFT magnitude scales
+        with sqrt(N). On CPU the split uses BF16-quantized values in FP32 matmuls,
+        giving ~sqrt(N)*u_bf16^2 relative error vs sqrt(N)*u_bf16 for plain BF16.
+        """
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_gemm_bf16, _fft_via_ozaki
+
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        ct = ComplexTensor(x, torch.zeros(n))
+        expected = np.fft.fft(x.numpy().astype(np.float64))
+        scale = np.abs(expected.real).max() + 1e-10  # normalise by DFT magnitude
+
+        bf16 = _fft_via_gemm_bf16(ct, inverse=False)
+        ozaki = _fft_via_ozaki(ct, inverse=False)
+
+        err_bf16 = np.abs(bf16.real.numpy() - expected.real).max() / scale
+        err_oz = np.abs(ozaki.real.numpy() - expected.real).max() / scale
+
+        # Ozaki should be significantly more accurate than plain BF16
+        assert err_oz < err_bf16 * 0.1, (
+            f"N={n}: ozaki rel ({err_oz:.2e}) not better than bf16 rel ({err_bf16:.2e})"
+        )
+        assert err_oz < 1e-3, f"N={n}: ozaki rel error {err_oz:.2e} exceeds 1e-3 bound"
+
+    def test_ozaki_roundtrip(self):
+        """Ozaki FFT→IFFT roundtrip recovers original signal."""
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_ozaki
+
+        torch.manual_seed(42)
+        n = 128
+        x = torch.randn(n)
+        ct = ComplexTensor(x, torch.zeros(n))
+        X = _fft_via_ozaki(ct, inverse=False)
+        back = _fft_via_ozaki(X, inverse=True)
+        np.testing.assert_allclose(back.real.numpy(), x.numpy(), atol=1e-3)
+
+    def test_precision_mode_ozaki_dispatches(self):
+        """set_precision('ozaki') routes to Ozaki path without error."""
+        import trnfft
+
+        old = trnfft.get_precision()
+        try:
+            trnfft.set_precision("ozaki")
+            x = torch.randn(64)
+            _ = trnfft.fft(x)
+        finally:
+            trnfft.set_precision(old)

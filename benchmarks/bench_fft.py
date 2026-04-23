@@ -267,6 +267,28 @@ class TestFFT1DBF16:
             fft_core._FORCE_BF16_GEMM = old
 
 
+class TestFFT1DOzaki:
+    """Ozaki-scheme benchmark (v0.18): 3 BF16 matmuls, O(u_bf16^2) accuracy.
+
+    Measures cost of the 2-split Ozaki path vs BF16 and FP32 DFT-GEMM.
+    Key metric: µs per accuracy decade vs bf16 and fast.
+    """
+
+    @pytest.mark.neuron
+    def test_fft_ozaki(self, benchmark, bf16_signal):
+        from trnfft import fft_core
+
+        old = fft_core._FORCE_OZAKI
+        fft_core._FORCE_OZAKI = True
+        _set("nki")
+        try:
+            _warm(trnfft.fft, bf16_signal)
+            benchmark(trnfft.fft, bf16_signal)
+        finally:
+            _set("auto")
+            fft_core._FORCE_OZAKI = old
+
+
 # ---------------------------------------------------------------------------
 # 2D FFT
 # ---------------------------------------------------------------------------
