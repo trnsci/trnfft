@@ -334,18 +334,16 @@ def _ozaki_split_bf16(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _fft_via_ozaki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
-    """Ozaki-scheme DFT-GEMM: 1-level BF16 split, 3 matmuls, FP64 accumulation.
+    """Ozaki-scheme DFT-GEMM: 1-level BF16 split, 3 matmuls, FP32 accumulation.
 
-    Splits W and x into BF16 high/low parts and computes 3 cross-term matmuls,
-    accumulating in FP64 for ~1e-5 relative error at N=64–256. Returns FP32.
+    Decomposes W and x into BF16 high/low parts, calls _fft_via_gemm_bf16 once
+    per cross-term (3 total), and sums the FP32 results. Uses _fft_via_gemm_bf16
+    directly so each term takes exactly the same hardware path as the working
+    BF16 benchmark.
 
     Expected accuracy: O(sqrt(N) * u_bf16^2) ≈ 8e-6–1.6e-5 rel error at N=64–256.
-    Cost: 3 BF16 matmuls ≈ 2× FP32 DFT-GEMM. Faster than ``precision="double"``
-    (no CPU roundtrip). Deterministic error bound suitable for the
-    ``target_forward_error`` API contract.
+    Cost: 3× BF16 DFT-GEMM ≈ 2× FP32 DFT-GEMM.
     """
-    from .nki.dispatch import complex_gemm_ozaki
-
     n = x.shape[-1]
     orig_shape = x.real.shape
 
@@ -353,14 +351,33 @@ def _fft_via_ozaki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     k = torch.arange(n, dtype=torch.float32)
     kj = k.unsqueeze(1) * k.unsqueeze(0)
     angles = sign * 2.0 * math.pi * kj / n
-    W = ComplexTensor(torch.cos(angles), torch.sin(angles))  # FP32, split inside ozaki
+    W_r_fp32 = torch.cos(angles)  # (n, n) FP32
+    W_i_fp32 = torch.sin(angles)
 
-    x_re = x.real.reshape(-1, n).contiguous()
-    x_im = x.imag.reshape(-1, n).contiguous()
+    # Ozaki splits (CPU → BF16)
+    x_re_fp32 = x.real.reshape(-1, n).contiguous()
+    x_im_fp32 = x.imag.reshape(-1, n).contiguous()
+    x_r_h, x_r_l = _ozaki_split_bf16(x_re_fp32)
+    x_i_h, x_i_l = _ozaki_split_bf16(x_im_fp32)
+    W_r_h, W_r_l = _ozaki_split_bf16(W_r_fp32)
+    W_i_h, W_i_l = _ozaki_split_bf16(W_i_fp32)
 
-    X_2d = complex_gemm_ozaki(ComplexTensor(x_re, x_im), W)
-    X_re = X_2d.real.reshape(orig_shape)
-    X_im = X_2d.imag.reshape(orig_shape)
+    def _term(xr, xi, wr, wi) -> ComplexTensor:
+        """One BF16 DFT-GEMM term using the validated BF16 kernel path."""
+        # Build a fake ComplexTensor carrying BF16 split parts, then call
+        # _fft_via_gemm_bf16's kernel directly.  We replicate just the matmul
+        # portion (no angle recomputation) via complex_gemm_bf16.
+        from .nki.dispatch import complex_gemm_bf16
+
+        return complex_gemm_bf16(ComplexTensor(xr, xi), ComplexTensor(wr, wi))
+
+    # Three cross-terms: hh + hl + lh  (ll is O(u_bf16^4), omitted)
+    hh = _term(x_r_h, x_i_h, W_r_h, W_i_h)
+    hl = _term(x_r_h, x_i_h, W_r_l, W_i_l)
+    lh = _term(x_r_l, x_i_l, W_r_h, W_i_h)
+
+    X_re = (hh.real + hl.real + lh.real).reshape(orig_shape)
+    X_im = (hh.imag + hl.imag + lh.imag).reshape(orig_shape)
     result = ComplexTensor(X_re, X_im)
     if inverse:
         result = result * (1.0 / n)
