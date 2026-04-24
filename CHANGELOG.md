@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `complex_gemm_ozaki(a, b)` in `trnfft/nki/dispatch.py`.
 - `_FORCE_OZAKI = False` bench toggle; `TestFFT1DOzaki` benchmark class.
 
+  **Hardware note:** `TestFFT1DOzaki` runs but does not produce timing data in four
+  consecutive hardware benchmark runs (benchmarks with 3 sequential NKI kernel calls in
+  one PyTorch/XLA lazy graph appear to fail silently). CPU tests pass and demonstrate the
+  ~1e-5 relative error improvement over single-pass BF16. Hardware throughput
+  characterisation deferred to v0.19.
+
 ## [0.17.0] - 2026-04-22
 
 ### Added
