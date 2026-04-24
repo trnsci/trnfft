@@ -371,13 +371,22 @@ def _fft_via_ozaki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
         return complex_gemm_bf16(ComplexTensor(xr, xi), ComplexTensor(wr, wi))
 
-    # Three cross-terms: hh + hl + lh  (ll is O(u_bf16^4), omitted)
+    # Three cross-terms: hh + hl + lh  (ll is O(u_bf16^4), omitted).
+    # .contiguous() after each term forces XLA graph materialisation before
+    # the next kernel call — same pattern as Stockham's per-stage loop.
+    # Without this, all 3 calls build independent lazy branches that the
+    # XLA/Neuron runtime fails to execute as a combined benchmark graph.
     hh = _term(x_r_h, x_i_h, W_r_h, W_i_h)
-    hl = _term(x_r_h, x_i_h, W_r_l, W_i_l)
-    lh = _term(x_r_l, x_i_l, W_r_h, W_i_h)
+    hh_r, hh_i = hh.real.contiguous(), hh.imag.contiguous()
 
-    X_re = (hh.real + hl.real + lh.real).reshape(orig_shape)
-    X_im = (hh.imag + hl.imag + lh.imag).reshape(orig_shape)
+    hl = _term(x_r_h, x_i_h, W_r_l, W_i_l)
+    hl_r, hl_i = hl.real.contiguous(), hl.imag.contiguous()
+
+    lh = _term(x_r_l, x_i_l, W_r_h, W_i_h)
+    lh_r, lh_i = lh.real.contiguous(), lh.imag.contiguous()
+
+    X_re = (hh_r + hl_r + lh_r).reshape(orig_shape)
+    X_im = (hh_i + hl_i + lh_i).reshape(orig_shape)
     result = ComplexTensor(X_re, X_im)
     if inverse:
         result = result * (1.0 / n)
