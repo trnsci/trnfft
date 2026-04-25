@@ -32,11 +32,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `complex_gemm_ozaki(a, b)` in `trnfft/nki/dispatch.py`.
 - `_FORCE_OZAKI = False` bench toggle; `TestFFT1DOzaki` benchmark class.
 
-  **Hardware note:** `TestFFT1DOzaki` runs but does not produce timing data in four
-  consecutive hardware benchmark runs (benchmarks with 3 sequential NKI kernel calls in
-  one PyTorch/XLA lazy graph appear to fail silently). CPU tests pass and demonstrate the
-  ~1e-5 relative error improvement over single-pass BF16. Hardware throughput
-  characterisation deferred to v0.19.
+  Hardware results (trn1, SDK 2.29, 2026-04-25):
+
+  | N   | Ozaki (µs) | BF16 (µs) | FP32 DFT-GEMM | oz/bf16 | oz/fp32 |
+  | --- | ---------- | --------- | ------------- | ------- | ------- |
+  | 64  | 3 241      | 1 179     | ~1 833        | 2.75×   | 1.77×   |
+  | 128 | 3 291      | 1 216     | —             | 2.71×   | —       |
+  | 256 | 3 466      | 1 302     | ~1 882        | 2.66×   | 1.84×   |
+
+  Cost: ~2.7× single-pass BF16; ~1.8× FP32 DFT-GEMM. On-chip (no CPU roundtrip).
+
+  **Debugging note (v0.18):** Eight hardware benchmark attempts produced no timing data
+  before the root cause was identified: the `_FORCE_OZAKI` bench toggle called
+  `_fft_via_ozaki(x, inverse, levels=2)` even after the `levels` parameter was removed
+  from the function signature. Every attempt threw `TypeError` before timing started.
+  The data-dependency trick (`0 * hh.mean()`) added in earlier attempts is kept because
+  it correctly forces sequential XLA graph execution for the 3 cross-term kernels.
 
 ## [0.17.0] - 2026-04-22
 
