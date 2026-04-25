@@ -952,7 +952,7 @@ def _cooley_tukey_nki_nograd(
 
     # Bench-toggles: force a specific path ahead of all threshold checks.
     if _FORCE_OZAKI:
-        return _fft_via_ozaki(x, inverse, levels=2)
+        return _fft_via_ozaki(x, inverse)
     if _FORCE_BF16_GEMM:
         return _fft_via_gemm_bf16(x, inverse)
     if _FORCE_STOCKHAM_MIXED and precision != "kahan":
