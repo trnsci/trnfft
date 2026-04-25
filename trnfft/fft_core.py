@@ -372,28 +372,29 @@ def _fft_via_ozaki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         return complex_gemm_bf16(ComplexTensor(xr, xi), ComplexTensor(wr, wi))
 
     # Three cross-terms: hh + hl + lh  (ll is O(u_bf16^4), omitted).
-    # torch_xla.sync() after each term explicitly flushes the XLA lazy graph
-    # so the next kernel call starts with a clean slate.  The Stockham loop
-    # achieves this implicitly via permute(...).contiguous() on non-contiguous
-    # tensors; for Ozaki the kernel output is already contiguous, so an
-    # explicit sync is needed.  This is the documented PyTorch/XLA idiom for
-    # ensuring pending operations are executed before proceeding.
-    from .nki.dispatch import _use_simulator as _ozaki_use_sim
-
-    def _sync():
-        if _use_nki() and not _ozaki_use_sim():
-            import torch_xla
-
-            torch_xla.sync()
-
+    # Data-dependency trick: add 0 * hh.mean() to the next term's inputs.
+    # This creates a graph edge that forces XLA to evaluate hh before starting
+    # hl, and hl before starting lh, without requiring any sync() API call.
+    # The mean() returns a zero-dim tensor; multiplied by 0 its value is 0,
+    # so the numerics are unchanged but the dependency is encoded in the graph.
+    # This is more robust than torch_xla.sync() across Neuron SDK versions.
     hh = _term(x_r_h, x_i_h, W_r_h, W_i_h)
-    _sync()
+    _dep_hh = hh.real.mean() * 0  # zero, but forces hh to be evaluated first
 
-    hl = _term(x_r_h, x_i_h, W_r_l, W_i_l)
-    _sync()
+    hl = _term(
+        x_r_h + _dep_hh,
+        x_i_h + _dep_hh,
+        W_r_l,
+        W_i_l,
+    )
+    _dep_hl = hl.real.mean() * 0  # zero, but forces hl to be evaluated first
 
-    lh = _term(x_r_l, x_i_l, W_r_h, W_i_h)
-    # No sync after last term — caller handles device cleanup.
+    lh = _term(
+        x_r_l + _dep_hl,
+        x_i_l + _dep_hl,
+        W_r_h,
+        W_i_h,
+    )
 
     X_re = (hh.real + hl.real + lh.real).reshape(orig_shape)
     X_im = (hh.imag + hl.imag + lh.imag).reshape(orig_shape)
