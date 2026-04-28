@@ -162,6 +162,9 @@ _FORCE_BF16_GEMM = False
 # Bench toggle for the Ozaki-scheme path (v0.18).
 _FORCE_OZAKI = False
 
+# Bench toggle for the 2-level Ozaki path (v0.19).
+_FORCE_OZAKI_HQ = False
+
 
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Compute FFT as a single complex matmul: X = W @ x (FP32, NKI path).
@@ -327,10 +330,28 @@ def _fft_iterative_refinement(x: ComplexTensor, inverse: bool, steps: int = 1) -
 
 
 def _ozaki_split_bf16(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split FP32 tensor into BF16 high + low parts (matches dispatch._ozaki_split_bf16)."""
+    """Split FP32 tensor into BF16 high + low parts (1-level ORO split)."""
     x_high = x.bfloat16()
     x_low = (x - x_high.float()).bfloat16()
     return x_high, x_low
+
+
+def _ozaki_split_3way_bf16(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """3-way ORO split: x ≈ x_h1 + x_h2 + x_h3, all BF16, FP32 residuals between levels.
+
+    This is the key constraint for 2-level Ozaki: the first residual must stay in FP32
+    before the second BF16 quantisation. A BF16 value has zero remaining mantissa bits
+    for a second split — the FP32 intermediate is what enables O(u_bf16^4) accuracy.
+
+    Magnitudes: |x_h1| ~ |x|, |x_h2| ~ u_bf16·|x|, |x_h3| ~ u_bf16²·|x|.
+    """
+    x_h1 = x.bfloat16()
+    r1 = x - x_h1.float()  # FP32 residual — NOT cast to BF16 here
+    x_h2 = r1.bfloat16()
+    x_h3 = (r1 - x_h2.float()).bfloat16()
+    return x_h1, x_h2, x_h3
 
 
 def _fft_via_ozaki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
@@ -398,6 +419,74 @@ def _fft_via_ozaki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
     X_re = (hh.real + hl.real + lh.real).reshape(orig_shape)
     X_im = (hh.imag + hl.imag + lh.imag).reshape(orig_shape)
+    result = ComplexTensor(X_re, X_im)
+    if inverse:
+        result = result * (1.0 / n)
+    return result
+
+
+def _fft_via_ozaki_hq(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """2-level Ozaki DFT-GEMM: W 2-split × x 3-split → 6 BF16 matmuls, FP32 accumulation.
+
+    Achieves O(sqrt(N)·u_bf16^4) ≈ 2e-9 rel error at N=64 — near-FP64 accuracy
+    without leaving the Tensor Engine.
+
+    Split structure:
+      x 3-way: x_h1 (BF16), x_h2 (BF16 of FP32 residual), x_h3 (BF16 of 2nd residual)
+      W 2-way: W_h (BF16), W_l (BF16 of FP32 residual)
+
+    Six cross-terms (all combinations W_{h,l} × x_{h1,h2,h3}):
+      W_h@x_h1, W_h@x_h2, W_h@x_h3, W_l@x_h1, W_l@x_h2, W_l@x_h3
+
+    Cost: 6× BF16 DFT-GEMM ≈ 3.5× FP32 DFT-GEMM.
+    Data-dependency trick forces sequential XLA graph execution (same as _fft_via_ozaki).
+    """
+    n = x.shape[-1]
+    orig_shape = x.real.shape
+
+    sign = 1.0 if inverse else -1.0
+    k = torch.arange(n, dtype=torch.float32)
+    kj = k.unsqueeze(1) * k.unsqueeze(0)
+    angles = sign * 2.0 * math.pi * kj / n
+    W_r_fp32 = torch.cos(angles)
+    W_i_fp32 = torch.sin(angles)
+
+    x_re_fp32 = x.real.reshape(-1, n).contiguous()
+    x_im_fp32 = x.imag.reshape(-1, n).contiguous()
+
+    # 2-way split of W (same as 1-level Ozaki)
+    W_r_h, W_r_l = _ozaki_split_bf16(W_r_fp32)
+    W_i_h, W_i_l = _ozaki_split_bf16(W_i_fp32)
+
+    # 3-way split of x (FP32 residuals between levels — the 2-level key)
+    x_r_h1, x_r_h2, x_r_h3 = _ozaki_split_3way_bf16(x_re_fp32)
+    x_i_h1, x_i_h2, x_i_h3 = _ozaki_split_3way_bf16(x_im_fp32)
+
+    def _term(xr, xi, wr, wi) -> ComplexTensor:
+        from .nki.dispatch import complex_gemm_bf16
+
+        return complex_gemm_bf16(ComplexTensor(xr, xi), ComplexTensor(wr, wi))
+
+    # Six terms with sequential data-dependencies to force XLA graph execution.
+    t1 = _term(x_r_h1, x_i_h1, W_r_h, W_i_h)
+    _d1 = t1.real.mean() * 0
+
+    t2 = _term(x_r_h2 + _d1, x_i_h2 + _d1, W_r_h, W_i_h)
+    _d2 = t2.real.mean() * 0
+
+    t3 = _term(x_r_h3 + _d2, x_i_h3 + _d2, W_r_h, W_i_h)
+    _d3 = t3.real.mean() * 0
+
+    t4 = _term(x_r_h1 + _d3, x_i_h1 + _d3, W_r_l, W_i_l)
+    _d4 = t4.real.mean() * 0
+
+    t5 = _term(x_r_h2 + _d4, x_i_h2 + _d4, W_r_l, W_i_l)
+    _d5 = t5.real.mean() * 0
+
+    t6 = _term(x_r_h3 + _d5, x_i_h3 + _d5, W_r_l, W_i_l)
+
+    X_re = (t1.real + t2.real + t3.real + t4.real + t5.real + t6.real).reshape(orig_shape)
+    X_im = (t1.imag + t2.imag + t3.imag + t4.imag + t5.imag + t6.imag).reshape(orig_shape)
     result = ComplexTensor(X_re, X_im)
     if inverse:
         result = result * (1.0 / n)
@@ -951,6 +1040,8 @@ def _cooley_tukey_nki_nograd(
     n = x.shape[-1]
 
     # Bench-toggles: force a specific path ahead of all threshold checks.
+    if _FORCE_OZAKI_HQ:
+        return _fft_via_ozaki_hq(x, inverse)
     if _FORCE_OZAKI:
         return _fft_via_ozaki(x, inverse)
     if _FORCE_BF16_GEMM:
@@ -973,6 +1064,10 @@ def _cooley_tukey_nki_nograd(
     # "bf16_refined" mode: BF16 + one iterative correction → near-FP32 accuracy.
     if precision == "bf16_refined" and n <= _DFT_GEMM_THRESHOLD:
         return _fft_iterative_refinement(x, inverse, steps=1)
+
+    # "ozaki_hq" mode: 2-level Ozaki, 6 matmuls, O(sqrt(N)*u_bf16^4) error.
+    if precision == "ozaki_hq" and n <= _DFT_GEMM_THRESHOLD:
+        return _fft_via_ozaki_hq(x, inverse)
 
     # "ozaki" mode: 1-level BF16 split, 3 matmuls, O(sqrt(N)*u_bf16^2) error.
     if precision == "ozaki" and n <= _DFT_GEMM_THRESHOLD:

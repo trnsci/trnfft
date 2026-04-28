@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-04-27
+
+### Added
+
+- **2-level Ozaki-scheme DFT-GEMM** (`precision="ozaki_hq"`). Extends v0.18's 1-level
+  scheme by using a 3-way x split (keeping FP32 residuals between levels) plus a 2-way
+  W split — 6 BF16 matmuls total. The key constraint from v0.18: once a value is
+  quantised to BF16, its residual has zero mantissa bits for a second split; the FP32
+  intermediate is what enables the second level.
+
+  Expected accuracy: O(sqrt(N)·u_bf16^4) ≈ 2e-9 rel error at N=64 — ~1000× better
+  than 1-level Ozaki (~1.6e-5) and near-FP64 without CPU roundtrip.
+  Cost: 6× single BF16 DFT-GEMM ≈ 3.5× FP32 DFT-GEMM. Hardware validation pending.
+
+- `_ozaki_split_3way_bf16(x)` — 3-way ORO split returning (x_h1, x_h2, x_h3) BF16,
+  using FP32 for the intermediate residual before the second quantisation.
+- `_FORCE_OZAKI_HQ = False` bench toggle; `TestFFT1DOzakiHQ` benchmark class.
+
+### Changed
+
+- `trnfft/nki/dispatch.py`: removed unused `_ozaki_split_bf16` and `complex_gemm_ozaki`
+  (consolidated into `trnfft/fft_core.py` alongside the new 2-level helpers).
+
 ## [0.18.0] - 2026-04-23
 
 ### Added

@@ -491,62 +491,10 @@ def complex_gemm_bf16(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     return ComplexTensor(result.real, result.imag)  # already FP32
 
 
-def _ozaki_split_bf16(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Split an FP32 tensor into high + low BF16 parts (Ozaki 1-level split).
-
-    Returns ``(x_high, x_low)`` such that
-    ``x_high.float() + x_low.float() ≈ x`` with error O(u_bf16^2 * |x|).
-
-    x_high = bfloat16(x)                          — BF16 representation of x
-    x_low  = bfloat16(x − float32(x_high))        — BF16 residual
-
-    Used by :func:`complex_gemm_ozaki` to decompose matmul inputs into partial
-    sums, enabling Ozaki-scheme FP64 emulation from BF16 kernel calls.
-    """
-    x_high = x.bfloat16()
-    x_low = (x - x_high.float()).bfloat16()
-    return x_high, x_low
-
-
-def complex_gemm_ozaki(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
-    """Ozaki-scheme complex GEMM: 1-level BF16 split + FP64 accumulation.
-
-    Decomposes a and b into BF16 high/low parts and computes the three
-    significant cross-terms using ``complex_gemm_bf16``, accumulating in FP64:
-
-        3 BF16 matmuls: a_high@b_high + a_high@b_low + a_low@b_high
-
-    The omitted term (a_low @ b_low) has magnitude O(u_bf16^2 * |a| * |b|)
-    per entry, contributing O(sqrt(N) * u_bf16^2) relative error to the DFT
-    output — ~1e-5 relative at N=64, ~2e-5 at N=256.
-
-    Output dtype is torch.float32 (FP64 accumulation is internal only).
-    Assumes a, b are FP32 on entry; they are split to BF16 internally.
-
-    Note on multi-level Ozaki: a 2-level split (for O(u_bf16^4) accuracy)
-    would require keeping the split residuals in FP32 rather than BF16, and
-    is deferred to a future version.
-    """
-    a_r_h, a_r_l = _ozaki_split_bf16(a.real.float())
-    a_i_h, a_i_l = _ozaki_split_bf16(a.imag.float())
-    b_r_h, b_r_l = _ozaki_split_bf16(b.real.float())
-    b_i_h, b_i_l = _ozaki_split_bf16(b.imag.float())
-
-    def _gemm(ar, ai, br, bi):
-        return complex_gemm_bf16(ComplexTensor(ar, ai), ComplexTensor(br, bi))
-
-    # Three cross-terms: hh + hl + lh (omit ll which is O(u^2) × signal)
-    hh = _gemm(a_r_h, a_i_h, b_r_h, b_i_h)
-    hl = _gemm(a_r_h, a_i_h, b_r_l, b_i_l)
-    lh = _gemm(a_r_l, a_i_l, b_r_h, b_i_h)
-
-    # Accumulate in FP32 on-device. The dominant error is O(u_bf16^2) from
-    # the input split — not from FP32 accumulation of 3 terms (which adds
-    # only ~3×u_fp32 ≈ 4e-7 per element, negligible vs the 1e-5 split error).
-    # Keeping accumulation on-device avoids XLA→CPU round-trips.
-    out_r = hh.real + hl.real + lh.real
-    out_i = hh.imag + hl.imag + lh.imag
-    return ComplexTensor(out_r, out_i)
+# _ozaki_split_bf16 and complex_gemm_ozaki were defined here in v0.18 but have been
+# consolidated into trnfft/fft_core.py in v0.19. The split helpers (_ozaki_split_bf16,
+# _ozaki_split_3way_bf16) live in fft_core.py; complex_gemm_ozaki was superseded by
+# the direct _fft_via_ozaki / _fft_via_ozaki_hq drivers in fft_core.py.
 
 
 def _nki_complex_linear(

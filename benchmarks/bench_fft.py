@@ -289,6 +289,27 @@ class TestFFT1DOzaki:
             fft_core._FORCE_OZAKI = old
 
 
+class TestFFT1DOzakiHQ:
+    """2-level Ozaki benchmark (v0.19): 6 BF16 matmuls, O(u_bf16^4) accuracy.
+
+    Measures cost of the 3-way x split + 2-way W split path. Expected: ~6× BF16 ≈ 3.5× FP32.
+    """
+
+    @pytest.mark.neuron
+    def test_fft_ozaki_hq(self, benchmark, bf16_signal):
+        from trnfft import fft_core
+
+        old = fft_core._FORCE_OZAKI_HQ
+        fft_core._FORCE_OZAKI_HQ = True
+        _set("nki")
+        try:
+            _warm(trnfft.fft, bf16_signal)
+            benchmark(trnfft.fft, bf16_signal)
+        finally:
+            _set("auto")
+            fft_core._FORCE_OZAKI_HQ = old
+
+
 # ---------------------------------------------------------------------------
 # 2D FFT
 # ---------------------------------------------------------------------------
