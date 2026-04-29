@@ -441,7 +441,12 @@ def _simulate_kernel(kernel, *tensors):
     correctness iteration only; hardware still owns perf numbers.
     """
     orig_device = tensors[0].device
-    np_args = [t.detach().cpu().numpy() for t in tensors]
+    # numpy has no BF16 dtype — cast to FP32 before simulation (simulator
+    # uses the kernel's declared dtype, not the numpy input dtype).
+    np_args = [
+        t.detach().cpu().float().numpy() if t.dtype == torch.bfloat16 else t.detach().cpu().numpy()
+        for t in tensors
+    ]
     out = nki.simulate(kernel)(*np_args)
     if isinstance(out, tuple):
         return tuple(torch.from_numpy(np.asarray(o)).to(orig_device) for o in out)
