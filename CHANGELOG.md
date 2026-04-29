@@ -19,7 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Expected accuracy: O(sqrt(N)·u_bf16^4) ≈ 2e-9 rel error at N=64 — ~1000× better
   than 1-level Ozaki (~1.6e-5) and near-FP64 without CPU roundtrip.
-  Cost: 6× single BF16 DFT-GEMM ≈ 3.5× FP32 DFT-GEMM. Hardware validation pending.
+  Hardware results (trn1, SDK 2.29, 2026-04-27):
+
+  | N   | oz_hq (µs) | ozaki (µs) | BF16 (µs) | hq/ozaki | hq/fp32 |
+  | --- | ---------- | ---------- | --------- | -------- | ------- |
+  | 64  | 6 252      | 3 225      | 1 178     | 1.94×    | 3.41×   |
+  | 128 | 6 313      | 3 316      | 1 214     | 1.90×    | —       |
+  | 256 | 6 417      | 3 451      | 1 300     | 1.86×    | 3.41×   |
+
+  The ~1.9× overhead vs 1-level Ozaki (not 2×) reflects kernel-call pipelining.
+  Precision characterisation on hardware (actual BF16 matmuls) pending.
 
 - `_ozaki_split_3way_bf16(x)` — 3-way ORO split returning (x_h1, x_h2, x_h3) BF16,
   using FP32 for the intermediate residual before the second quantisation.
