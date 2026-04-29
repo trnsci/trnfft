@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-04-17
+
+### Added
+
+- **Multi-NeuronCore batch-split FFT** (`trnfft/nki/multicore.py`). Replaces the
+  v0.19 scaffold passthrough with a genuine batch-splitting implementation.
+  `set_multicore(True, num_cores=N)` routes batched inputs through `_batch_split_fft`,
+  which splits the batch dimension across N NeuronCores (or CPU threads in test mode)
+  and reassembles the result.
+
+  On Neuron hardware with `torch_neuronx` available: compiles a thin `_FFTModule`
+  wrapper with `torch_neuronx.trace`, then dispatches via `torch_neuronx.DataParallel`.
+  Compiled models are cached per `(n, inverse, num_cores)` key so the first call pays
+  the compilation cost and subsequent calls do not.
+
+  On CPU (no `torch_neuronx`): processes shards sequentially — architecturally correct,
+  no hardware parallelism. All CPU tests pass.
+
+  Single-transform inputs still raise `NotImplementedError`; stage parallelism requires
+  inter-core all-reduce infrastructure and is deferred.
+
+- `_resolve_num_cores(batch_size)` — resolves actual core count from requested count,
+  `torch_neuronx.get_neuron_device_count()`, or CPU fallback (min(2, batch)).
+- `tests/test_multicore.py` — CPU correctness tests covering shape contracts, roundtrip,
+  core clamping, and API surface.
+
 ## [0.19.0] - 2026-04-27
 
 ### Added

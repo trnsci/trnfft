@@ -394,3 +394,62 @@ class TestOzakiHQPrecision:
             _ = trnfft.fft(x)
         finally:
             trnfft.set_precision(old)
+
+
+@pytest.mark.neuron
+class TestOzakiHQCharacterization:
+    """On-silicon precision characterization for ``trnfft.set_precision("ozaki_hq")``.
+
+    Forces the DFT-GEMM path (ensures _DFT_GEMM_THRESHOLD >= n) so the 6-term
+    2-level Ozaki path runs on hardware.  Records 1-level vs 2-level Ozaki rel
+    error at N ∈ {64, 128, 256} and asserts 2-level is strictly better.
+
+    Expected hardware results:
+      - "ozaki" (1-level):    O(sqrt(N)·u_bf16²) ≈ 1.6e-5 at N=64
+      - "ozaki_hq" (2-level): O(sqrt(N)·u_bf16⁴) ≈ 2e-9  at N=64
+      - improvement ≈ 10 000× at N=64
+
+    Run on trn1 to fill the hardware precision table in the CHANGELOG and blog.
+    """
+
+    @pytest.mark.parametrize("n", [64, 128, 256])
+    def test_ozaki_hq_error_vs_fp64(self, n):
+        from trnfft import fft_core
+
+        old_thr = fft_core._DFT_GEMM_THRESHOLD
+        fft_core._DFT_GEMM_THRESHOLD = max(n, old_thr)
+        try:
+            ozaki_err = _bluestein_rel_error(n, "ozaki")
+            hq_err = _bluestein_rel_error(n, "ozaki_hq")
+            ratio = ozaki_err / hq_err if hq_err > 0 else float("inf")
+            print(
+                f"\nN={n}: ozaki={ozaki_err:.2e}  ozaki_hq={hq_err:.2e}  improvement={ratio:.1f}×"
+            )
+            assert hq_err < ozaki_err, (
+                f"N={n}: ozaki_hq ({hq_err:.2e}) not better than ozaki ({ozaki_err:.2e})"
+            )
+            assert hq_err < 1e-6, f"N={n}: ozaki_hq rel error {hq_err:.2e} exceeds 1e-6 bound"
+        finally:
+            fft_core._DFT_GEMM_THRESHOLD = old_thr
+
+    def test_ozaki_hq_single_n64(self):
+        """Focused N=64 test; easiest to read in CI output and the blog table."""
+        from trnfft import fft_core
+
+        n = 64
+        old_thr = fft_core._DFT_GEMM_THRESHOLD
+        fft_core._DFT_GEMM_THRESHOLD = max(n, old_thr)
+        try:
+            ozaki_err = _bluestein_rel_error(n, "ozaki")
+            hq_err = _bluestein_rel_error(n, "ozaki_hq")
+            print(
+                f"\n2-level Ozaki characterization (N=64, trn1):\n"
+                f"  ozaki (1-level)    error = {ozaki_err:.3e}\n"
+                f"  ozaki_hq (2-level) error = {hq_err:.3e}\n"
+                f"  ratio ozaki/ozaki_hq = {ozaki_err / hq_err:.1f}×"
+            )
+            assert hq_err < ozaki_err, (
+                f"ozaki_hq ({hq_err:.2e}) not better than ozaki ({ozaki_err:.2e})"
+            )
+        finally:
+            fft_core._DFT_GEMM_THRESHOLD = old_thr
