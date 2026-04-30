@@ -42,14 +42,19 @@ Three modes trade off speed vs numerical accuracy:
   accumulated rounding matters. Hardware validation pending (v0.17).
 
 * ``"ozaki_hq"`` — 2-level Ozaki (3-way x split + 2-way W split) for N ≤ 256.
-  6 BF16 matmuls, O(sqrt(N)·u_bf16^4) ≈ 2e-9 rel error at N=64. Cost ≈ 6× BF16
-  ≈ 3.5× FP32. Near-FP64 accuracy without CPU roundtrip. Hardware validation pending.
+  6 BF16 matmuls. Theoretical O(sqrt(N)·u_bf16^4) ≈ 2e-9 rel error at N=64.
+  **Hardware-gated**: requires nc_matmul to compute BF16×BF16 products at FP32
+  precision before PSUM accumulation. trn1 does not provide this — measured
+  ozaki_hq ≈ bf16 ≈ 1.7e-3 on trn1 (SDK 2.29.0). trn2/trn3 likely do (TF32/MXFP8
+  product precision). Emits RuntimeWarning and falls back to "bf16" unless
+  ``trnfft.set_ozaki_product_precision_verified(True)`` has been called.
 
 * ``"ozaki"`` — 1-level Ozaki-scheme DFT-GEMM for N ≤ 256 on NKI hardware.
-  Splits W and x into BF16 high/low parts (Ogita–Rump–Oishi split), runs 3
-  BF16 matmuls (W_high@x_high + W_high@x_low + W_low@x_high), and accumulates
-  in FP64 before returning FP32. Expected O(u_bf16^2) ≈ 1.6e-5 rel error at
-  N=256. Cost ≈ 2× FP32 DFT-GEMM. Faster than ``"double"`` (no CPU roundtrip).
+  3 BF16 matmuls (W_h@x_h + W_h@x_l + W_l@x_h). Theoretical O(u_bf16^2) ≈ 1.6e-5
+  rel error at N=256. **Hardware-gated**: same product-precision constraint as
+  "ozaki_hq". On trn1, measured error equals single-pass BF16. Emits RuntimeWarning
+  and falls back to "bf16" unless verified. Run TestOzakiHQCharacterization to test
+  your hardware, then call set_ozaki_product_precision_verified(True) to enable.
 
 
 Backend interaction: "kahan" and "double" do not disable the NKI backend

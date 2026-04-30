@@ -319,16 +319,32 @@ class TestOzakiPrecision:
         np.testing.assert_allclose(back.real.numpy(), x.numpy(), atol=1e-3)
 
     def test_precision_mode_ozaki_dispatches(self):
-        """set_precision('ozaki') routes to Ozaki path without error."""
+        """set_precision('ozaki') routes to Ozaki path; emits warning on unverified hardware."""
+        import warnings
+
         import trnfft
+        from trnfft.fft_core import set_ozaki_product_precision_verified
 
         old = trnfft.get_precision()
         try:
             trnfft.set_precision("ozaki")
             x = torch.randn(64)
-            _ = trnfft.fft(x)
+            # Without verification: should emit RuntimeWarning and fall back.
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                _ = trnfft.fft(x)
+                assert any("ozaki" in str(warning.message).lower() for warning in w), (
+                    "Expected RuntimeWarning for unverified ozaki on this hardware"
+                )
+            # With verification: no warning.
+            set_ozaki_product_precision_verified(True)
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                _ = trnfft.fft(x)
+                assert not any(issubclass(warning.category, RuntimeWarning) for warning in w)
         finally:
             trnfft.set_precision(old)
+            set_ozaki_product_precision_verified(False)
 
 
 class TestOzakiHQPrecision:
@@ -386,15 +402,28 @@ class TestOzakiHQPrecision:
         np.testing.assert_allclose(back.real.numpy(), x.numpy(), atol=1e-4)
 
     def test_precision_mode_ozaki_hq_dispatches(self):
+        """ozaki_hq emits RuntimeWarning on unverified hardware, no warning when verified."""
+        import warnings
+
         import trnfft
+        from trnfft.fft_core import set_ozaki_product_precision_verified
 
         old = trnfft.get_precision()
         try:
             trnfft.set_precision("ozaki_hq")
             x = torch.randn(64)
-            _ = trnfft.fft(x)
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                _ = trnfft.fft(x)
+                assert any("ozaki" in str(warning.message).lower() for warning in w)
+            set_ozaki_product_precision_verified(True)
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                _ = trnfft.fft(x)
+                assert not any(issubclass(warning.category, RuntimeWarning) for warning in w)
         finally:
             trnfft.set_precision(old)
+            set_ozaki_product_precision_verified(False)
 
 
 @pytest.mark.neuron

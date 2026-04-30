@@ -28,6 +28,7 @@ from .api import (
     stft,
 )
 from .complex import ComplexTensor, complex_matmul
+from .fft_core import set_ozaki_product_precision_verified
 from .nki import HAS_NKI, get_backend, set_backend
 from .plan import FFTPlan, clear_plan_cache, create_plan
 from .precision import get_precision, set_precision
@@ -62,5 +63,6 @@ __all__ = [
     "get_backend",
     # Precision
     "set_precision",
+    "set_ozaki_product_precision_verified",
     "get_precision",
 ]

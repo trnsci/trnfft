@@ -9,6 +9,7 @@ All operations on split real/imaginary tensors for Trainium compatibility.
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
 import torch
@@ -164,6 +165,57 @@ _FORCE_OZAKI = False
 
 # Bench toggle for the 2-level Ozaki path (v0.19).
 _FORCE_OZAKI_HQ = False
+
+# Hardware capability flag for Ozaki product precision.
+#
+# Ozaki precision improvement requires BF16 inputs to produce FP32-precision
+# products before PSUM accumulation (i.e., nc_matmul computes W*x in FP32).
+# trn1 does NOT provide this — BF16 products are rounded to BF16 before PSUM,
+# leaving no signal for the correction terms to capture. Measured result on
+# trn1: ozaki ≈ ozaki_hq ≈ bf16 (~1.7e-3 rel error at N=64).
+#
+# trn2/trn3 may provide FP32 product precision via TF32/MXFP8 tensor cores
+# (same gap NVIDIA TF32 exploits). Run TestOzakiHQCharacterization to verify,
+# then call set_ozaki_product_precision_verified(True) to enable.
+#
+# False  → emit RuntimeWarning, fall back to precision="bf16"
+# True   → proceed without warning
+_OZAKI_PRODUCT_PRECISION_VERIFIED = False
+
+
+def set_ozaki_product_precision_verified(verified: bool = True) -> None:
+    """Declare that nc_matmul on this hardware provides FP32 product precision.
+
+    Call after running TestOzakiHQCharacterization and confirming ozaki_err
+    is significantly better than bf16_err. Suppresses the trn1 warning and
+    enables the ozaki/ozaki_hq precision modes without fallback.
+
+    On trn1 (SDK 2.29.0): ozaki ≈ bf16 ≈ 1.7e-3. Do not set True on trn1.
+    On trn2+: rerun characterization to verify before setting True.
+    """
+    global _OZAKI_PRODUCT_PRECISION_VERIFIED
+    _OZAKI_PRODUCT_PRECISION_VERIFIED = verified
+
+
+def _ozaki_or_fallback(x: ComplexTensor, inverse: bool, hq: bool) -> ComplexTensor:
+    """Dispatch to Ozaki path if hardware is verified, else warn and use BF16."""
+    if not _OZAKI_PRODUCT_PRECISION_VERIFIED:
+        warnings.warn(
+            "precision='ozaki_hq'"
+            if hq
+            else "precision='ozaki'"
+            " requires nc_matmul to compute BF16×BF16 products at FP32 precision "
+            "before PSUM accumulation. trn1 (SDK 2.29.0) does not provide this — "
+            "measured ozaki ≈ bf16 ≈ 1.7e-3 rel error at N=64. "
+            "Cost: " + ("6×" if hq else "3×") + " BF16 latency, no accuracy gain. "
+            "Run TestOzakiHQCharacterization on your instance type and call "
+            "trnfft.set_ozaki_product_precision_verified(True) if ozaki_err ≪ bf16_err. "
+            "Falling back to precision='bf16'.",
+            RuntimeWarning,
+            stacklevel=4,
+        )
+        return _fft_via_gemm_bf16(x, inverse)
+    return _fft_via_ozaki_hq(x, inverse) if hq else _fft_via_ozaki(x, inverse)
 
 
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
@@ -1066,12 +1118,14 @@ def _cooley_tukey_nki_nograd(
         return _fft_iterative_refinement(x, inverse, steps=1)
 
     # "ozaki_hq" mode: 2-level Ozaki, 6 matmuls, O(sqrt(N)*u_bf16^4) error.
+    # Requires FP32 product precision in nc_matmul; not available on trn1.
     if precision == "ozaki_hq" and n <= _DFT_GEMM_THRESHOLD:
-        return _fft_via_ozaki_hq(x, inverse)
+        return _ozaki_or_fallback(x, inverse, hq=True)
 
     # "ozaki" mode: 1-level BF16 split, 3 matmuls, O(sqrt(N)*u_bf16^2) error.
+    # Requires FP32 product precision in nc_matmul; not available on trn1.
     if precision == "ozaki" and n <= _DFT_GEMM_THRESHOLD:
-        return _fft_via_ozaki(x, inverse)
+        return _ozaki_or_fallback(x, inverse, hq=False)
 
     if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
         return _fft_via_gemm(x, inverse)
