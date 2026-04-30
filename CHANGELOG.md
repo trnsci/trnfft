@@ -7,7 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.20.0] - 2026-04-17
+## [0.21.0] - 2026-04-30
+
+### Added
+
+- **Stage-parallel FFT** (`_stage_parallel_fft` in `trnfft/nki/multicore.py`). Enables
+  single-transform multi-core execution for composite N via the row-column (Cooley-Tukey
+  2D) decomposition. No NKI inter-core communication primitive required — the twiddle
+  multiply between phases is the "inter-core exchange" and runs in FP32 on the host.
+
+  Algorithm for N = n1 × n2:
+  1. Reshape x to (n1, n2)
+  2. Column DFTs: batch of n2 size-n1 FFTs (dispatched via `_batch_split_fft`)
+  3. Twiddle: Z[k1, l] × exp(sign·2πi·l·k1/N)
+  4. Row DFTs: batch of n1 size-n2 FFTs
+  5. Column-major flatten: X_flat[k] = X_2d[k%n1, k//n1]
+
+  Only beneficial for N > ~2^17 where single-core SBUF becomes the bottleneck.
+  For prime N, `multi_core_fft` raises `NotImplementedError` with a clear message.
+
+- `_factorize(n)` — returns (n1, n2) with n1*n2=n and n1 ≈ sqrt(n); raises ValueError
+  for prime n.
+- `scripts/run_precision_characterization.sh` — focused SSM script for running
+  `TestOzakiHQCharacterization` on trn1 (5–10 min vs 30 min for full neuron suite).
+- Extended `tests/test_multicore.py` with `TestFactorize`, `TestStageParallelFFT`, and
+  `TestMultiCoreSingleTransform` classes.
+
+### Changed
+
+- `multi_core_fft`: single-transform inputs now route to `_stage_parallel_fft` for
+  composite N instead of unconditionally raising `NotImplementedError`.
+
+## [0.20.0] - 2026-04-29
 
 ### Added
 

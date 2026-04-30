@@ -17,7 +17,9 @@ import torch
 from trnfft.complex import ComplexTensor
 from trnfft.nki.multicore import (
     _batch_split_fft,
+    _factorize,
     _resolve_num_cores,
+    _stage_parallel_fft,
     get_multicore,
     multi_core_fft,
     set_multicore,
@@ -58,12 +60,20 @@ class TestMulticoreAPI:
         assert result.real.shape == (4, n)
         assert result.imag.shape == (4, n)
 
-    def test_multi_core_fft_single_transform_raises(self):
-        """Single 1-D input raises NotImplementedError when multicore enabled."""
+    def test_multi_core_fft_single_transform_prime_raises(self):
+        """Single 1-D prime-N input raises NotImplementedError when multicore enabled."""
         set_multicore(True)
-        x = ComplexTensor(torch.randn(64), torch.randn(64))
-        with pytest.raises(NotImplementedError, match="Stage parallelism"):
+        x = ComplexTensor(torch.randn(7), torch.randn(7))
+        with pytest.raises(NotImplementedError, match="prime"):
             multi_core_fft(x)
+
+    def test_multi_core_fft_single_transform_composite_succeeds(self):
+        """Single 1-D composite-N input succeeds via stage-parallel path."""
+        set_multicore(True)
+        n = 64  # 8 × 8
+        ct = ComplexTensor(torch.randn(n), torch.zeros(n))
+        result = multi_core_fft(ct)
+        assert result.real.shape == (n,)
 
 
 class TestBatchSplitCPU:
@@ -177,3 +187,109 @@ class TestResolveNumCores:
         assert _resolve_num_cores(batch_size=1) == 1
         assert _resolve_num_cores(batch_size=4) == 2
         assert _resolve_num_cores(batch_size=2) == 2
+
+
+class TestFactorize:
+    @pytest.mark.parametrize(
+        "n,expected_product",
+        [(4, 4), (64, 64), (256, 256), (1024, 1024), (65536, 65536)],
+    )
+    def test_factorize_product_is_n(self, n, expected_product):
+        n1, n2 = _factorize(n)
+        assert n1 * n2 == expected_product
+
+    def test_factorize_n1_leq_sqrt_n(self):
+        import math
+
+        for n in [4, 16, 64, 256, 1024]:
+            n1, n2 = _factorize(n)
+            assert n1 <= math.sqrt(n) + 1
+            assert n1 >= 1
+
+    def test_factorize_prime_raises(self):
+        with pytest.raises(ValueError, match="prime"):
+            _factorize(65537)
+
+    def test_factorize_prime_small(self):
+        with pytest.raises(ValueError):
+            _factorize(7)
+
+
+class TestStageParallelFFT:
+    """CPU correctness tests for row-column stage-parallel FFT."""
+
+    @pytest.mark.parametrize("n", [4, 16, 64, 256, 1024])
+    def test_stage_parallel_matches_single_core(self, n):
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        ct = ComplexTensor(x, torch.zeros(n))
+
+        from trnfft.fft_core import fft_core
+
+        expected = fft_core(ct)
+        actual = _stage_parallel_fft(ct, num_cores=2, inverse=False)
+
+        np.testing.assert_allclose(
+            actual.real.numpy(),
+            expected.real.numpy(),
+            rtol=1e-4,
+            atol=1e-4,
+            err_msg=f"N={n}: real mismatch",
+        )
+        np.testing.assert_allclose(
+            actual.imag.numpy(),
+            expected.imag.numpy(),
+            rtol=1e-4,
+            atol=1e-4,
+            err_msg=f"N={n}: imag mismatch",
+        )
+
+    @pytest.mark.parametrize("n", [64, 256, 1024])
+    def test_stage_parallel_roundtrip(self, n):
+        torch.manual_seed(7)
+        x = torch.randn(n)
+        ct = ComplexTensor(x, torch.zeros(n))
+
+        X = _stage_parallel_fft(ct, num_cores=2, inverse=False)
+        back = _stage_parallel_fft(X, num_cores=2, inverse=True)
+
+        np.testing.assert_allclose(
+            back.real.numpy(), x.numpy(), atol=1e-4, err_msg=f"N={n}: roundtrip mismatch"
+        )
+
+    def test_stage_parallel_output_shape(self):
+        for n in [4, 64, 256]:
+            ct = ComplexTensor(torch.randn(n), torch.zeros(n))
+            result = _stage_parallel_fft(ct, num_cores=2, inverse=False)
+            assert result.real.shape == (n,), f"N={n}: shape {result.real.shape}"
+
+    def test_stage_parallel_output_dtype_fp32(self):
+        ct = ComplexTensor(torch.randn(64), torch.zeros(64))
+        result = _stage_parallel_fft(ct, num_cores=2, inverse=False)
+        assert result.real.dtype == torch.float32
+        assert result.imag.dtype == torch.float32
+
+
+class TestMultiCoreSingleTransform:
+    """multi_core_fft single-transform routing tests."""
+
+    def test_single_transform_composite_n(self):
+        """Composite N routes to stage-parallel, produces correct output."""
+        set_multicore(True)
+        n = 64
+        torch.manual_seed(42)
+        ct = ComplexTensor(torch.randn(n), torch.zeros(n))
+
+        from trnfft.fft_core import fft_core
+
+        expected = fft_core(ct)
+        actual = multi_core_fft(ct)
+
+        np.testing.assert_allclose(actual.real.numpy(), expected.real.numpy(), rtol=1e-4, atol=1e-4)
+
+    def test_single_transform_prime_n_raises(self):
+        """Prime N raises NotImplementedError with helpful message."""
+        set_multicore(True)
+        ct = ComplexTensor(torch.randn(7), torch.zeros(7))
+        with pytest.raises(NotImplementedError, match="prime"):
+            multi_core_fft(ct)
