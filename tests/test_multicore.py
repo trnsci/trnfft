@@ -60,12 +60,20 @@ class TestMulticoreAPI:
         assert result.real.shape == (4, n)
         assert result.imag.shape == (4, n)
 
-    def test_multi_core_fft_single_transform_raises(self):
-        """Single 1-D input raises NotImplementedError when multicore enabled."""
+    def test_multi_core_fft_single_transform_prime_raises(self):
+        """Single 1-D prime-N input raises NotImplementedError when multicore enabled."""
         set_multicore(True)
-        x = ComplexTensor(torch.randn(64), torch.randn(64))
-        with pytest.raises(NotImplementedError, match="Stage parallelism"):
+        x = ComplexTensor(torch.randn(7), torch.randn(7))
+        with pytest.raises(NotImplementedError, match="prime"):
             multi_core_fft(x)
+
+    def test_multi_core_fft_single_transform_composite_succeeds(self):
+        """Single 1-D composite-N input succeeds via stage-parallel path."""
+        set_multicore(True)
+        n = 64  # 8 × 8
+        ct = ComplexTensor(torch.randn(n), torch.zeros(n))
+        result = multi_core_fft(ct)
+        assert result.real.shape == (n,)
 
 
 class TestBatchSplitCPU:
