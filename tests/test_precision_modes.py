@@ -33,7 +33,8 @@ def _bluestein_rel_error(n: int, precision: str, seed: int = 42) -> float:
     finally:
         set_precision(old)
 
-    y_cplx = y.real.numpy() + 1j * y.imag.numpy()
+    # .cpu() is a no-op on CPU; required on XLA (Trainium) to copy before numpy().
+    y_cplx = y.real.cpu().numpy() + 1j * y.imag.cpu().numpy()
     return float(np.abs(y_cplx - ref).max() / np.abs(ref).max())
 
 
