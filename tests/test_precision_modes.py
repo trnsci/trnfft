@@ -401,16 +401,21 @@ class TestOzakiHQPrecision:
 class TestOzakiHQCharacterization:
     """On-silicon precision characterization for ``trnfft.set_precision("ozaki_hq")``.
 
-    Forces the DFT-GEMM path (ensures _DFT_GEMM_THRESHOLD >= n) so the 6-term
-    2-level Ozaki path runs on hardware.  Records 1-level vs 2-level Ozaki rel
-    error at N ∈ {64, 128, 256} and asserts 2-level is strictly better.
+    Records 1-level vs 2-level Ozaki rel error vs scipy fp64 at N ∈ {64, 128, 256}.
+    This test MEASURES and PRINTS — it does not assert theoretical precision bounds.
 
-    Expected hardware results:
-      - "ozaki" (1-level):    O(sqrt(N)·u_bf16²) ≈ 1.6e-5 at N=64
-      - "ozaki_hq" (2-level): O(sqrt(N)·u_bf16⁴) ≈ 2e-9  at N=64
-      - improvement ≈ 10 000× at N=64
+    Measured hardware results (trn1, SDK 2.29.0, 2026-04-30):
+      - "ozaki" (1-level):    ~1.7e-3 at N=64 (≈ single-pass BF16)
+      - "ozaki_hq" (2-level): ~1.7e-3 at N=64 (same as 1-level)
 
-    Run on trn1 to fill the hardware precision table in the CHANGELOG and blog.
+    Both modes give hardware precision equivalent to a single BF16 DFT-GEMM. The
+    ORO split corrects INPUT quantization error (BF16(W) and BF16(x)), but the
+    Trainium Tensor Engine rounds BF16 PRODUCTS before PSUM accumulation. That
+    per-product rounding (~u_bf16 per product) is not captured by the split and
+    dominates the error budget. The split scheme works as expected on CPU (where
+    the BF16 fallback promotes to FP32 before matmul), but not on hardware.
+
+    The hard assertion is only a sanity check: the result is a valid FFT (not NaN/Inf).
     """
 
     @pytest.mark.parametrize("n", [64, 128, 256])
@@ -423,18 +428,15 @@ class TestOzakiHQCharacterization:
             ozaki_err = _bluestein_rel_error(n, "ozaki")
             hq_err = _bluestein_rel_error(n, "ozaki_hq")
             ratio = ozaki_err / hq_err if hq_err > 0 else float("inf")
-            print(
-                f"\nN={n}: ozaki={ozaki_err:.2e}  ozaki_hq={hq_err:.2e}  improvement={ratio:.1f}×"
-            )
-            assert hq_err < ozaki_err, (
-                f"N={n}: ozaki_hq ({hq_err:.2e}) not better than ozaki ({ozaki_err:.2e})"
-            )
-            assert hq_err < 1e-6, f"N={n}: ozaki_hq rel error {hq_err:.2e} exceeds 1e-6 bound"
+            print(f"\nN={n}: ozaki={ozaki_err:.2e}  ozaki_hq={hq_err:.2e}  ratio={ratio:.1f}×")
+            # Sanity: result is a valid FFT, not garbage.
+            assert hq_err < 0.5, f"N={n}: ozaki_hq {hq_err:.2e} not a valid FFT result"
+            assert ozaki_err < 0.5, f"N={n}: ozaki {ozaki_err:.2e} not a valid FFT result"
         finally:
             fft_core._DFT_GEMM_THRESHOLD = old_thr
 
     def test_ozaki_hq_single_n64(self):
-        """Focused N=64 test; easiest to read in CI output and the blog table."""
+        """Focused N=64 summary; printed output goes into the CHANGELOG."""
         from trnfft import fft_core
 
         n = 64
@@ -443,14 +445,15 @@ class TestOzakiHQCharacterization:
         try:
             ozaki_err = _bluestein_rel_error(n, "ozaki")
             hq_err = _bluestein_rel_error(n, "ozaki_hq")
+            bf16_err = _bluestein_rel_error(n, "bf16")
             print(
-                f"\n2-level Ozaki characterization (N=64, trn1):\n"
-                f"  ozaki (1-level)    error = {ozaki_err:.3e}\n"
-                f"  ozaki_hq (2-level) error = {hq_err:.3e}\n"
-                f"  ratio ozaki/ozaki_hq = {ozaki_err / hq_err:.1f}×"
+                f"\nOzaki hardware precision characterization (N=64, trn1):\n"
+                f"  bf16 (1 matmul)    error = {bf16_err:.3e}\n"
+                f"  ozaki (3 matmuls)  error = {ozaki_err:.3e}\n"
+                f"  ozaki_hq (6 mat.)  error = {hq_err:.3e}\n"
+                f"  ozaki improvement over bf16 = {bf16_err / ozaki_err:.1f}×\n"
+                f"  hq improvement over ozaki   = {ozaki_err / hq_err:.1f}×"
             )
-            assert hq_err < ozaki_err, (
-                f"ozaki_hq ({hq_err:.2e}) not better than ozaki ({ozaki_err:.2e})"
-            )
+            assert hq_err < 0.5
         finally:
             fft_core._DFT_GEMM_THRESHOLD = old_thr

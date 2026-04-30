@@ -85,7 +85,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | 256 | 6 417      | 3 451      | 1 300     | 1.86×    | 3.41×   |
 
   The ~1.9× overhead vs 1-level Ozaki (not 2×) reflects kernel-call pipelining.
-  Precision characterisation on hardware (actual BF16 matmuls) pending.
+  Hardware precision (trn1, SDK 2.29.0, 2026-04-30): both `ozaki` and `ozaki_hq`
+  measure ~1.7e-3 rel error at N=64 — equivalent to a single-pass BF16 DFT-GEMM.
+  The ORO split corrects input quantization error (BF16 W and x), but the Trainium
+  Tensor Engine rounds BF16 products before PSUM accumulation; that per-product
+  rounding dominates and is not captured by the split. The scheme works as theorised
+  on CPU (where the complex_gemm_bf16 fallback promotes inputs to FP32 before matmul),
+  but not on hardware. Throughput improvement from the multi-term structure remains
+  valid (3× / 6× BF16 latency); only the precision claim is revised.
+
+  | mode      | hardware rel error (N=64) | CPU rel error (N=64) |
+  | --------- | ------------------------- | -------------------- |
+  | bf16      | ~1.7e-3                   | ~2.2e-3              |
+  | ozaki     | ~1.7e-3                   | ~1.6e-5              |
+  | ozaki_hq  | ~1.7e-3                   | ~1.4e-7              |
 
 - `_ozaki_split_3way_bf16(x)` — 3-way ORO split returning (x_h1, x_h2, x_h3) BF16,
   using FP32 for the intermediate residual before the second quantisation.
