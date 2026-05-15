@@ -94,11 +94,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but not on hardware. Throughput improvement from the multi-term structure remains
   valid (3× / 6× BF16 latency); only the precision claim is revised.
 
-  | mode      | hardware rel error (N=64) | CPU rel error (N=64) |
-  | --------- | ------------------------- | -------------------- |
-  | bf16      | ~1.7e-3                   | ~2.2e-3              |
-  | ozaki     | ~1.7e-3                   | ~1.6e-5              |
-  | ozaki_hq  | ~1.7e-3                   | ~1.4e-7              |
+  | mode      | trn1 rel error (N=64) | trn2 rel error (N=64) | CPU rel error (N=64) |
+  | --------- | --------------------- | --------------------- | -------------------- |
+  | bf16      | ~1.5e-3               | ~1.5e-3               | ~2.2e-3              |
+  | ozaki     | ~1.7e-3               | ~1.7e-3               | ~1.6e-5              |
+  | ozaki_hq  | ~1.7e-3               | ~1.7e-3               | ~1.4e-7              |
+
+  trn2.3xlarge (sa-east-1, SDK 2.29.0, 2026-05-01): identical to trn1. Both
+  hardware generations round BF16×BF16 products to BF16 before PSUM. The NKI
+  Bootcamp phrase "BF16 products computed at full precision internally" refers to
+  the FP32 PSUM accumulator, not the individual product precision. trn3 MXFP8
+  (`nisa.nc_matmul_mx`) with FP32 accumulation is the next test point.
 
 - `_ozaki_split_3way_bf16(x)` — 3-way ORO split returning (x_h1, x_h2, x_h3) BF16,
   using FP32 for the intermediate residual before the second quantisation.
