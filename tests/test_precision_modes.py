@@ -428,55 +428,56 @@ class TestOzakiHQPrecision:
 
 @pytest.mark.neuron
 class TestOzakiHQCharacterization:
-    """On-silicon precision characterization for ``trnfft.set_precision("ozaki_hq")``.
+    """On-silicon precision characterization for the Ozaki DFT-GEMM paths.
 
-    Records 1-level vs 2-level Ozaki rel error vs scipy fp64 at N ∈ {64, 128, 256}.
+    Bypasses the hardware-verification gate (sets _OZAKI_PRODUCT_PRECISION_VERIFIED=True
+    temporarily) so the actual Ozaki kernels run rather than the BF16 fallback.
+    Records bf16, ozaki, and ozaki_hq rel error at N ∈ {64, 128, 256}.
     This test MEASURES and PRINTS — it does not assert theoretical precision bounds.
 
     Measured hardware results (trn1, SDK 2.29.0, 2026-04-30):
-      - "ozaki" (1-level):    ~1.7e-3 at N=64 (≈ single-pass BF16)
-      - "ozaki_hq" (2-level): ~1.7e-3 at N=64 (same as 1-level)
+      - "bf16" (1 matmul):    ~1.7e-3 at N=64
+      - "ozaki" (3 matmuls):  ~1.7e-3 at N=64  (no improvement: BF16 products before PSUM)
+      - "ozaki_hq" (6 mat.):  ~1.7e-3 at N=64  (same)
 
-    Both modes give hardware precision equivalent to a single BF16 DFT-GEMM. The
-    ORO split corrects INPUT quantization error (BF16(W) and BF16(x)), but the
-    Trainium Tensor Engine rounds BF16 PRODUCTS before PSUM accumulation. That
-    per-product rounding (~u_bf16 per product) is not captured by the split and
-    dominates the error budget. The split scheme works as expected on CPU (where
-    the BF16 fallback promotes to FP32 before matmul), but not on hardware.
-
-    The hard assertion is only a sanity check: the result is a valid FFT (not NaN/Inf).
+    Measured hardware results (trn2.3xlarge, SDK 2.29.0, 2026-05-01): TBD
     """
 
     @pytest.mark.parametrize("n", [64, 128, 256])
     def test_ozaki_hq_error_vs_fp64(self, n):
         from trnfft import fft_core
+        from trnfft.fft_core import set_ozaki_product_precision_verified
 
         old_thr = fft_core._DFT_GEMM_THRESHOLD
         fft_core._DFT_GEMM_THRESHOLD = max(n, old_thr)
+        # Force the actual Ozaki kernel — bypass the hardware-verification gate.
+        set_ozaki_product_precision_verified(True)
         try:
             ozaki_err = _bluestein_rel_error(n, "ozaki")
             hq_err = _bluestein_rel_error(n, "ozaki_hq")
             ratio = ozaki_err / hq_err if hq_err > 0 else float("inf")
             print(f"\nN={n}: ozaki={ozaki_err:.2e}  ozaki_hq={hq_err:.2e}  ratio={ratio:.1f}×")
-            # Sanity: result is a valid FFT, not garbage.
             assert hq_err < 0.5, f"N={n}: ozaki_hq {hq_err:.2e} not a valid FFT result"
             assert ozaki_err < 0.5, f"N={n}: ozaki {ozaki_err:.2e} not a valid FFT result"
         finally:
             fft_core._DFT_GEMM_THRESHOLD = old_thr
+            set_ozaki_product_precision_verified(False)
 
     def test_ozaki_hq_single_n64(self):
         """Focused N=64 summary; printed output goes into the CHANGELOG."""
         from trnfft import fft_core
+        from trnfft.fft_core import set_ozaki_product_precision_verified
 
         n = 64
         old_thr = fft_core._DFT_GEMM_THRESHOLD
         fft_core._DFT_GEMM_THRESHOLD = max(n, old_thr)
+        set_ozaki_product_precision_verified(True)
         try:
+            bf16_err = _bluestein_rel_error(n, "bf16")
             ozaki_err = _bluestein_rel_error(n, "ozaki")
             hq_err = _bluestein_rel_error(n, "ozaki_hq")
-            bf16_err = _bluestein_rel_error(n, "bf16")
             print(
-                f"\nOzaki hardware precision characterization (N=64, trn1):\n"
+                f"\nOzaki hardware precision characterization (N=64):\n"
                 f"  bf16 (1 matmul)    error = {bf16_err:.3e}\n"
                 f"  ozaki (3 matmuls)  error = {ozaki_err:.3e}\n"
                 f"  ozaki_hq (6 mat.)  error = {hq_err:.3e}\n"
@@ -486,3 +487,4 @@ class TestOzakiHQCharacterization:
             assert hq_err < 0.5
         finally:
             fft_core._DFT_GEMM_THRESHOLD = old_thr
+            set_ozaki_product_precision_verified(False)

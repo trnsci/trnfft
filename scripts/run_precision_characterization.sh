@@ -34,8 +34,16 @@ echo "Instance: $INSTANCE_ID"
 cleanup() {
   local exit_code=$?
   echo ""
-  echo "Stopping $INSTANCE_ID..."
-  aws ec2 stop-instances --instance-ids "$INSTANCE_ID" --region "$REGION" >/dev/null
+  # Spot instances (one-time) cannot be stopped — terminate instead.
+  LIFECYCLE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
+    --query 'Reservations[0].Instances[0].InstanceLifecycle' --output text 2>/dev/null || echo "none")
+  if [[ "$LIFECYCLE" == "spot" ]]; then
+    echo "Terminating spot instance $INSTANCE_ID..."
+    aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$REGION" >/dev/null
+  else
+    echo "Stopping $INSTANCE_ID..."
+    aws ec2 stop-instances --instance-ids "$INSTANCE_ID" --region "$REGION" >/dev/null
+  fi
   exit "$exit_code"
 }
 trap cleanup EXIT
@@ -65,6 +73,33 @@ for i in $(seq 1 30); do
   if [[ "$STATUS" == "Online" ]]; then echo "SSM agent online."; break; fi
   if [[ $i -eq 30 ]]; then echo "ERROR: SSM agent not online" >&2; exit 1; fi
   sleep 10
+done
+
+# Wait for user_data (git clone + pip install) to complete on fresh instances.
+echo "Waiting for /home/ubuntu/trnfft to exist (user_data may still be running)..."
+for i in $(seq 1 40); do
+  CHECK_ID=$(aws ssm send-command \
+    --instance-ids "$INSTANCE_ID" \
+    --document-name "AWS-RunShellScript" \
+    --parameters '{"commands":["test -d /home/ubuntu/trnfft && echo READY || echo NOT_READY"],"executionTimeout":["15"]}' \
+    --region "$REGION" \
+    --output text --query 'Command.CommandId' 2>/dev/null) || true
+  if [[ -n "$CHECK_ID" ]]; then
+    sleep 5
+    CHECK_OUT=$(aws ssm get-command-invocation \
+      --command-id "$CHECK_ID" --instance-id "$INSTANCE_ID" \
+      --region "$REGION" --query 'StandardOutputContent' --output text 2>/dev/null || echo "")
+    if echo "$CHECK_OUT" | grep -q "READY"; then
+      echo "Repo ready."
+      break
+    fi
+  fi
+  if [[ $i -eq 40 ]]; then
+    echo "ERROR: /home/ubuntu/trnfft not found after 10 min; user_data may have failed" >&2
+    exit 1
+  fi
+  echo "  [$i] waiting for user_data... (15s)"
+  sleep 15
 done
 
 echo "Running TestOzakiHQCharacterization @ SHA=$SHA..."

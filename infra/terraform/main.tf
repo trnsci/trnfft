@@ -27,6 +27,18 @@ variable "instance_tag" {
   default     = "trnfft-ci-trn1"
 }
 
+variable "use_spot" {
+  description = "Use spot instances (cheaper, may be interrupted)"
+  type        = bool
+  default     = false
+}
+
+variable "spot_max_price" {
+  description = "Maximum spot price (on-demand price used if empty)"
+  type        = string
+  default     = ""
+}
+
 variable "vpc_id" {
   description = "VPC to place the instance in"
   type        = string
@@ -116,6 +128,18 @@ resource "aws_instance" "ci" {
   root_block_device {
     volume_size = 100
     volume_type = "gp3"
+  }
+
+  dynamic "instance_market_options" {
+    for_each = var.use_spot ? [1] : []
+    content {
+      market_type = "spot"
+      spot_options {
+        max_price                      = var.spot_max_price != "" ? var.spot_max_price : null
+        instance_interruption_behavior = "terminate"
+        spot_instance_type             = "one-time"
+      }
+    }
   }
 
   user_data = <<-EOF
