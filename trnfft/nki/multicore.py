@@ -299,8 +299,10 @@ def _neuron_dp_dispatch(
     if cache_key not in _dp_model_cache:
         sample = torch.zeros(shard_size, n)
         module = _FFTModule(n, inverse)
-        traced = torch.jit.trace(module, (sample, sample))
-        neuron_model = torch_neuronx.trace(traced, (sample, sample))
+        # Pass the raw nn.Module directly — torch_neuronx.trace handles its own
+        # JIT tracing internally. Pre-tracing with torch.jit.trace first causes
+        # a layout assertion failure in torch_neuronx's structure flattener.
+        neuron_model = torch_neuronx.trace(module, (sample, sample))
         dp_model = torch_neuronx.DataParallel(neuron_model)
         _dp_model_cache[cache_key] = dp_model
 
