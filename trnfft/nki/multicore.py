@@ -49,7 +49,10 @@ HAS_TORCH_NEURONX = importlib.util.find_spec("torch_neuronx") is not None
 #   _NEURONLINK_THRESHOLD = 2**17  # only pays off at large N on trn2
 #
 # Measured: SDK 2.29.0 and 2.29.1 do not include nki.collectives (sa-east-1, 2026-05-01).
-HAS_COLLECTIVES = importlib.util.find_spec("nki.collectives") is not None
+try:
+    HAS_COLLECTIVES = importlib.util.find_spec("nki.collectives") is not None
+except (ModuleNotFoundError, ValueError):
+    HAS_COLLECTIVES = False
 
 # Disabled by default. Enable via TRNFFT_MULTICORE=1 or set_multicore(True).
 _use_multicore = os.environ.get("TRNFFT_MULTICORE", "0") == "1"
