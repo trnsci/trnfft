@@ -60,9 +60,7 @@ _use_multicore = os.environ.get("TRNFFT_MULTICORE", "0") == "1"
 # Default target NeuronCore count. 0 means "all available" (resolved at dispatch).
 _num_cores: int = 0
 
-# Cache of compiled DataParallel models keyed by (n, inverse, num_cores).
-# On CPU this stays empty; on Neuron hardware the first call per key is slow
-# (torch_neuronx.trace + DataParallel init), subsequent calls are fast.
+# Reserved for future compiled-model cache (SDK 2.30+ DataParallel path).
 _dp_model_cache: dict[tuple, object] = {}
 
 
@@ -262,22 +260,6 @@ def _batch_split_fft(x: ComplexTensor, inverse: bool, num_cores: int) -> Complex
     return ComplexTensor(out_real, out_imag)
 
 
-class _FFTModule(torch.nn.Module):
-    """Thin nn.Module wrapper for fft_core, required by torch_neuronx.DataParallel."""
-
-    def __init__(self, n: int, inverse: bool) -> None:
-        super().__init__()
-        self.n = n
-        self.inverse = inverse
-
-    def forward(self, real: torch.Tensor, imag: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        from ..complex import ComplexTensor
-        from ..fft_core import fft_core
-
-        y = fft_core(ComplexTensor(real, imag), inverse=self.inverse)
-        return y.real, y.imag
-
-
 def _neuron_dp_dispatch(
     real_shards: tuple[torch.Tensor, ...],
     imag_shards: tuple[torch.Tensor, ...],
@@ -285,30 +267,24 @@ def _neuron_dp_dispatch(
     inverse: bool,
     num_cores: int,
 ) -> list[ComplexTensor]:
-    """Dispatch shards via torch_neuronx compiled model (Neuron hardware only).
+    """Dispatch shards via NKI fft_core on Neuron hardware.
 
-    Compiles and caches one neuron model per (n, inverse, shard_size) key.
-    Each shard is dispatched sequentially through the compiled model.
-    torch_neuronx handles NeuronCore placement; DataParallel is not used
-    because its internal flattener asserts layout equality across calls and
-    fails when shard sizes differ across benchmark configurations.
+    SDK 2.29 (NKI 0.3.0): torch_neuronx.trace + DataParallel fails when
+    multiple shapes are compiled in the same process — the internal structure
+    flattener asserts layout equality across forward() calls, breaking when
+    different benchmark configs produce different shard sizes. Tracked for
+    re-evaluation on SDK 2.30+.
+
+    Current approach: call fft_core per shard. fft_core routes through the
+    NKI dispatch layer (NEFF-compiled kernels, cached per shape). This gives
+    NKI kernel acceleration on each shard without the DataParallel layer.
+    True cross-core parallelism requires the NeuronLink collectives path
+    (HAS_COLLECTIVES, SDK ≥ 2.30).
     """
-    import torch_neuronx
-
     from ..complex import ComplexTensor
-
-    shard_size = real_shards[0].shape[0]
-    cache_key = (n, inverse, shard_size)
-    if cache_key not in _dp_model_cache:
-        sample = torch.zeros(shard_size, n)
-        module = _FFTModule(n, inverse)
-        neuron_model = torch_neuronx.trace(module, example_inputs=(sample, sample))
-        _dp_model_cache[cache_key] = neuron_model
-
-    neuron_model = _dp_model_cache[cache_key]
+    from ..fft_core import fft_core
 
     results = []
     for r_shard, i_shard in zip(real_shards, imag_shards, strict=True):
-        r_out, i_out = neuron_model(r_shard, i_shard)
-        results.append(ComplexTensor(r_out, i_out))
+        results.append(fft_core(ComplexTensor(r_shard, i_shard), inverse=inverse))
     return results
