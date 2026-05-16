@@ -212,7 +212,7 @@ def _ozaki_or_fallback(x: ComplexTensor, inverse: bool, hq: bool) -> ComplexTens
             "trnfft.set_ozaki_product_precision_verified(True) if ozaki_err ≪ bf16_err. "
             "Falling back to precision='bf16'.",
             RuntimeWarning,
-            stacklevel=4,
+            stacklevel=2,
         )
         return _fft_via_gemm_bf16(x, inverse)
     return _fft_via_ozaki_hq(x, inverse) if hq else _fft_via_ozaki(x, inverse)
