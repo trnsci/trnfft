@@ -302,7 +302,7 @@ def _neuron_dp_dispatch(
     if cache_key not in _dp_model_cache:
         sample = torch.zeros(shard_size, n)
         module = _FFTModule(n, inverse)
-        neuron_model = torch_neuronx.trace(module, [sample, sample])
+        neuron_model = torch_neuronx.trace(module, example_inputs=(sample, sample))
         _dp_model_cache[cache_key] = neuron_model
 
     neuron_model = _dp_model_cache[cache_key]
