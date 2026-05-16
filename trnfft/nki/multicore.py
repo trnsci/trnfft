@@ -285,31 +285,30 @@ def _neuron_dp_dispatch(
     inverse: bool,
     num_cores: int,
 ) -> list[ComplexTensor]:
-    """Dispatch shards via torch_neuronx.DataParallel (Neuron hardware only).
+    """Dispatch shards via torch_neuronx compiled model (Neuron hardware only).
 
-    Compiles and caches a DataParallel model on first call for a given
-    (n, inverse, num_cores) key. Subsequent calls skip compilation.
+    Compiles and caches one neuron model per (n, inverse, shard_size) key.
+    Each shard is dispatched sequentially through the compiled model.
+    torch_neuronx handles NeuronCore placement; DataParallel is not used
+    because its internal flattener asserts layout equality across calls and
+    fails when shard sizes differ across benchmark configurations.
     """
     import torch_neuronx
 
     from ..complex import ComplexTensor
 
     shard_size = real_shards[0].shape[0]
-    cache_key = (n, inverse, num_cores, shard_size)
+    cache_key = (n, inverse, shard_size)
     if cache_key not in _dp_model_cache:
         sample = torch.zeros(shard_size, n)
         module = _FFTModule(n, inverse)
-        # Pass the raw nn.Module directly — torch_neuronx.trace handles its own
-        # JIT tracing internally. Pre-tracing with torch.jit.trace first causes
-        # a layout assertion failure in torch_neuronx's structure flattener.
-        neuron_model = torch_neuronx.trace(module, (sample, sample))
-        dp_model = torch_neuronx.DataParallel(neuron_model)
-        _dp_model_cache[cache_key] = dp_model
+        neuron_model = torch_neuronx.trace(module, [sample, sample])
+        _dp_model_cache[cache_key] = neuron_model
 
-    dp_model = _dp_model_cache[cache_key]
+    neuron_model = _dp_model_cache[cache_key]
 
     results = []
     for r_shard, i_shard in zip(real_shards, imag_shards, strict=True):
-        r_out, i_out = dp_model(r_shard, i_shard)
+        r_out, i_out = neuron_model(r_shard, i_shard)
         results.append(ComplexTensor(r_out, i_out))
     return results
