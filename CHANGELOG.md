@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-05-15
+
+### Added
+
+- **STFT/ISTFT multi-NeuronCore dispatch** (`trnfft/api.py`). `stft()` and `istft()` now
+  route the inner FFT batch through `multi_core_fft()` instead of `fft_core()`. When
+  `set_multicore(True)` is active, STFT frames — which are independent transforms — are
+  distributed across NeuronCores via `_batch_split_fft`. Behaviour is unchanged when
+  multicore is disabled (falls back to `fft_core`). No API changes.
+
+  A 16 kHz 1-s waveform with n_fft=512, hop=256 produces ~62 frames; each frame is an
+  independent length-512 FFT, making STFT a natural batch workload for data-parallel
+  multi-core dispatch.
+
+- `benchmarks/bench_fft.py::TestSTFTMulticore` — hardware benchmark comparing multicore
+  vs single-core STFT at n_fft ∈ {128, 256, 512}. Added to `scripts/run_benchmarks.sh`.
+
+- `HAS_COLLECTIVES` capability flag in `trnfft/nki/multicore.py`. Checks for
+  `nki.collectives` at import time. Currently False on all available AMIs (SDK 2.29.x).
+  Documents the NeuronLink stage-parallel forward path for SDK ≥ 2.30.
+
+  trn2 benchmark results (sa-east-1b, SDK 2.29.1): pending hardware run.
+
 ## [0.21.0] - 2026-04-30
 
 ### Added

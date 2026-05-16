@@ -519,6 +519,29 @@ class TestSTFT:
         benchmark(torch.stft, waveform, n_fft=n_fft, hop_length=hop, return_complex=True)
 
 
+class TestSTFTMulticore:
+    """STFT routed through multi-NeuronCore batch-split FFT (v0.22).
+
+    Frames are independent transforms: a 16 kHz 1-s waveform at n_fft=512/hop=256
+    produces ~62 frames — dispatched as a batch of 62 independent FFTs across
+    NeuronCores. Baseline is TestSTFT (single-core) for throughput comparison.
+    """
+
+    @pytest.mark.neuron
+    def test_stft_multicore_nki(self, benchmark, waveform, stft_config):
+        from trnfft.nki.multicore import set_multicore
+
+        n_fft, hop = stft_config
+        set_multicore(True)
+        _set("nki")
+        try:
+            _warm(trnfft.stft, waveform, n_fft=n_fft, hop_length=hop)
+            benchmark(trnfft.stft, waveform, n_fft=n_fft, hop_length=hop)
+        finally:
+            _set("auto")
+            set_multicore(False)
+
+
 # ---------------------------------------------------------------------------
 # Complex GEMM
 # ---------------------------------------------------------------------------

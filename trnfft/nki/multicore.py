@@ -36,6 +36,21 @@ if TYPE_CHECKING:
 
 HAS_TORCH_NEURONX = importlib.util.find_spec("torch_neuronx") is not None
 
+# NeuronLink collectives (nki.collectives) require SDK ≥ 2.30 (NKI ≥ 0.4.0).
+# Current minimum: NKI 0.3.0 (SDK 2.29). Checked once at import time.
+#
+# When HAS_COLLECTIVES is True, stage-parallel FFT for large single transforms
+# (N > _NEURONLINK_THRESHOLD) will use device-side twiddle + all_reduce instead
+# of the current host-side twiddle multiply between _batch_split_fft phases.
+# This eliminates two HBM roundtrips per stage-parallel transform at large N.
+#
+# Implementation path (SDK 2.30+):
+#   _stage_parallel_fft_neuronlink(): fused twiddle kernel + nki.collectives.all_reduce
+#   _NEURONLINK_THRESHOLD = 2**17  # only pays off at large N on trn2
+#
+# Measured: SDK 2.29.0 and 2.29.1 do not include nki.collectives (sa-east-1, 2026-05-01).
+HAS_COLLECTIVES = importlib.util.find_spec("nki.collectives") is not None
+
 # Disabled by default. Enable via TRNFFT_MULTICORE=1 or set_multicore(True).
 _use_multicore = os.environ.get("TRNFFT_MULTICORE", "0") == "1"
 

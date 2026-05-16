@@ -342,7 +342,9 @@ def stft(
     flat_re = frames_complex.real.reshape(-1, n_fft)
     flat_im = frames_complex.imag.reshape(-1, n_fft)
     flat = ComplexTensor(flat_re, flat_im)
-    fft_result = fft_core(flat, inverse=False)
+    from .nki.multicore import multi_core_fft
+
+    fft_result = multi_core_fft(flat, inverse=False)
     result_re = fft_result.real.reshape(orig_shape)
     result_im = fft_result.imag.reshape(orig_shape)
 
@@ -411,7 +413,9 @@ def istft(
     flat_re = spec_re.reshape(-1, n_fft)
     flat_im = spec_im.reshape(-1, n_fft)
     flat = ComplexTensor(flat_re, flat_im)
-    ifft_result = fft_core(flat, inverse=True)
+    from .nki.multicore import multi_core_fft
+
+    ifft_result = multi_core_fft(flat, inverse=True)
     frames = ifft_result.real.reshape(*spec_re.shape[:-1], n_fft)
 
     # Build the window for overlap-add
