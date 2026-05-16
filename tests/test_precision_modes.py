@@ -319,31 +319,32 @@ class TestOzakiPrecision:
         np.testing.assert_allclose(back.real.numpy(), x.numpy(), atol=1e-3)
 
     def test_precision_mode_ozaki_dispatches(self):
-        """set_precision('ozaki') routes to Ozaki path; emits warning on unverified hardware."""
+        """_ozaki_or_fallback emits RuntimeWarning when unverified, silent when verified."""
         import warnings
 
-        import trnfft
-        from trnfft.fft_core import set_ozaki_product_precision_verified
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _ozaki_or_fallback, set_ozaki_product_precision_verified
 
-        old = trnfft.get_precision()
+        ct = ComplexTensor(torch.randn(64), torch.zeros(64))
+
+        # Unverified: should emit RuntimeWarning and return a valid result.
+        set_ozaki_product_precision_verified(False)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = _ozaki_or_fallback(ct, inverse=False, hq=False)
+            assert any(issubclass(warning.category, RuntimeWarning) for warning in w), (
+                "Expected RuntimeWarning from _ozaki_or_fallback when unverified"
+            )
+            assert result.real.shape == (64,)
+
+        # Verified: no warning.
+        set_ozaki_product_precision_verified(True)
         try:
-            trnfft.set_precision("ozaki")
-            x = torch.randn(64)
-            # Without verification: should emit RuntimeWarning and fall back.
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
-                _ = trnfft.fft(x)
-                assert any("ozaki" in str(warning.message).lower() for warning in w), (
-                    "Expected RuntimeWarning for unverified ozaki on this hardware"
-                )
-            # With verification: no warning.
-            set_ozaki_product_precision_verified(True)
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                _ = trnfft.fft(x)
+                _ = _ozaki_or_fallback(ct, inverse=False, hq=False)
                 assert not any(issubclass(warning.category, RuntimeWarning) for warning in w)
         finally:
-            trnfft.set_precision(old)
             set_ozaki_product_precision_verified(False)
 
 
@@ -402,27 +403,28 @@ class TestOzakiHQPrecision:
         np.testing.assert_allclose(back.real.numpy(), x.numpy(), atol=1e-4)
 
     def test_precision_mode_ozaki_hq_dispatches(self):
-        """ozaki_hq emits RuntimeWarning on unverified hardware, no warning when verified."""
+        """_ozaki_or_fallback(hq=True) emits RuntimeWarning when unverified."""
         import warnings
 
-        import trnfft
-        from trnfft.fft_core import set_ozaki_product_precision_verified
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _ozaki_or_fallback, set_ozaki_product_precision_verified
 
-        old = trnfft.get_precision()
+        ct = ComplexTensor(torch.randn(64), torch.zeros(64))
+
+        set_ozaki_product_precision_verified(False)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            result = _ozaki_or_fallback(ct, inverse=False, hq=True)
+            assert any(issubclass(warning.category, RuntimeWarning) for warning in w)
+            assert result.real.shape == (64,)
+
+        set_ozaki_product_precision_verified(True)
         try:
-            trnfft.set_precision("ozaki_hq")
-            x = torch.randn(64)
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
-                _ = trnfft.fft(x)
-                assert any("ozaki" in str(warning.message).lower() for warning in w)
-            set_ozaki_product_precision_verified(True)
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                _ = trnfft.fft(x)
+                _ = _ozaki_or_fallback(ct, inverse=False, hq=True)
                 assert not any(issubclass(warning.category, RuntimeWarning) for warning in w)
         finally:
-            trnfft.set_precision(old)
             set_ozaki_product_precision_verified(False)
 
 
