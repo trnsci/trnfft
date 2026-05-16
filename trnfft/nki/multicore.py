@@ -299,8 +299,8 @@ def _neuron_dp_dispatch(
         shard_size = real_shards[0].shape[0]
         sample = torch.zeros(shard_size, n)
         module = _FFTModule(n, inverse)
-        traced = torch.jit.trace(module, [sample, sample])
-        neuron_model = torch_neuronx.trace(traced, [sample, sample])
+        traced = torch.jit.trace(module, (sample, sample))
+        neuron_model = torch_neuronx.trace(traced, (sample, sample))
         dp_model = torch_neuronx.DataParallel(neuron_model)
         _dp_model_cache[cache_key] = dp_model
 
