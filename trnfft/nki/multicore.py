@@ -294,9 +294,9 @@ def _neuron_dp_dispatch(
 
     from ..complex import ComplexTensor
 
-    cache_key = (n, inverse, num_cores)
+    shard_size = real_shards[0].shape[0]
+    cache_key = (n, inverse, num_cores, shard_size)
     if cache_key not in _dp_model_cache:
-        shard_size = real_shards[0].shape[0]
         sample = torch.zeros(shard_size, n)
         module = _FFTModule(n, inverse)
         traced = torch.jit.trace(module, (sample, sample))
