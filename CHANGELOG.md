@@ -28,7 +28,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nki.collectives` at import time. Currently False on all available AMIs (SDK 2.29.x).
   Documents the NeuronLink stage-parallel forward path for SDK ≥ 2.30.
 
-  trn2 benchmark results (sa-east-1b, SDK 2.29.1): pending hardware run.
+  trn2 hardware results (sa-east-1b, SDK 2.29.1, 2026-05-16) — all 23 benchmarks passed.
+  Note: `torch_neuronx.DataParallel` is not usable for multi-shape dispatch in SDK 2.29
+  (internal structure flattener asserts layout equality across calls). `_batch_split_fft`
+  dispatches shards sequentially through NKI-compiled `fft_core`. True cross-core
+  parallelism deferred to NeuronLink collectives (SDK ≥ 2.30).
+
+  **trn2 vs trn1 throughput (median µs):**
+
+  | Algorithm | N | trn1 (µs) | trn2 (µs) | trn2/trn1 |
+  | --------- | --- | --------- | --------- | --------- |
+  | BF16 DFT-GEMM | 64 | 1 179 | 998 | 0.85× |
+  | BF16 DFT-GEMM | 256 | 1 300 | 1 092 | 0.84× |
+  | Stockham r4 | 64 | 4 322 | 5 986 | 1.39× |
+  | Stockham r4 | 1024 | 6 850 | 8 039 | 1.17× |
+  | Stockham r4 | 4096 | 8 632 | 9 637 | 1.12× |
+  | Stockham r8 | 64 | 4 793 | 5 344 | 1.11× |
+  | Stockham r8 | 4096 | 5 917 | 7 397 | 1.25× |
+  | Stockham mixed | 1024 | 5 863 | 7 324 | 1.25× |
+  | Ozaki (1-level) | 64 | 3 225 | 2 749 | 0.85× |
+  | Ozaki (2-level) | 64 | 6 252 | 5 436 | 0.87× |
+  | STFT multicore | n_fft=128 | — | 3 943 | — |
+  | STFT multicore | n_fft=256 | — | 4 241 | — |
+  | STFT multicore | n_fft=512 | — | 13 366 | — |
+
+  trn2 is 10–16% faster than trn1 for DFT-GEMM / Ozaki paths (memory-bandwidth bound).
+  trn2 is 11–39% slower for Stockham (kernel-launch overhead dominates at small N;
+  trn2's higher clock rate doesn't help if the bottleneck is dispatch latency).
 
 ## [0.21.0] - 2026-04-30
 
