@@ -72,7 +72,7 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
     sign = 1.0 if inverse else -1.0
 
     # Bit-reversal permutation
-    indices = _bit_reverse_indices(n, log2n)
+    indices = _bit_reverse_indices(n, log2n).to(x.real.device)
     re = x.real[..., indices].clone()
     im = x.imag[..., indices].clone()
 
@@ -84,8 +84,8 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
 
         # Twiddle: exp(sign * 2πi * k / m) for k = 0..half-1
         angles = sign * 2.0 * math.pi * torch.arange(half, dtype=re.dtype) / m
-        tw_re = torch.cos(angles)
-        tw_im = torch.sin(angles)
+        tw_re = torch.cos(angles).to(re.device)
+        tw_im = torch.sin(angles).to(re.device)
 
         for k in range(half):
             # All butterflies at position k within their group, across all groups
@@ -696,7 +696,7 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         pad_im = flat_im
     else:
         B_pad = ((B + PMAX - 1) // PMAX) * PMAX
-        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype)
+        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype, device=flat_re.device)
         pad_re = torch.cat([flat_re, padding], dim=0)
         pad_im = torch.cat([flat_im, padding], dim=0)
 
@@ -838,7 +838,7 @@ def _fft_via_stockham_nki_r8(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         pad_im = flat_im
     else:
         B_pad = ((B + PMAX - 1) // PMAX) * PMAX
-        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype)
+        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype, device=flat_re.device)
         pad_re = torch.cat([flat_re, padding], dim=0)
         pad_im = torch.cat([flat_im, padding], dim=0)
 
@@ -973,7 +973,7 @@ def _fft_via_stockham_nki_mixed(x: ComplexTensor, inverse: bool) -> ComplexTenso
         B_pad, pad_re, pad_im = B, flat_re, flat_im
     else:
         B_pad = ((B + PMAX - 1) // PMAX) * PMAX
-        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype)
+        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype, device=flat_re.device)
         pad_re = torch.cat([flat_re, padding], dim=0)
         pad_im = torch.cat([flat_im, padding], dim=0)
 
@@ -1193,7 +1193,7 @@ def _cooley_tukey_nki_nograd(
         pad_im = flat_im
     else:
         B = ((B_orig + PMAX - 1) // PMAX) * PMAX
-        padding = torch.zeros(B - B_orig, n, dtype=flat_re.dtype)
+        padding = torch.zeros(B - B_orig, n, dtype=flat_re.dtype, device=flat_re.device)
         pad_re = torch.cat([flat_re, padding], dim=0)
         pad_im = torch.cat([flat_im, padding], dim=0)
 
@@ -1203,7 +1203,7 @@ def _cooley_tukey_nki_nograd(
     device = None if use_sim else torch_xla.device()
 
     # Bit-reversal permutation along the last dim.
-    indices = _bit_reverse_indices(n, log2n)
+    indices = _bit_reverse_indices(n, log2n).to(pad_re.device)
     re = pad_re[..., indices]
     im = pad_im[..., indices]
     if not use_sim:
@@ -1328,13 +1328,30 @@ def _bluestein(
     m = padded_n if padded_n is not None else (1 << (2 * n - 2).bit_length())
 
     sign = 1.0 if inverse else -1.0
+    # Every tensor built here lives on the caller's device. The chirp, the
+    # zero-padded y and the filter h were created on CPU (torch default), so
+    # on a Neuron device ``x * chirp`` raised "input tensor is on cpu device,
+    # expected neuron" at every non-power-of-2 length (trnfft#80 follow-up).
+    device = x.real.device
 
     # Chirp sequence: W_N^(k^2/2) = exp(sign * πi * k^2 / N)
     k = torch.arange(n, dtype=x.dtype)
     chirp_angles = sign * math.pi * k * k / n
     chirp_re = torch.cos(chirp_angles)
     chirp_im = torch.sin(chirp_angles)
-    chirp = ComplexTensor(chirp_re, chirp_im)
+
+    # Filter h = conj(chirp) with circular wrap, built on CPU in one shot
+    # (no per-element device writes), then moved with the chirp.
+    h_re = torch.zeros(m, dtype=x.dtype)
+    h_im = torch.zeros(m, dtype=x.dtype)
+    h_re[:n] = chirp_re
+    h_im[:n] = -chirp_im  # conjugate
+    if n > 1:
+        h_re[m - n + 1 :] = torch.flip(chirp_re[1:], dims=[0])
+        h_im[m - n + 1 :] = -torch.flip(chirp_im[1:], dims=[0])  # conjugate
+
+    chirp = ComplexTensor(chirp_re.to(device), chirp_im.to(device))
+    h = ComplexTensor(h_re.to(device), h_im.to(device))
 
     # Step 1: y[n] = x[n] * chirp[n]
     if precision == "kahan":
@@ -1344,21 +1361,13 @@ def _bluestein(
 
     # Step 2: Zero-pad y to length m
     batch_shape = x.shape[:-1]
-    y_pad_re = torch.zeros(*batch_shape, m, dtype=x.dtype)
-    y_pad_im = torch.zeros(*batch_shape, m, dtype=x.dtype)
+    y_pad_re = torch.zeros(*batch_shape, m, dtype=x.dtype, device=device)
+    y_pad_im = torch.zeros(*batch_shape, m, dtype=x.dtype, device=device)
     y_pad_re[..., :n] = y.real
     y_pad_im[..., :n] = y.imag
     y_padded = ComplexTensor(y_pad_re, y_pad_im)
 
-    # Step 3: Build filter h = conj(chirp) with circular wrap
-    h_re = torch.zeros(m, dtype=x.dtype)
-    h_im = torch.zeros(m, dtype=x.dtype)
-    h_re[:n] = chirp_re
-    h_im[:n] = -chirp_im  # conjugate
-    for i in range(1, n):
-        h_re[m - i] = chirp_re[i]
-        h_im[m - i] = -chirp_im[i]  # conjugate
-    h = ComplexTensor(h_re, h_im)
+    # Step 3: filter h (built above, already on ``device``)
 
     # Step 4: Circular convolution via FFT
     Y = _cooley_tukey(y_padded, inverse=False, precision=precision)

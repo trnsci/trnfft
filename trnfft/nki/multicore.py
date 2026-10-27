@@ -195,8 +195,8 @@ def _stage_parallel_fft(x: ComplexTensor, num_cores: int, inverse: bool) -> Comp
     Y_im = col_result.imag.T.contiguous()
 
     # Step 3: Twiddle multiply Z[k1, l] = Y[k1, l] × exp(sign·2πi·l·k1/N).
-    k1 = torch.arange(n1, dtype=torch.float32).unsqueeze(1)  # (n1, 1)
-    l = torch.arange(n2, dtype=torch.float32).unsqueeze(0)  # (1, n2)
+    k1 = torch.arange(n1, dtype=torch.float32, device=Y_re.device).unsqueeze(1)  # (n1, 1)
+    l = torch.arange(n2, dtype=torch.float32, device=Y_re.device).unsqueeze(0)  # (1, n2)
     angles = sign * 2.0 * math.pi * l * k1 / n
     tw_re = torch.cos(angles)
     tw_im = torch.sin(angles)

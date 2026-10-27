@@ -52,8 +52,8 @@ def irfft(input: ComplexTensor, n: int | None = None) -> torch.Tensor:
         n = 2 * (input.shape[-1] - 1)
 
     # Reconstruct full spectrum via Hermitian symmetry
-    full_re = torch.zeros(*input.shape[:-1], n, dtype=input.dtype)
-    full_im = torch.zeros(*input.shape[:-1], n, dtype=input.dtype)
+    full_re = torch.zeros(*input.shape[:-1], n, dtype=input.dtype, device=input.device)
+    full_im = torch.zeros(*input.shape[:-1], n, dtype=input.dtype, device=input.device)
     half = input.shape[-1]
     full_re[..., :half] = input.real
     full_im[..., :half] = input.imag
@@ -305,7 +305,7 @@ def stft(
     if win_length is None:
         win_length = n_fft
     if window is None:
-        window = torch.hann_window(win_length, dtype=input.dtype)
+        window = torch.hann_window(win_length, dtype=input.dtype, device=input.device)
 
     if center:
         pad_amount = n_fft // 2
@@ -328,7 +328,7 @@ def stft(
 
     # Apply window
     if win_length < n_fft:
-        padded_window = torch.zeros(n_fft, dtype=input.dtype)
+        padded_window = torch.zeros(n_fft, dtype=input.dtype, device=window.device)
         offset = (n_fft - win_length) // 2
         padded_window[offset : offset + win_length] = window
         frames_tensor = frames_tensor * padded_window
@@ -382,7 +382,7 @@ def istft(
     if win_length is None:
         win_length = n_fft
     if window is None:
-        window = torch.hann_window(win_length, dtype=input.dtype)
+        window = torch.hann_window(win_length, dtype=input.dtype, device=input.device)
 
     # Undo normalization
     if normalized:
@@ -397,8 +397,12 @@ def istft(
     if onesided:
         freq_bins = spec_re.shape[-1]
         full_n = n_fft
-        full_re = torch.zeros(*spec_re.shape[:-1], full_n, dtype=spec_re.dtype)
-        full_im = torch.zeros(*spec_im.shape[:-1], full_n, dtype=spec_im.dtype)
+        full_re = torch.zeros(
+            *spec_re.shape[:-1], full_n, dtype=spec_re.dtype, device=spec_re.device
+        )
+        full_im = torch.zeros(
+            *spec_im.shape[:-1], full_n, dtype=spec_im.dtype, device=spec_im.device
+        )
         full_re[..., :freq_bins] = spec_re
         full_im[..., :freq_bins] = spec_im
         if full_n > 1:
@@ -420,7 +424,7 @@ def istft(
 
     # Build the window for overlap-add
     if win_length < n_fft:
-        padded_window = torch.zeros(n_fft, dtype=window.dtype)
+        padded_window = torch.zeros(n_fft, dtype=window.dtype, device=window.device)
         offset = (n_fft - win_length) // 2
         padded_window[offset : offset + win_length] = window
         window = padded_window
@@ -432,8 +436,8 @@ def istft(
     # IFFT output directly (no window weighting can recover those samples).
     expected_len = n_fft + (num_frames - 1) * hop_length
     batch_shape = frames.shape[:-2]
-    output = torch.zeros(*batch_shape, expected_len, dtype=frames.dtype)
-    window_sum = torch.zeros(expected_len, dtype=frames.dtype)
+    output = torch.zeros(*batch_shape, expected_len, dtype=frames.dtype, device=frames.device)
+    window_sum = torch.zeros(expected_len, dtype=frames.dtype, device=frames.device)
 
     for t in range(num_frames):
         start = t * hop_length
@@ -442,7 +446,7 @@ def istft(
 
     # Where the window sum is large enough, normalize. Where it's near zero
     # (boundary samples), fall back to the raw overlap-add of IFFT frames.
-    raw_output = torch.zeros(*batch_shape, expected_len, dtype=frames.dtype)
+    raw_output = torch.zeros(*batch_shape, expected_len, dtype=frames.dtype, device=frames.device)
     for t in range(num_frames):
         start = t * hop_length
         raw_output[..., start : start + n_fft] += frames[..., t, :]
@@ -464,7 +468,9 @@ def istft(
         if current > length:
             output = output[..., :length]
         elif current < length:
-            pad = torch.zeros(*batch_shape, length - current, dtype=output.dtype)
+            pad = torch.zeros(
+                *batch_shape, length - current, dtype=output.dtype, device=output.device
+            )
             output = torch.cat([output, pad], dim=-1)
 
     return output
@@ -484,8 +490,8 @@ def _resize_last(x: ComplexTensor, n: int) -> ComplexTensor:
     if current == n:
         return x
     if current < n:
-        pad_re = torch.zeros(*x.shape[:-1], n - current, dtype=x.dtype)
-        pad_im = torch.zeros(*x.shape[:-1], n - current, dtype=x.dtype)
+        pad_re = torch.zeros(*x.shape[:-1], n - current, dtype=x.dtype, device=x.device)
+        pad_im = torch.zeros(*x.shape[:-1], n - current, dtype=x.dtype, device=x.device)
         return ComplexTensor(
             torch.cat([x.real, pad_re], dim=-1),
             torch.cat([x.imag, pad_im], dim=-1),
@@ -533,6 +539,6 @@ def _resize_real(x: torch.Tensor, n: int) -> torch.Tensor:
     if current == n:
         return x
     if current < n:
-        pad = torch.zeros(*x.shape[:-1], n - current, dtype=x.dtype)
+        pad = torch.zeros(*x.shape[:-1], n - current, dtype=x.dtype, device=x.device)
         return torch.cat([x, pad], dim=-1)
     return x[..., :n]

@@ -812,3 +812,71 @@ class TestNKIFFT:
         finally:
             set_precision(old_prec)
             fft_core._DFT_GEMM_THRESHOLD = old_thr
+
+
+class TestBluesteinDeviceReturn:
+    """Non-power-of-2 (Bluestein) FFT must keep every tensor on the caller's
+    device through the NKI dispatch path (trnfft#80 follow-up).
+
+    ``meta`` stands in for the Neuron device: like a native ``neuron`` tensor,
+    a ``meta`` tensor refuses to mix with a CPU tensor ("Tensor on device cpu
+    is not on the expected device meta"). A fake ``torch_xla`` and a stand-in
+    GEMM kernel let the dispatch path run on CPU; the kernel also rejects
+    any input that was not moved to the device first.
+    """
+
+    def _install_fakes(self, monkeypatch, device, compute):
+        import sys
+        import types
+
+        from trnfft import fft_core as fc
+        from trnfft.nki import dispatch
+
+        fake_xla = types.ModuleType("torch_xla")
+        fake_xla.device = lambda: torch.device(device)
+        monkeypatch.setitem(sys.modules, "torch_xla", fake_xla)
+        # butterfly.py imports the real ``nki`` at module load; the GEMM path
+        # under test never calls these kernels.
+        fake_bfly = types.ModuleType("trnfft.nki.butterfly")
+        fake_bfly.butterfly_stage_kernel = None
+        fake_bfly.butterfly_stage_kernel_kahan = None
+        monkeypatch.setitem(sys.modules, "trnfft.nki.butterfly", fake_bfly)
+
+        def fake_kernel(a_re, a_im, b_re, b_im):
+            for t in (a_re, a_im, b_re, b_im):
+                if t.device != torch.device(device):
+                    raise RuntimeError(f"input tensor is on {t.device} device, expected {device}")
+            if not compute:
+                shape = (a_re.shape[0], b_re.shape[1])
+                return torch.empty(shape, device=device), torch.empty(shape, device=device)
+            c_re = a_re @ b_re - a_im @ b_im
+            c_im = a_re @ b_im + a_im @ b_re
+            return c_re, c_im
+
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_complex_gemm_kernel", fake_kernel, raising=False)
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(fc, "_use_nki", lambda: True)
+        # Route the padded power-of-2 sub-FFTs (up to m=2048 for n=1000)
+        # through the DFT-GEMM wrapper, the path the fake kernel covers.
+        monkeypatch.setattr(fc, "_DFT_GEMM_THRESHOLD", 4096)
+
+    @pytest.mark.parametrize("n", [7, 127, 129, 1000])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_non_pow2_stays_on_caller_device(self, monkeypatch, n, inverse):
+        self._install_fakes(monkeypatch, "meta", compute=False)
+        x = ComplexTensor(torch.empty(n, device="meta"), torch.empty(n, device="meta"))
+        y = trnfft.ifft(x) if inverse else trnfft.fft(x)
+        assert y.real.device.type == "meta"
+        assert y.imag.device.type == "meta"
+        assert y.shape == (n,)
+
+    @pytest.mark.parametrize("n", [7, 127, 1000])
+    def test_non_pow2_matches_numpy_via_dispatch(self, monkeypatch, n):
+        self._install_fakes(monkeypatch, "cpu", compute=True)
+        x = torch.randn(n, generator=torch.Generator().manual_seed(n))
+        y = trnfft.fft(x)
+        ref = np.fft.fft(x.numpy().astype(np.float64))
+        rel = np.linalg.norm(y.to_torch_complex().numpy() - ref) / np.linalg.norm(ref)
+        assert rel < 1e-3

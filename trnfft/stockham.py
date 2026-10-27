@@ -133,8 +133,8 @@ def stockham_radix4(x: ComplexTensor, inverse: bool = False) -> ComplexTensor:
         # Apply twiddles: T[l, k, m] = exp(sign*2πi*l*k / (4L))
         #   k dim only — broadcast over l and m.
         # Pre-twiddle:  x'[l, k, m] = x[l, k, m] * exp(sign*2πi*l*k/(4L))
-        l_idx = torch.arange(L, dtype=ar.dtype).view(1, L, 1, 1)
-        k_idx = torch.arange(4, dtype=ar.dtype).view(1, 1, 4, 1)
+        l_idx = torch.arange(L, dtype=ar.dtype, device=ar.device).view(1, L, 1, 1)
+        k_idx = torch.arange(4, dtype=ar.dtype, device=ar.device).view(1, 1, 4, 1)
         ang = sign * 2.0 * math.pi * l_idx * k_idx / (4.0 * L)
         tw_r = torch.cos(ang)
         tw_i = torch.sin(ang)
@@ -184,7 +184,7 @@ def _w8_matvec(a: ComplexTensor) -> ComplexTensor:
     we compute y = x @ W_8 (row-vector form, same as y = x @ W_8^T = x @ W_8).
     """
     dtype = a.real.dtype
-    idx = torch.arange(8, dtype=dtype)
+    idx = torch.arange(8, dtype=dtype, device=a.real.device)
     ang = -2.0 * math.pi * idx.unsqueeze(1) * idx.unsqueeze(0) / 8  # (8, 8)
     w8_r = torch.cos(ang)  # real part of W_8
     w8_i = torch.sin(ang)  # imag part of W_8
@@ -239,8 +239,8 @@ def stockham_radix8(x: ComplexTensor, inverse: bool = False) -> ComplexTensor:
         ai = a.imag.reshape(B, L, 8, M)
 
         # Twiddle: T[l, k] = exp(sign·2πi·l·k / (8·L)) for k ∈ {0..7}
-        l_idx = torch.arange(L, dtype=ar.dtype).view(1, L, 1, 1)
-        k_idx = torch.arange(8, dtype=ar.dtype).view(1, 1, 8, 1)
+        l_idx = torch.arange(L, dtype=ar.dtype, device=ar.device).view(1, L, 1, 1)
+        k_idx = torch.arange(8, dtype=ar.dtype, device=ar.device).view(1, 1, 8, 1)
         ang = sign * 2.0 * math.pi * l_idx * k_idx / (8.0 * L)
         tw_r = torch.cos(ang)
         tw_i = torch.sin(ang)
@@ -316,8 +316,8 @@ def stockham_mixed_radix(x: ComplexTensor, inverse: bool = False) -> ComplexTens
         ar = a.real.reshape(B, L, r, M)
         ai = a.imag.reshape(B, L, r, M)
 
-        l_idx = torch.arange(L, dtype=ar.dtype).view(1, L, 1, 1)
-        k_idx = torch.arange(r, dtype=ar.dtype).view(1, 1, r, 1)
+        l_idx = torch.arange(L, dtype=ar.dtype, device=ar.device).view(1, L, 1, 1)
+        k_idx = torch.arange(r, dtype=ar.dtype, device=ar.device).view(1, 1, r, 1)
         ang = sign * 2.0 * math.pi * l_idx * k_idx / (float(r) * L)
         tw_r = torch.cos(ang)
         tw_i = torch.sin(ang)

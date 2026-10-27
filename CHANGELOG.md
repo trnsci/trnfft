@@ -39,6 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the fft_core drivers. Audit of the other host wrappers in `trnfft/nki/` found no other
   instance.
 
+- **Bluestein (non-power-of-2) FFT keeps every tensor on the caller's device**
+  (`trnfft/fft_core.py::_bluestein`, #80 follow-up). `fft`/`ifft` at every
+  non-power-of-2 length failed on Trn2 native with `RuntimeError: input tensor is on
+  cpu device, expected neuron`. The chirp, the zero-padded `y` and the filter `h` were
+  built with CPU-default `torch.arange`/`torch.zeros`, so `x * chirp` mixed a device
+  input with a CPU chirp. They are now created on (or moved to) `x.real.device`; `h` is
+  built with one vectorized wrap instead of a per-element loop. The same CPU-default
+  factory pattern is fixed in the batch padding of the NKI butterfly/Stockham drivers,
+  the bit-reversal indices and CPU butterfly twiddles, the PyTorch Stockham reference
+  (`trnfft/stockham.py`), the four-step twiddles (`trnfft/nki/multicore.py`), and the
+  `irfft`/`stft`/`istft`/`n=` padding buffers and default windows (`trnfft/api.py`).
+  CPU-verified (meta-device stand-in); hardware re-check pending.
+
 ### Added
 
 - `tests/test_nki_compile.py` (`nki_simulator` marker): runs the NKI frontend
@@ -47,6 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without hardware. All eight kernels verify on NKI 0.7.0.
 - CPU regression test for the `complex_gemm_bf16` device-return contract
   (`tests/test_complex.py::TestDispatchDeviceReturn`).
+- CPU regression test for non-power-of-2 FFT/IFFT device placement through the NKI
+  dispatch path (`tests/test_fft.py::TestBluesteinDeviceReturn`). The `meta` device
+  stands in for `neuron` (it also rejects mixing with CPU tensors); fails before the fix.
 
 ## [0.22.0] - 2026-05-15
 
