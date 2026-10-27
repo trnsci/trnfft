@@ -1122,3 +1122,167 @@ class TestBluesteinChirpPrecision:
         got = y.real.double().numpy() + 1j * y.imag.double().numpy()
         rel = np.linalg.norm(got - ref) / np.linalg.norm(ref)
         assert rel < 2e-6, f"N={n}: rel err {rel:.2e}"
+
+
+class TestStockhamRowChunking:
+    """Row-chunked Stockham kernel launches (trnfft#83).
+
+    N >= 2^25 overflowed the NKI kernel body on Trn2 ("body blob exceeds
+    uint32 offset range") because a stage launch carried 2^23 rows. Dispatch
+    now caps rows per launch (TRNFFT_MAX_ROWS_PER_LAUNCH). Stand-in kernels
+    mirror the stage kernels row for row in torch, so chunked and unchunked
+    runs must agree bit for bit.
+    """
+
+    def test_planner_single_chunk_when_under_cap(self):
+        from trnfft.fft_core import _plan_row_chunks
+
+        assert _plan_row_chunks(64, 128) == [(0, 64)]
+        assert _plan_row_chunks(1 << 21, 1 << 21) == [(0, 1 << 21)]
+
+    def test_planner_splits_on_tile_boundaries(self):
+        from trnfft.fft_core import _plan_row_chunks
+
+        assert _plan_row_chunks(1 << 23, 1 << 21) == [(i << 21, (i + 1) << 21) for i in range(4)]
+        # Non-power-of-2 batch padding (B_pad = 384): tail chunk, all on 128s.
+        chunks = _plan_row_chunks(384 * 64, 1000)
+        assert chunks[0] == (0, 896)
+        assert chunks[-1][1] == 384 * 64
+        assert all(a % 128 == 0 and b - a <= 896 for a, b in chunks)
+        assert all(c[1] == d[0] for c, d in zip(chunks, chunks[1:], strict=False))
+        # Cap rounds down to a multiple of 128, minimum 128.
+        assert _plan_row_chunks(512, 1) == [(0, 128), (128, 256), (256, 384), (384, 512)]
+        with pytest.raises(ValueError):
+            _plan_row_chunks(0, 128)
+
+    def test_cap_env_var(self, monkeypatch):
+        from trnfft import fft_core as fc
+
+        monkeypatch.delenv("TRNFFT_MAX_ROWS_PER_LAUNCH", raising=False)
+        assert fc._max_rows_per_launch() == 1 << 21
+        monkeypatch.setenv("TRNFFT_MAX_ROWS_PER_LAUNCH", "300")
+        assert fc._max_rows_per_launch() == 256
+        monkeypatch.setenv("TRNFFT_MAX_ROWS_PER_LAUNCH", "5")
+        assert fc._max_rows_per_launch() == 128
+
+    def _install_fakes(self, monkeypatch):
+        import sys
+        import types
+
+        from trnfft import fft_core as fc
+
+        fake_xla = types.ModuleType("torch_xla")
+        fake_xla.device = lambda: torch.device("cpu")
+        monkeypatch.setitem(sys.modules, "torch_xla", fake_xla)
+
+        launches = []
+
+        def _check(t):
+            g = t.shape[0]
+            assert g <= 128 or g % 128 == 0, f"rows={g} not tileable"
+
+        # Elementwise per-row arithmetic (no BLAS, whose blocking can depend
+        # on the row count), so any chunking difference would show up.
+        def _rowwise_dft(a_re, a_im, w_re, w_im):
+            r = a_re.shape[1]
+            y_re = torch.zeros_like(a_re)
+            y_im = torch.zeros_like(a_im)
+            for k in range(r):
+                ar, ai = a_re[:, k : k + 1], a_im[:, k : k + 1]
+                y_re = y_re + (ar * w_re[k] - ai * w_im[k])
+                y_im = y_im + (ar * w_im[k] + ai * w_re[k])
+            return y_re, y_im
+
+        def _w(r):
+            k = torch.arange(r, dtype=torch.float64)
+            ang = -2.0 * np.pi * torch.outer(k, k) / r
+            return torch.cos(ang).float(), torch.sin(ang).float()
+
+        w4_re, w4_im = _w(4)
+
+        def fake_r4(x_re, x_im, tw_re, tw_im):
+            _check(x_re)
+            launches.append(("r4", x_re.shape[0]))
+            a_re = x_re * tw_re - x_im * tw_im
+            a_im = x_re * tw_im + x_im * tw_re
+            return _rowwise_dft(a_re, a_im, w4_re, w4_im)
+
+        def fake_r8(a_re, a_im, w8_re, w8_im):
+            _check(a_re)
+            assert w8_re.shape == (8, 8)
+            launches.append(("r8", a_re.shape[0]))
+            return _rowwise_dft(a_re, a_im, w8_re, w8_im)
+
+        fake_st = types.ModuleType("trnfft.nki.stockham")
+        fake_st.stockham_radix4_stage_kernel = fake_r4
+        fake_st.stockham_radix8_w8_kernel = fake_r8
+        monkeypatch.setitem(sys.modules, "trnfft.nki.stockham", fake_st)
+        from trnfft.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        return fc, launches
+
+    @pytest.mark.parametrize(
+        "driver,n",
+        [
+            ("_fft_via_stockham_nki_mixed", 2048),
+            ("_fft_via_stockham_nki_mixed", 8192),
+            ("_fft_via_stockham_nki", 1024),
+            ("_fft_via_stockham_nki_r8", 4096),
+        ],
+    )
+    @pytest.mark.parametrize("batch", [1, 3])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_chunked_bit_identical_to_unchunked(self, monkeypatch, driver, n, batch, inverse):
+        fc, launches = self._install_fakes(monkeypatch)
+        fn = getattr(fc, driver)
+        g = torch.Generator().manual_seed(n + batch)
+        x = ComplexTensor(torch.randn(batch, n, generator=g), torch.randn(batch, n, generator=g))
+
+        monkeypatch.setenv("TRNFFT_MAX_ROWS_PER_LAUNCH", str(1 << 30))
+        whole = fn(x, inverse)
+        n_whole = len(launches)
+        launches.clear()
+
+        monkeypatch.setenv("TRNFFT_MAX_ROWS_PER_LAUNCH", "128")
+        chunked = fn(x, inverse)
+        assert len(launches) > n_whole
+        assert max(rows for _, rows in launches) <= 128
+
+        assert torch.equal(chunked.real, whole.real)
+        assert torch.equal(chunked.imag, whole.imag)
+        xc = x.real.double().numpy() + 1j * x.imag.double().numpy()
+        ref = np.fft.ifft(xc) if inverse else np.fft.fft(xc)
+        got = chunked.real.double().numpy() + 1j * chunked.imag.double().numpy()
+        assert np.linalg.norm(got - ref) / np.linalg.norm(ref) < 1e-5
+
+
+@pytest.mark.neuron
+class TestLargeFFTNeuron:
+    """N = 2^25 on device (trnfft#83): stage launches are row-chunked."""
+
+    def test_fft_2_25_vs_torch(self, nki_backend):
+        n = 1 << 25
+        g = torch.Generator().manual_seed(83)
+        x = torch.randn(n, generator=g)
+        y = trnfft.fft(x)
+        ref = torch.fft.fft(x.double())
+        got = torch.complex(y.real.double().cpu(), y.imag.double().cpu())
+        rel = (torch.linalg.vector_norm(got - ref) / torch.linalg.vector_norm(ref)).item()
+        assert rel < 1e-5, f"N=2^25 rel err {rel:.2e}"
+
+    def test_chunked_bit_identical_2_22(self, nki_backend, monkeypatch):
+        """N = 2^22 fits one launch per stage (max 2^20 rows); forcing the cap
+        to TRNFFT_BITID_CAP rows (default 2^17) must not change a single bit."""
+        import os
+
+        n = 1 << 22
+        cap = os.environ.get("TRNFFT_BITID_CAP", str(1 << 17))
+        g = torch.Generator().manual_seed(84)
+        x = torch.randn(n, generator=g)
+        monkeypatch.setenv("TRNFFT_MAX_ROWS_PER_LAUNCH", str(1 << 30))
+        whole = trnfft.fft(x)
+        monkeypatch.setenv("TRNFFT_MAX_ROWS_PER_LAUNCH", cap)
+        chunked = trnfft.fft(x)
+        assert torch.equal(chunked.real.cpu(), whole.real.cpu())
+        assert torch.equal(chunked.imag.cpu(), whole.imag.cpu())

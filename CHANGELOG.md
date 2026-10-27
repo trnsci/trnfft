@@ -53,6 +53,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **FFT N ≥ 2^25 failed on Trn2 with "body blob exceeds uint32 offset range"**
+  (`trnfft/fft_core.py`, #83). Each Stockham stage launches one kernel over a
+  `(B·N/r, r)` operand, and the compiler unrolls the kernel's 128-row tile
+  loop, so the kernel body grows with the row count. At N=2^25 the radix-4
+  stage took 2^23 rows and BIR emission failed. N ≤ 2^24 passed; the largest
+  launches there were 2^21 rows. Each row is an independent r-point butterfly
+  group with its own twiddle row, so the radix-4, radix-8 and mixed-radix
+  drivers now split any stage above 2^21 rows into launches of at most 2^21
+  rows (on 128-row tile boundaries) and concatenate the results. Output is
+  bit-identical to a single launch. Env `TRNFFT_MAX_ROWS_PER_LAUNCH` overrides
+  the cap and is read per call.
+
 - **`precision="kahan"` is no longer less accurate than `"fast"`** (#82). On
   Trn2 at bbff7be, `TestKahanCharacterization` failed at Bluestein N=997:
   kahan 4.09e-7 against fast 2.62e-7, where the tests require kahan ≤ 1.5×fast.

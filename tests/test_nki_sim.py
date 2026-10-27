@@ -99,6 +99,29 @@ class TestStockhamSimulator:
         np.testing.assert_allclose(sim.real.numpy(), cpu.real.numpy(), atol=1e-4, rtol=1e-4)
         np.testing.assert_allclose(sim.imag.numpy(), cpu.imag.numpy(), atol=1e-4, rtol=1e-4)
 
+    @pytest.mark.parametrize(
+        "driver,n",
+        [
+            ("_fft_via_stockham_nki", 1024),
+            ("_fft_via_stockham_nki_r8", 512),
+            ("_fft_via_stockham_nki_mixed", 2048),
+        ],
+    )
+    def test_row_chunked_bit_identical(self, monkeypatch, driver, n):
+        """trnfft#83: launches capped at 128 rows match one launch per stage."""
+        from trnfft import fft_core as fc
+        from trnfft.complex import ComplexTensor
+
+        torch.manual_seed(83)
+        x = ComplexTensor(torch.randn(2, n), torch.randn(2, n))
+        fn = getattr(fc, driver)
+        monkeypatch.setenv("TRNFFT_MAX_ROWS_PER_LAUNCH", str(1 << 30))
+        whole = fn(x, inverse=False)
+        monkeypatch.setenv("TRNFFT_MAX_ROWS_PER_LAUNCH", "128")
+        chunked = fn(x, inverse=False)
+        assert torch.equal(chunked.real, whole.real)
+        assert torch.equal(chunked.imag, whole.imag)
+
     def test_stockham_nki_matches_numpy_n256(self):
         from trnfft.complex import ComplexTensor
         from trnfft.fft_core import _fft_via_stockham_nki
