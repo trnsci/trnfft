@@ -85,9 +85,9 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
         half = m >> 1  # Half group
 
         # Twiddle: exp(sign * 2πi * k / m) for k = 0..half-1
-        angles = sign * 2.0 * math.pi * torch.arange(half, dtype=re.dtype) / m
-        tw_re = torch.cos(angles).to(re.device)
-        tw_im = torch.sin(angles).to(re.device)
+        angles = sign * 2.0 * math.pi * torch.arange(half, dtype=torch.float64) / m
+        tw_re = torch.cos(angles).to(dtype=re.dtype, device=re.device)
+        tw_im = torch.sin(angles).to(dtype=re.dtype, device=re.device)
 
         for k in range(half):
             # All butterflies at position k within their group, across all groups
@@ -1268,9 +1268,12 @@ def _cooley_tukey_nki_nograd(
 
     For N <= _DFT_GEMM_THRESHOLD the butterfly path is bypassed in favor of
     :func:`_fft_via_gemm`, which routes onto the Tensor engine (one matmul)
-    instead of the Vector engine (log2(N) butterfly stages). "fast" precision
-    only — the kahan variant stays on the butterfly path so the compensated
-    complex multiply remains available for users who explicitly want it.
+    instead of the Vector engine (log2(N) butterfly stages); up to
+    _FOUR_STEP_MAX the four-step two-GEMM path is used. Both apply to "kahan"
+    as well, since they are more accurate than the Kahan butterfly on Trn2
+    (trnfft#82). Above _FOUR_STEP_MAX, "kahan" uses the compensated butterfly
+    and "fast" uses Stockham. Set _DFT_GEMM_THRESHOLD = 0 to force the Kahan
+    butterfly at any N.
     """
     from .nki.butterfly import butterfly_stage_kernel, butterfly_stage_kernel_kahan
     from .nki.dispatch import _use_simulator
@@ -1318,19 +1321,20 @@ def _cooley_tukey_nki_nograd(
     if precision == "ozaki" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _ozaki_or_fallback(x, inverse, hq=False)
 
-    if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
+    # "kahan" takes the GEMM paths too (trnfft#82). On Trn2 the single GEMM /
+    # four-step measure 1.2e-7-1.6e-7 rel err, below the Kahan butterfly
+    # (1.9e-7-4.6e-7, trn1): the PSUM accumulates in FP32 with no per-stage
+    # rounding to compensate. Keeping kahan on the butterfly made it *worse*
+    # than "fast" once fast moved to the GEMM paths (Bluestein N=997 on Trn2:
+    # kahan 4.09e-7 vs fast 2.62e-7). Kahan's compensated chirp multiplies in
+    # Bluestein still apply. Threshold 0 still forces the Kahan butterfly.
+    if n <= _DFT_GEMM_THRESHOLD:
         return _fft_via_gemm(x, inverse)
 
     # Four-step FFT as two GEMMs (trnfft#82): 2 kernel launches instead of one
     # per Stockham stage plus inter-stage permutes. A threshold of 0 disables
     # it along with DFT-GEMM ("force butterfly/Stockham").
-    if (
-        _DFT_GEMM_THRESHOLD > 0
-        and n <= _FOUR_STEP_MAX
-        and n >= 4
-        and _is_power_of_two(n)
-        and precision != "kahan"
-    ):
+    if _DFT_GEMM_THRESHOLD > 0 and n <= _FOUR_STEP_MAX and n >= 4 and _is_power_of_two(n):
         return _fft_via_four_step(x, inverse)
 
     # Mixed-radix Stockham (v0.16): optimal [8^a, 4^b] plan for any power-of-2.
@@ -1406,9 +1410,10 @@ def _cooley_tukey_nki_nograd(
 
         # Precompute twiddle factors for this stage. Expand to (total_groups, half)
         # so every batch row / group row has matching partition-dim values.
-        angles = sign * 2.0 * math.pi * torch.arange(half, dtype=x.real.dtype) / m
-        tw_re_1d = torch.cos(angles)
-        tw_im_1d = torch.sin(angles)
+        # FP64 angles/cos/sin, cast once (trnfft#82; #81 recipe).
+        angles = sign * 2.0 * math.pi * torch.arange(half, dtype=torch.float64) / m
+        tw_re_1d = torch.cos(angles).to(x.real.dtype)
+        tw_im_1d = torch.sin(angles).to(x.real.dtype)
         tw_re_bcast = tw_re_1d.unsqueeze(0).expand(total_groups, half).contiguous()
         tw_im_bcast = tw_im_1d.unsqueeze(0).expand(total_groups, half).contiguous()
 

@@ -20,6 +20,13 @@ Three modes trade off speed vs numerical accuracy:
 
   Roughly 2× the op count of "fast" in the compensated sections. Use when
   forward-error budget for butterfly stages is ≤ 3e-7 (vs "fast"'s ≤ 4e-6).
+
+  Since trnfft#82, power-of-2 FFTs with N ≤ 4096 on the NKI path use the same
+  single-GEMM / four-step GEMM paths as "fast" in both modes. On Trn2 those
+  measure 1.2e-7 to 1.6e-7, which beats the Kahan butterfly. The Kahan
+  butterfly applies above N=4096, or at any N with ``_DFT_GEMM_THRESHOLD = 0``.
+  Bluestein keeps its compensated chirp multiplies. The contract is that
+  "kahan" is never less accurate than "fast".
 * ``"double"`` — promotes math to FP64 for maximum accuracy. Affects two paths:
 
   1. **Bluestein** (non-power-of-2 N): promotes the entire chirp/pad/filter

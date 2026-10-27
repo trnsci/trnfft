@@ -1068,6 +1068,42 @@ class TestFourStepDispatch:
         x = ComplexTensor(torch.randn(4, 512), torch.randn(4, 512))
         fc._cooley_tukey_nki_nograd(x, inverse=False, precision="bf16")
 
+    @pytest.mark.parametrize("n,expect_gemms", [(1024, 1), (4096, 2)])
+    def test_kahan_uses_gemm_paths(self, monkeypatch, n, expect_gemms):
+        """kahan must not be less accurate than fast: it shares the GEMM paths (#82)."""
+        from trnfft import fft_core as fc
+
+        calls = self._install_fakes(monkeypatch)
+        monkeypatch.setattr(fc, "_DFT_GEMM_THRESHOLD", 1024)
+        xr, xi = torch.randn(4, n), torch.randn(4, n)
+        y = fc._cooley_tukey_nki_nograd(ComplexTensor(xr, xi), inverse=False, precision="kahan")
+        ref = np.fft.fft(xr.double().numpy() + 1j * xi.double().numpy())
+        assert self._rel(y, ref) < 1e-5
+        assert calls["gemm"] == expect_gemms
+
+    @pytest.mark.parametrize("n", [997, 1009])
+    def test_kahan_bluestein_not_worse_than_fast(self, monkeypatch, n):
+        """CPU mirror of the neuron TestKahanCharacterization contract."""
+        from trnfft import fft_core as fc
+        from trnfft import get_precision, set_precision
+
+        self._install_fakes(monkeypatch)
+        monkeypatch.setattr(fc, "_DFT_GEMM_THRESHOLD", 1024)
+        torch.manual_seed(42)
+        x = torch.randn(n)
+        ref = np.fft.fft(x.numpy().astype(np.float64))
+        errs = {}
+        old = get_precision()
+        try:
+            for prec in ("fast", "kahan"):
+                set_precision(prec)
+                y = trnfft.fft(x)
+                got = y.real.double().numpy() + 1j * y.imag.double().numpy()
+                errs[prec] = np.abs(got - ref).max() / np.abs(ref).max()
+        finally:
+            set_precision(old)
+        assert errs["kahan"] <= 1.5 * errs["fast"], errs
+
 
 class TestBluesteinChirpPrecision:
     """Chirp built in FP64 with k^2 mod 2N (trnfft#82 hardware finding).

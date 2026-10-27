@@ -53,6 +53,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`precision="kahan"` is no longer less accurate than `"fast"`** (#82). On
+  Trn2 at bbff7be, `TestKahanCharacterization` failed at Bluestein N=997:
+  kahan 4.09e-7 against fast 2.62e-7, where the tests require kahan ≤ 1.5×fast.
+  The fast path had moved to the single-GEMM and four-step GEMM paths, but
+  kahan's inner power-of-2 FFTs stayed on the Kahan butterfly, which
+  measures 1.9e-7 to 4.6e-7 on trn1. The GEMM paths are more accurate on
+  Trn2 (1.2e-7 to 1.6e-7), so `"kahan"` now uses them up to N=4096, the same
+  as `"fast"`. The Kahan butterfly still applies above N=4096, or at any N with
+  `_DFT_GEMM_THRESHOLD = 0`. Bluestein keeps the compensated chirp multiplies.
+  The butterfly twiddles on the NKI and CPU paths are now built in FP64 and
+  cast once.
+  - CPU with fake kernels on the NKI dispatch path, using the neuron test's
+    max-rel metric at seed 42. Columns: fast / kahan before → kahan after.
+    - N=997: 3.37e-7 / 3.55e-7 → 3.44e-7
+    - N=1009: 3.21e-7 / 4.09e-7 → 3.80e-7
+    - N=8193: 3.66e-6 / 5.47e-7 → 2.59e-7. At this size fast uses Stockham
+      and kahan the butterfly.
+    - N=4096 (power of 2): 2.46e-7 / 4.25e-7 → 2.46e-7. Before the fix this
+      ratio was 1.73×, a latent failure of the same contract.
+  - Over 20 seeds the kahan/fast ratio at N=997 and N=1009 now averages
+    1.00 and is at most 1.16.
+
 - **Bluestein (non-power-of-2 N) chirp is now built in FP64 with k² reduced
   mod 2N** (`trnfft/fft_core.py`, found in the #82 Trn2 run). The chirp
   `exp(±iπk²/N)` was computed from an FP32 angle of up to about πN, which put
