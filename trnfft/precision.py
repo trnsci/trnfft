@@ -41,20 +41,30 @@ Three modes trade off speed vs numerical accuracy:
   near-FP32 at ≈1.5-2× BF16 cost. Suitable for chained FFT pipelines where
   accumulated rounding matters. Hardware validation pending (v0.17).
 
-* ``"ozaki_hq"`` — 2-level Ozaki (3-way x split + 2-way W split) for N ≤ 256.
-  6 BF16 matmuls. Theoretical O(sqrt(N)·u_bf16^4) ≈ 2e-9 rel error at N=64.
+* ``"ozaki_hq"`` — 2-level Ozaki (3-way x split + 3-way W split, triangular
+  6-term product) for N ≤ 256. 6 BF16 matmuls. Target ≤ 1e-6 rel error; the FP32
+  output floor gives ~7e-8 (N=64) to ~1.1e-7 (N=256) with exact BF16 products
+  (CPU emulation, after trnfft#81). The earlier "O(u_bf16^4) ≈ 2e-9" figure ignored
+  the FP32 floor. Before #81 (FP32 twiddles, 2-way W split) trn2 measured
+  4.9e-6 / 9.9e-6 / 2.0e-5 at N=64/128/256, the same as "ozaki" (spike B5, SDK 2.33).
   **Hardware-gated**: requires nc_matmul to compute BF16×BF16 products at FP32
-  precision before PSUM accumulation. trn1 does not provide this — measured
-  ozaki_hq ≈ bf16 ≈ 1.7e-3 on trn1 (SDK 2.29.0). trn2/trn3 likely do (TF32/MXFP8
-  product precision). Emits RuntimeWarning and falls back to "bf16" unless
+  precision before PSUM accumulation. trn1 measured ozaki_hq ≈ bf16 ≈ 1.7e-3
+  (SDK 2.29.0). Emits RuntimeWarning and falls back to "bf16" unless
   ``trnfft.set_ozaki_product_precision_verified(True)`` has been called.
 
 * ``"ozaki"`` — 1-level Ozaki-scheme DFT-GEMM for N ≤ 256 on NKI hardware.
-  3 BF16 matmuls (W_h@x_h + W_h@x_l + W_l@x_h). Theoretical O(u_bf16^2) ≈ 1.6e-5
-  rel error at N=256. **Hardware-gated**: same product-precision constraint as
-  "ozaki_hq". On trn1, measured error equals single-pass BF16. Emits RuntimeWarning
-  and falls back to "bf16" unless verified. Run TestOzakiHQCharacterization to test
-  your hardware, then call set_ozaki_product_precision_verified(True) to enable.
+  3 BF16 matmuls (W_h@x_h + W_h@x_l + W_l@x_h). Bound 1.6e-5 rel error at
+  N ≤ 256 (O(u_bf16^2)); CPU emulation gives ~3.5e-6–4e-6 after trnfft#81. Before
+  #81, trn2 measured 5.9e-6 / 1.0e-5 / 2.0e-5 at N=64/128/256, the N=256 value over
+  the bound, all of it from FP32 twiddle generation. **Hardware-gated**: same
+  product-precision constraint as "ozaki_hq". On trn1, measured error equals
+  single-pass BF16. Emits RuntimeWarning and falls back to "bf16" unless verified.
+  Run TestOzakiHQCharacterization to test your hardware, then call
+  set_ozaki_product_precision_verified(True) to enable.
+
+  Both Ozaki modes dispatch only for N ≤ 256 (``_DFT_GEMM_THRESHOLD``). At larger
+  N, "ozaki"/"ozaki_hq" fall through to the FP32 Stockham/butterfly path, which has
+  the "fast" accuracy (≤ 4e-6 butterfly) with no Ozaki correction.
 
 
 Backend interaction: "kahan" and "double" do not disable the NKI backend

@@ -173,6 +173,9 @@ _FORCE_OZAKI_HQ = False
 # trn1 does NOT provide this — BF16 products are rounded to BF16 before PSUM,
 # leaving no signal for the correction terms to capture. Measured result on
 # trn1: ozaki ≈ ozaki_hq ≈ bf16 (~1.7e-3 rel error at N=64).
+# trn2 (SDK 2.33 / NKI 0.7.0, spike B5, 2026-10-27): ozaki/ozaki_hq matched the
+# CPU emulation to two digits, i.e. products were not the limit. The remaining
+# error was the FP32 twiddle build, fixed in trnfft#81.
 #
 # trn2/trn3 may provide FP32 product precision via TF32/MXFP8 tensor cores
 # (same gap NVIDIA TF32 exploits). Run TestOzakiHQCharacterization to verify,
@@ -218,6 +221,23 @@ def _ozaki_or_fallback(x: ComplexTensor, inverse: bool, hq: bool) -> ComplexTens
     return _fft_via_ozaki_hq(x, inverse) if hq else _fft_via_ozaki(x, inverse)
 
 
+def _dft_matrix_fp64(n: int, inverse: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (cos, sin) of the N×N DFT matrix in FP64, angles reduced mod N.
+
+    ``k*j`` is reduced modulo N in exact integer arithmetic before the angle is
+    formed, so every angle lies in [0, 2π) and the FP64 cos/sin are correctly
+    rounded to ~1e-16. Building W directly as ``cos(2π·k·j/N)`` in FP32 (the
+    pre-#81 code) makes the angle up to ~2πN and rounds it to FP32, giving a
+    twiddle error of ~N·1e-7 rel (5e-6 at N=64, 2e-5 at N=256). That error is
+    a floor no Ozaki split can get under (trnfft#81).
+    """
+    sign = 1.0 if inverse else -1.0
+    k = torch.arange(n, dtype=torch.int64)
+    kj = (k.unsqueeze(1) * k.unsqueeze(0)) % n
+    angles = sign * 2.0 * math.pi * kj.to(torch.float64) / n
+    return torch.cos(angles), torch.sin(angles)
+
+
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Compute FFT as a single complex matmul: X = W @ x (FP32, NKI path).
 
@@ -236,11 +256,8 @@ def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     x_re = x.real.reshape(-1, n).contiguous()
     x_im = x.imag.reshape(-1, n).contiguous()
 
-    sign = 1.0 if inverse else -1.0
-    k = torch.arange(n, dtype=x_re.dtype)
-    kj = k.unsqueeze(1) * k.unsqueeze(0)
-    angles = sign * 2.0 * math.pi * kj / n
-    W = ComplexTensor(torch.cos(angles), torch.sin(angles))
+    W_r, W_i = _dft_matrix_fp64(n, inverse)
+    W = ComplexTensor(W_r.to(x_re.dtype), W_i.to(x_re.dtype))
 
     X_2d = complex_gemm(ComplexTensor(x_re, x_im), W)
     X_re = X_2d.real.reshape(orig_shape)
@@ -274,11 +291,7 @@ def _fft_via_gemm_double(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     x_re_cpu = x.real.detach().cpu().double()
     x_im_cpu = x.imag.detach().cpu().double()
 
-    sign = 1.0 if inverse else -1.0
-    k = torch.arange(n, dtype=torch.float64)
-    kj = k.unsqueeze(1) * k.unsqueeze(0)
-    angles = sign * 2.0 * math.pi * kj / n
-    W = ComplexTensor(torch.cos(angles), torch.sin(angles))
+    W = ComplexTensor(*_dft_matrix_fp64(n, inverse))
 
     orig_shape = x_re_cpu.shape
     x_re_2d = x_re_cpu.reshape(-1, n).contiguous()
@@ -324,12 +337,9 @@ def _fft_via_gemm_bf16(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     x_re = x.real.reshape(-1, n).to(torch.bfloat16).contiguous()
     x_im = x.imag.reshape(-1, n).to(torch.bfloat16).contiguous()
 
-    sign = 1.0 if inverse else -1.0
-    k = torch.arange(n, dtype=torch.float32)  # FP32 angles for accuracy
-    kj = k.unsqueeze(1) * k.unsqueeze(0)
-    angles = sign * 2.0 * math.pi * kj / n
     # Quantize W to BF16 — this is the BF16 DFT-matrix approximation.
-    W = ComplexTensor(torch.cos(angles).bfloat16(), torch.sin(angles).bfloat16())
+    W_r, W_i = _dft_matrix_fp64(n, inverse)
+    W = ComplexTensor(W_r.bfloat16(), W_i.bfloat16())
 
     # complex_gemm_bf16 returns FP32 (PSUM not rounded to BF16).
     X_2d = complex_gemm_bf16(ComplexTensor(x_re, x_im), W)
@@ -384,7 +394,7 @@ def _fft_iterative_refinement(x: ComplexTensor, inverse: bool, steps: int = 1) -
 def _ozaki_split_bf16(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Split FP32 tensor into BF16 high + low parts (1-level ORO split)."""
     x_high = x.bfloat16()
-    x_low = (x - x_high.float()).bfloat16()
+    x_low = (x - x_high.to(x.dtype)).bfloat16()
     return x_high, x_low
 
 
@@ -400,9 +410,9 @@ def _ozaki_split_3way_bf16(
     Magnitudes: |x_h1| ~ |x|, |x_h2| ~ u_bf16·|x|, |x_h3| ~ u_bf16²·|x|.
     """
     x_h1 = x.bfloat16()
-    r1 = x - x_h1.float()  # FP32 residual — NOT cast to BF16 here
+    r1 = x - x_h1.to(x.dtype)  # FP32/FP64 residual — NOT cast to BF16 here
     x_h2 = r1.bfloat16()
-    x_h3 = (r1 - x_h2.float()).bfloat16()
+    x_h3 = (r1 - x_h2.to(x.dtype)).bfloat16()
     return x_h1, x_h2, x_h3
 
 
@@ -414,26 +424,26 @@ def _fft_via_ozaki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     directly so each term takes exactly the same hardware path as the working
     BF16 benchmark.
 
-    Expected accuracy: O(sqrt(N) * u_bf16^2) ≈ 8e-6–1.6e-5 rel error at N=64–256.
+    Expected accuracy: ~3.5e-6–4e-6 rel error at N=64–256 (dominated by the
+    dropped W_l@x_l term and the W/x split residuals, all O(u_bf16^2)). W is built
+    and split from FP64 (trnfft#81); the earlier FP32 W added ~N·1e-7 of twiddle
+    error on top.
     Cost: 3× BF16 DFT-GEMM ≈ 2× FP32 DFT-GEMM.
     """
     n = x.shape[-1]
     orig_shape = x.real.shape
 
-    sign = 1.0 if inverse else -1.0
-    k = torch.arange(n, dtype=torch.float32)
-    kj = k.unsqueeze(1) * k.unsqueeze(0)
-    angles = sign * 2.0 * math.pi * kj / n
-    W_r_fp32 = torch.cos(angles)  # (n, n) FP32
-    W_i_fp32 = torch.sin(angles)
+    # W in FP64 (angles reduced mod n) and split from FP64: an FP32 W carries
+    # ~N·1e-7 twiddle error that the split cannot remove (trnfft#81).
+    W_r_fp64, W_i_fp64 = _dft_matrix_fp64(n, inverse)
 
     # Ozaki splits (CPU → BF16)
     x_re_fp32 = x.real.reshape(-1, n).contiguous()
     x_im_fp32 = x.imag.reshape(-1, n).contiguous()
     x_r_h, x_r_l = _ozaki_split_bf16(x_re_fp32)
     x_i_h, x_i_l = _ozaki_split_bf16(x_im_fp32)
-    W_r_h, W_r_l = _ozaki_split_bf16(W_r_fp32)
-    W_i_h, W_i_l = _ozaki_split_bf16(W_i_fp32)
+    W_r_h, W_r_l = _ozaki_split_bf16(W_r_fp64)
+    W_i_h, W_i_l = _ozaki_split_bf16(W_i_fp64)
 
     def _term(xr, xi, wr, wi) -> ComplexTensor:
         """One BF16 DFT-GEMM term using the validated BF16 kernel path."""
@@ -478,17 +488,24 @@ def _fft_via_ozaki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
 
 def _fft_via_ozaki_hq(x: ComplexTensor, inverse: bool) -> ComplexTensor:
-    """2-level Ozaki DFT-GEMM: W 2-split × x 3-split → 6 BF16 matmuls, FP32 accumulation.
+    """2-level Ozaki DFT-GEMM: W 3-split × x 3-split → 6 BF16 matmuls, FP32 accumulation.
 
-    Achieves O(sqrt(N)·u_bf16^4) ≈ 2e-9 rel error at N=64 — near-FP64 accuracy
-    without leaving the Tensor Engine.
+    Target: ≤ 1e-6 rel error at N ≤ 256. The FP32 output (and FP32 PSUM sum of the
+    six terms) sets the floor: measured ~7e-8 (N=64) to ~1.1e-7 (N=256) with exact
+    BF16 products (CPU emulation). The earlier "O(u_bf16^4) ≈ 2e-9" claim ignored
+    that FP32 floor.
 
-    Split structure:
-      x 3-way: x_h1 (BF16), x_h2 (BF16 of FP32 residual), x_h3 (BF16 of 2nd residual)
-      W 2-way: W_h (BF16), W_l (BF16 of FP32 residual)
+    Split structure (both from the higher-precision source, FP32 residuals or
+    better between levels):
+      x 3-way: x_h1, x_h2, x_h3 (BF16) from the FP32 input
+      W 3-way: W_h1, W_h2, W_h3 (BF16) from the FP64 DFT matrix
 
-    Six cross-terms (all combinations W_{h,l} × x_{h1,h2,h3}):
-      W_h@x_h1, W_h@x_h2, W_h@x_h3, W_l@x_h1, W_l@x_h2, W_l@x_h3
+    Six cross-terms, triangular (level(W) + level(x) ≤ 2):
+      W_h1@x_h1, W_h1@x_h2, W_h1@x_h3, W_h2@x_h1, W_h2@x_h2, W_h3@x_h1
+
+    Before trnfft#81 W was built in FP32 (twiddle error ~N·1e-7) and split only
+    2-way (residual ~u_bf16^2), so ozaki_hq landed at ozaki's level (4.9e-6 at
+    N=64, 2.0e-5 at N=256 on trn2).
 
     Cost: 6× BF16 DFT-GEMM ≈ 3.5× FP32 DFT-GEMM.
     Data-dependency trick forces sequential XLA graph execution (same as _fft_via_ozaki).
@@ -496,19 +513,16 @@ def _fft_via_ozaki_hq(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     n = x.shape[-1]
     orig_shape = x.real.shape
 
-    sign = 1.0 if inverse else -1.0
-    k = torch.arange(n, dtype=torch.float32)
-    kj = k.unsqueeze(1) * k.unsqueeze(0)
-    angles = sign * 2.0 * math.pi * kj / n
-    W_r_fp32 = torch.cos(angles)
-    W_i_fp32 = torch.sin(angles)
+    W_r_fp64, W_i_fp64 = _dft_matrix_fp64(n, inverse)
 
     x_re_fp32 = x.real.reshape(-1, n).contiguous()
     x_im_fp32 = x.imag.reshape(-1, n).contiguous()
 
-    # 2-way split of W (same as 1-level Ozaki)
-    W_r_h, W_r_l = _ozaki_split_bf16(W_r_fp32)
-    W_i_h, W_i_l = _ozaki_split_bf16(W_i_fp32)
+    # 3-way split of W, taken from FP64 (trnfft#81). A 2-way W split leaves a
+    # ~u_bf16^2 ≈ 1.5e-5 residual in W itself, capping the result at ~1.3-1.9e-6
+    # rel error however finely x is split.
+    W_r_h1, W_r_h2, W_r_h3 = _ozaki_split_3way_bf16(W_r_fp64)
+    W_i_h1, W_i_h2, W_i_h3 = _ozaki_split_3way_bf16(W_i_fp64)
 
     # 3-way split of x (FP32 residuals between levels — the 2-level key)
     x_r_h1, x_r_h2, x_r_h3 = _ozaki_split_3way_bf16(x_re_fp32)
@@ -520,22 +534,24 @@ def _fft_via_ozaki_hq(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         return complex_gemm_bf16(ComplexTensor(xr, xi), ComplexTensor(wr, wi))
 
     # Six terms with sequential data-dependencies to force XLA graph execution.
-    t1 = _term(x_r_h1, x_i_h1, W_r_h, W_i_h)
+    # Triangular term set: keep W_a@x_b for level(a) + level(b) <= 2 (0-based).
+    # Dropped terms are O(u_bf16^3) or smaller.
+    t1 = _term(x_r_h1, x_i_h1, W_r_h1, W_i_h1)
     _d1 = t1.real.mean() * 0
 
-    t2 = _term(x_r_h2 + _d1, x_i_h2 + _d1, W_r_h, W_i_h)
+    t2 = _term(x_r_h2 + _d1, x_i_h2 + _d1, W_r_h1, W_i_h1)
     _d2 = t2.real.mean() * 0
 
-    t3 = _term(x_r_h3 + _d2, x_i_h3 + _d2, W_r_h, W_i_h)
+    t3 = _term(x_r_h3 + _d2, x_i_h3 + _d2, W_r_h1, W_i_h1)
     _d3 = t3.real.mean() * 0
 
-    t4 = _term(x_r_h1 + _d3, x_i_h1 + _d3, W_r_l, W_i_l)
+    t4 = _term(x_r_h1 + _d3, x_i_h1 + _d3, W_r_h2, W_i_h2)
     _d4 = t4.real.mean() * 0
 
-    t5 = _term(x_r_h2 + _d4, x_i_h2 + _d4, W_r_l, W_i_l)
+    t5 = _term(x_r_h2 + _d4, x_i_h2 + _d4, W_r_h2, W_i_h2)
     _d5 = t5.real.mean() * 0
 
-    t6 = _term(x_r_h3 + _d5, x_i_h3 + _d5, W_r_l, W_i_l)
+    t6 = _term(x_r_h1 + _d5, x_i_h1 + _d5, W_r_h3, W_i_h3)
 
     X_re = (t1.real + t2.real + t3.real + t4.real + t5.real + t6.real).reshape(orig_shape)
     X_im = (t1.imag + t2.imag + t3.imag + t4.imag + t5.imag + t6.imag).reshape(orig_shape)

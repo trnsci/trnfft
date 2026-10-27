@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`precision="ozaki_hq"` now meets its 1e-6 bound, and `"ozaki"` its 1.6e-5 bound,
+  at N ≤ 256** (`trnfft/fft_core.py`, #81). Spike B5 on Trn2 (SDK 2.33) measured
+  ozaki_hq at 4.9e-6 / 9.9e-6 / 2.0e-5 and ozaki at 5.9e-6 / 1.0e-5 / 2.0e-5 at
+  N=64/128/256, so HQ gave no gain. CPU emulation reproduces those numbers to two
+  digits. There were two causes:
+  1. The DFT matrix was built as `cos(2π·k·j/N)` in FP32 with no `k·j mod N`
+     reduction. Angles up to ~2πN rounded to FP32 give a twiddle error of about
+     N·1e-7 relative, which neither split can remove. That error grows linearly
+     with N and is the same for both modes.
+  2. ozaki_hq split W only 2-way, which leaves a ~u_bf16² residual in W
+     (~1.3–1.9e-6 even with exact twiddles).
+
+  New `_dft_matrix_fp64` builds W in FP64 with angles reduced mod N. All DFT-GEMM
+  paths now use it (`fast`, `double`, `bf16`, `ozaki`, `ozaki_hq`). Both Ozaki
+  modes split W from FP64. ozaki_hq splits W 3-way and uses the triangular
+  6-term product (level(W) + level(x) ≤ 2), so it still runs 6 matmuls. CPU
+  results: ozaki 3.4e-6–3.8e-6, ozaki_hq 6.8e-8–1.1e-7. The old "≈ 2e-9" ozaki_hq
+  claim ignored the FP32 output floor and has been removed. The N=512 B5 row
+  never ran Ozaki: both modes dispatch only for N ≤ 256 and fall through to FP32
+  Stockham above that. This is now documented. Hardware re-check pending.
+
 - **`complex_gemm_bf16` returns results on the caller's device** (`trnfft/nki/dispatch.py`).
   The hardware path moved inputs to the device but returned the kernel outputs without
   moving them back, so `_fft_via_ozaki_hq` mixed device and CPU tensors

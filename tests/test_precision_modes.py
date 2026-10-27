@@ -261,8 +261,8 @@ class TestOzakiPrecision:
     CPU-runnable: the CPU fallback in complex_gemm_bf16 casts BF16→FP32 before
     matmul, so Ozaki on CPU uses FP32 arithmetic throughout. This gives near-FP64
     accuracy on CPU (no BF16 quantisation) and validates the algorithm structure.
-    On hardware, expected O(u_bf16^2) ≈ 1e-5 for "ozaki" and O(u_bf16^3) ≈ 1e-8
-    for "ozaki_hq".
+    Bounds (precision.py): "ozaki" ≤ 1.6e-5, "ozaki_hq" ≤ 1e-6 at N ≤ 256; see
+    TestOzakiBoundsRegression (trnfft#81).
     """
 
     @pytest.mark.parametrize("n", [64, 128, 256])
@@ -490,3 +490,68 @@ class TestOzakiHQCharacterization:
         finally:
             fft_core._DFT_GEMM_THRESHOLD = old_thr
             set_ozaki_product_precision_verified(False)
+
+
+class TestOzakiBoundsRegression:
+    """Regression for trnfft#81: Ozaki modes vs the precision.py bounds.
+
+    complex_gemm_bf16's CPU fallback multiplies BF16 values in FP32, and products of
+    BF16 values are exact in FP32. So the CPU numbers are what hardware with exact
+    BF16 products gives; trn2 (SDK 2.33, spike B5) matched them to two digits before
+    the fix. Error is a relative Frobenius norm vs FP64 torch.fft, as in B5.
+    """
+
+    @staticmethod
+    def _rel(out, xr, xi):
+        ref = torch.fft.fft(torch.complex(xr.double(), xi.double()))
+        got = torch.complex(out.real.double(), out.imag.double())
+        return (torch.linalg.norm(got - ref) / torch.linalg.norm(ref)).item()
+
+    def test_dft_matrix_fp64_is_exact(self):
+        from trnfft.fft_core import _dft_matrix_fp64
+
+        for n in (64, 256):
+            for inverse in (False, True):
+                c, s = _dft_matrix_fp64(n, inverse)
+                k = torch.arange(n, dtype=torch.float64)
+                sign = 1.0 if inverse else -1.0
+                ref = torch.exp(sign * 2j * torch.pi * torch.outer(k, k) / n)
+                assert c.dtype == torch.float64
+                assert torch.allclose(torch.complex(c, s), ref, atol=1e-12)
+
+    @pytest.mark.parametrize("n", [64, 128, 256])
+    def test_ozaki_within_bound(self, n):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_ozaki
+
+        torch.manual_seed(0)
+        xr, xi = torch.randn(8, n), torch.randn(8, n)
+        err = self._rel(_fft_via_ozaki(ComplexTensor(xr, xi), inverse=False), xr, xi)
+        # precision.py bound is 1.6e-5; pre-#81 this was 2.0e-5 at N=256.
+        assert err < 1.6e-5 / 2, f"N={n}: ozaki rel err {err:.2e}"
+
+    @pytest.mark.parametrize("n", [64, 128, 256])
+    def test_ozaki_hq_within_1e6_bound(self, n):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_ozaki, _fft_via_ozaki_hq
+
+        torch.manual_seed(0)
+        xr, xi = torch.randn(8, n), torch.randn(8, n)
+        ct = ComplexTensor(xr, xi)
+        err_hq = self._rel(_fft_via_ozaki_hq(ct, inverse=False), xr, xi)
+        err_oz = self._rel(_fft_via_ozaki(ct, inverse=False), xr, xi)
+        # pre-#81: 5.0e-6 / 1.0e-5 / 2.1e-5, the same as ozaki.
+        assert err_hq < 1e-6 / 2, f"N={n}: ozaki_hq rel err {err_hq:.2e}"
+        assert err_hq < err_oz / 10, f"N={n}: hq {err_hq:.2e} vs ozaki {err_oz:.2e}"
+
+    @pytest.mark.parametrize("n", [64, 256])
+    def test_ozaki_hq_inverse_within_bound(self, n):
+        from trnfft.complex import ComplexTensor
+        from trnfft.fft_core import _fft_via_ozaki_hq
+
+        torch.manual_seed(1)
+        xr, xi = torch.randn(4, n), torch.randn(4, n)
+        out = _fft_via_ozaki_hq(ComplexTensor(xr, xi), inverse=True)
+        ref = torch.fft.ifft(torch.complex(xr.double(), xi.double()))
+        got = torch.complex(out.real.double(), out.imag.double())
+        assert (torch.linalg.norm(got - ref) / torch.linalg.norm(ref)).item() < 5e-7
