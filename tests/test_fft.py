@@ -949,8 +949,12 @@ class TestFourStepDispatch:
     @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
     @pytest.mark.parametrize("batch", [1, 32, 33])
     @pytest.mark.parametrize("inverse", [False, True])
-    def test_matches_numpy_two_gemm_launches(self, monkeypatch, n, batch, inverse):
+    @pytest.mark.parametrize("fused", [False, True])
+    def test_matches_numpy_two_gemm_launches(self, monkeypatch, n, batch, inverse, fused):
+        from trnfft import fft_core as fc
+
         calls = self._install_fakes(monkeypatch)
+        monkeypatch.setattr(fc, "_FOUR_STEP_FUSED_TWIDDLE", fused)
         g = torch.Generator().manual_seed(n + batch)
         xr, xi = torch.randn(batch, n, generator=g), torch.randn(batch, n, generator=g)
         y = (trnfft.ifft if inverse else trnfft.fft)(ComplexTensor(xr, xi))
@@ -1017,3 +1021,68 @@ class TestFourStepDispatch:
         monkeypatch.setenv("TRNFFT_TEST_KNOB", "abc")
         with pytest.warns(UserWarning):
             assert fc._env_int("TRNFFT_TEST_KNOB", 256) == 256
+
+    def test_defaults(self):
+        """Defaults chosen from the Trn2 A/B (trnfft#82)."""
+        import os
+
+        from trnfft import fft_core as fc
+
+        knobs = (
+            "TRNFFT_DFT_GEMM_THRESHOLD",
+            "TRNFFT_FOUR_STEP_MAX",
+            "TRNFFT_FOUR_STEP_FUSED_TWIDDLE",
+        )
+        if any(os.environ.get(k) for k in knobs):
+            pytest.skip("trnfft env knob set; defaults overridden")
+
+        assert fc._env_int("TRNFFT_DFT_GEMM_THRESHOLD", 1024) == fc._DFT_GEMM_THRESHOLD
+        assert fc._DFT_GEMM_THRESHOLD == 1024
+        assert fc._FOUR_STEP_MAX == 4096
+        assert fc._FOUR_STEP_FUSED_TWIDDLE is True
+        assert fc._LOWP_GEMM_MAX == 256
+
+    @pytest.mark.parametrize("n,expect_gemms", [(1024, 1), (2048, 2), (4096, 2)])
+    def test_default_threshold_routing(self, monkeypatch, n, expect_gemms):
+        from trnfft import fft_core as fc
+
+        calls = self._install_fakes(monkeypatch)
+        monkeypatch.setattr(fc, "_DFT_GEMM_THRESHOLD", 1024)
+        xr, xi = torch.randn(32, n), torch.randn(32, n)
+        y = trnfft.fft(ComplexTensor(xr, xi))
+        ref = np.fft.fft(xr.double().numpy() + 1j * xi.double().numpy())
+        assert self._rel(y, ref) < 1e-5
+        assert calls["gemm"] == expect_gemms
+
+    def test_bf16_mode_keeps_256_cap(self, monkeypatch):
+        """bf16 above N=256 must not take the BF16 GEMM even with threshold 1024."""
+        from trnfft import fft_core as fc
+
+        self._install_fakes(monkeypatch)
+        monkeypatch.setattr(fc, "_DFT_GEMM_THRESHOLD", 1024)
+
+        def _no_bf16(*a, **k):
+            raise AssertionError("bf16 GEMM reached above _LOWP_GEMM_MAX")
+
+        monkeypatch.setattr(fc, "_fft_via_gemm_bf16", _no_bf16)
+        x = ComplexTensor(torch.randn(4, 512), torch.randn(4, 512))
+        fc._cooley_tukey_nki_nograd(x, inverse=False, precision="bf16")
+
+
+class TestBluesteinChirpPrecision:
+    """Chirp built in FP64 with k^2 mod 2N (trnfft#82 hardware finding).
+
+    The FP32 chirp angle pi*k^2/N gave 1.2e-4 rel error at N=1000 (Trn2 and
+    CPU) and 4.4e-4 at N=4097; with the reduction CPU gives ~4e-7.
+    """
+
+    @pytest.mark.parametrize("n", [7, 1000, 4097])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_matches_numpy(self, n, inverse):
+        g = torch.Generator().manual_seed(n)
+        x = torch.randn(4, n, generator=g)
+        y = trnfft.ifft(x) if inverse else trnfft.fft(x)
+        ref = (np.fft.ifft if inverse else np.fft.fft)(x.double().numpy())
+        got = y.real.double().numpy() + 1j * y.imag.double().numpy()
+        rel = np.linalg.norm(got - ref) / np.linalg.norm(ref)
+        assert rel < 2e-6, f"N={n}: rel err {rel:.2e}"

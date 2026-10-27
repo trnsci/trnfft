@@ -3,8 +3,10 @@
 Three modes trade off speed vs numerical accuracy:
 
 * ``"fast"`` (default) — straight FP32 throughout. Matches the behavior of
-  every trnfft release prior to v0.11.0. Bluestein at N ≥ 500 accumulates
-  ~2e-2 relative error from the 3-FFT chain.
+  every trnfft release prior to v0.11.0. Bluestein (non-power-of-2 N) measures
+  ~4e-7 rel error at N=1000/4097 on CPU since the chirp is built in FP64 with
+  k² reduced mod 2N (trnfft#82). Before that the FP32 chirp angle gave 1.2e-4
+  at N=1000 and 4.4e-4 at N=4097.
 * ``"kahan"`` — compensated complex multiply (Dekker 2Prod) in the Bluestein
   chirp multiplications on the host, plus a Kahan variant of the NKI
   butterfly kernel. Measured butterfly rel error (trn1, SDK 2.29, 2026-04-22):
@@ -62,9 +64,10 @@ Three modes trade off speed vs numerical accuracy:
   Run TestOzakiHQCharacterization to test your hardware, then call
   set_ozaki_product_precision_verified(True) to enable.
 
-  Both Ozaki modes dispatch only for N ≤ 256 (``_DFT_GEMM_THRESHOLD``). At larger
-  N, "ozaki"/"ozaki_hq" fall through to the FP32 Stockham/butterfly path, which has
-  the "fast" accuracy (≤ 4e-6 butterfly) with no Ozaki correction.
+  Both Ozaki modes dispatch only for N ≤ 256 (``_LOWP_GEMM_MAX``). At larger
+  N, "ozaki"/"ozaki_hq" fall through to the FP32 single-GEMM (N ≤ 1024) or
+  four-step (N ≤ 4096) path, which has the "fast" accuracy (~1.5e-7 on Trn2)
+  with no Ozaki correction.
 
 
 Backend interaction: "kahan" and "double" do not disable the NKI backend

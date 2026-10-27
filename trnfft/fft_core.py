@@ -128,22 +128,24 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
 #   straight win — asymmetric hardware affordances flip the usual
 #   complexity-vs-constant tradeoff.
 #
-#   Threshold set to 256: measured upper bound where FP32 O(N^2)
-#   nc_matmul accumulation stays within 1e-3 relative error vs numpy
-#   reference. Widened bench on trn1 (2026-04-13, docs/design-notes/
-#   fft-is-a-gemm.md) shows the launch-count win extends cleanly to
-#   N=1024 (5.3× over butterfly), with a hard perf cliff at N=2048.
-#   The 256 cap is precision-bound, not perf-bound — raising it further
-#   needs Stockham radix-r (Thread B) to break the O(N^2) accumulation
-#   without falling back to butterfly. test_fft_nki_vs_numpy confirmed
-#   N=256 stays inside 1e-3 tol; N=1024 exceeds (observed 2.2% rel err).
+#   Default 1024 (trnfft#82). Trn2 (SDK 2.33 / NKI 0.7.0, 2026-10-27), batch
+#   32, device-resident warm median: single GEMM 0.26 ms (N=512) / 0.31 ms
+#   (N=1024) vs four-step 1.23 / 2.04 ms (fused twiddle) vs pre-#82 Stockham
+#   5.45 / 7.56 ms. Device rel err vs FP64: 1.35e-7 (N=512), 1.54e-7
+#   (N=1024). The earlier 256 cap cited "2.2% rel err at N=1024" on trn1;
+#   that was the pre-#81 FP32 twiddle build (angles ~2*pi*N rounded to
+#   FP32), not the K=N PSUM accumulation, and is obsolete. At N=2048 the
+#   single GEMM (1.08 ms) and four-step (1.20 ms) are close; at N=4096
+#   four-step wins (2.18 vs 2.36 ms) and the N^2 W stops being cheap.
+#
+#   The low-precision GEMM modes (bf16 / bf16_refined / ozaki / ozaki_hq)
+#   keep their validated N <= 256 range via _LOWP_GEMM_MAX.
 #
 #   Env knob TRNFFT_DFT_GEMM_THRESHOLD (read at import; tests still
 #   monkeypatch the module constant) lets a device A/B the single-GEMM path
-#   against the four-step / Stockham paths at N=512-4096 (trnfft#82). Raising
-#   it trades accuracy (K=N accumulation in one PSUM pass) for launch count.
-#   Setting it to 0 disables every GEMM path (DFT-GEMM and four-step), which
-#   is what the "force butterfly/Stockham" tests rely on.
+#   against the four-step / Stockham paths. Setting it to 0 disables every
+#   GEMM path (DFT-GEMM and four-step), which is what the "force
+#   butterfly/Stockham" tests rely on.
 
 
 def _env_int(name: str, default: int) -> int:
@@ -157,21 +159,29 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-_DFT_GEMM_THRESHOLD = _env_int("TRNFFT_DFT_GEMM_THRESHOLD", 256)
+_DFT_GEMM_THRESHOLD = _env_int("TRNFFT_DFT_GEMM_THRESHOLD", 1024)
+
+# Upper N for the bf16 / bf16_refined / ozaki / ozaki_hq GEMM modes, capped
+# further by _DFT_GEMM_THRESHOLD. Their error bounds are characterised at
+# N <= 256 only; above that they fall through to the FP32 single-GEMM /
+# four-step paths.
+_LOWP_GEMM_MAX = 256
 
 # Four-step (Bailey) FFT-as-two-GEMMs (trnfft#82). For power-of-2 N with
 # _DFT_GEMM_THRESHOLD < N <= _FOUR_STEP_MAX, N = N1*N2 (N1, N2 <= 64 at
 # N=4096) is computed as GEMM(x, W_N1) -> twiddle -> GEMM(., W_N2): two
-# Tensor-engine launches with K = N1, N2 (smaller per-GEMM accumulation than
-# the validated N=256 single GEMM) instead of 3-4 Stockham kernel launches
-# plus ~26-38 inter-stage permute/twiddle device ops and per-call twiddle
-# H2D copies. Env knob TRNFFT_FOUR_STEP_MAX (0 disables -> pre-#82 dispatch).
+# Tensor-engine launches with K = N1, N2 instead of 3-4 Stockham kernel
+# launches plus ~26-38 inter-stage permute/twiddle device ops and per-call
+# twiddle H2D copies. With the default threshold it covers N=2048/4096:
+# Trn2 1.20 / 2.18 ms (fused twiddle) vs Stockham 8.22 / 10.25 ms, device rel
+# err 1.2e-7-1.6e-7. Env TRNFFT_FOUR_STEP_MAX (0 -> pre-#82 Stockham dispatch).
 _FOUR_STEP_MAX = _env_int("TRNFFT_FOUR_STEP_MAX", 4096)
 
 # Fuse the four-step twiddle multiply into one NKI complex-mul kernel launch
-# (``_complex_mul_kernel``) instead of 6 elementwise device ops. Off by default
-# until measured on Trn2: env TRNFFT_FOUR_STEP_FUSED_TWIDDLE=1.
-_FOUR_STEP_FUSED_TWIDDLE = os.environ.get("TRNFFT_FOUR_STEP_FUSED_TWIDDLE", "").lower() in (
+# (``_complex_mul_kernel``) instead of 6 elementwise device ops. Default on
+# (trnfft#82): validated on Trn2, same accuracy, 1.67 -> 1.23 ms (N=512),
+# 2.43 -> 2.18 ms (N=4096). Env TRNFFT_FOUR_STEP_FUSED_TWIDDLE=0 to disable.
+_FOUR_STEP_FUSED_TWIDDLE = os.environ.get("TRNFFT_FOUR_STEP_FUSED_TWIDDLE", "1").lower() in (
     "1",
     "true",
     "yes",
@@ -404,8 +414,8 @@ def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Compute FFT as a single complex matmul: X = W @ x (FP32, NKI path).
 
     Routes onto the Trainium Tensor engine via `complex_gemm`. PSUM
-    accumulation on Trainium is always FP32; this path achieves ~1e-3
-    relative error at N=256 (the dispatch threshold). For FP64 accuracy,
+    accumulation on Trainium is always FP32; Trn2 measured 1.35e-7 / 1.54e-7
+    relative error at N=512 / 1024 (default threshold 1024, trnfft#82). For FP64 accuracy,
     use ``precision="double"`` which routes to :func:`_fft_via_gemm_double`.
 
     Shape handling: flattens leading batch dims to 2D (B, N), does
@@ -1291,21 +1301,21 @@ def _cooley_tukey_nki_nograd(
         return _fft_via_gemm_double(x, inverse)
 
     # "bf16" mode: BF16 compute on Tensor Engine, FP32 PSUM → FP32 output.
-    if precision == "bf16" and n <= _DFT_GEMM_THRESHOLD:
+    if precision == "bf16" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _fft_via_gemm_bf16(x, inverse)
 
     # "bf16_refined" mode: BF16 + one iterative correction → near-FP32 accuracy.
-    if precision == "bf16_refined" and n <= _DFT_GEMM_THRESHOLD:
+    if precision == "bf16_refined" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _fft_iterative_refinement(x, inverse, steps=1)
 
     # "ozaki_hq" mode: 2-level Ozaki, 6 matmuls, O(sqrt(N)*u_bf16^4) error.
     # Requires FP32 product precision in nc_matmul; not available on trn1.
-    if precision == "ozaki_hq" and n <= _DFT_GEMM_THRESHOLD:
+    if precision == "ozaki_hq" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _ozaki_or_fallback(x, inverse, hq=True)
 
     # "ozaki" mode: 1-level BF16 split, 3 matmuls, O(sqrt(N)*u_bf16^2) error.
     # Requires FP32 product precision in nc_matmul; not available on trn1.
-    if precision == "ozaki" and n <= _DFT_GEMM_THRESHOLD:
+    if precision == "ozaki" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _ozaki_or_fallback(x, inverse, hq=False)
 
     if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
@@ -1512,10 +1522,15 @@ def _bluestein(
     device = x.real.device
 
     # Chirp sequence: W_N^(k^2/2) = exp(sign * πi * k^2 / N)
-    k = torch.arange(n, dtype=x.dtype)
-    chirp_angles = sign * math.pi * k * k / n
-    chirp_re = torch.cos(chirp_angles)
-    chirp_im = torch.sin(chirp_angles)
+    # Built in FP64 with k^2 reduced mod 2N (exp(i*pi*k^2/N) has period 2N in
+    # k^2), then cast. The FP32 angle pi*k^2/N reaches ~pi*N, so rounding it
+    # gave a chirp error of ~N*1e-7 rel: 1.2e-4 at N=1000 on Trn2 and CPU
+    # alike (same bug class as trnfft#81, found in the #82 hardware run).
+    k = torch.arange(n, dtype=torch.int64)
+    k2 = (k * k) % (2 * n)
+    chirp_angles = sign * math.pi * k2.to(torch.float64) / n
+    chirp_re = torch.cos(chirp_angles).to(x.dtype)
+    chirp_im = torch.sin(chirp_angles).to(x.dtype)
 
     # Filter h = conj(chirp) with circular wrap, built on CPU in one shot
     # (no per-element device writes), then moved with the chirp.

@@ -9,37 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **NKI FFT at 256 < N ≤ 4096 now runs as two GEMM launches (four-step FFT)**
-  (`trnfft/fft_core.py`, #82). Spike B7 on Trn2 measured batch-32 FFT at
-  7.1 ms (N=1024) and 10.5 ms (N=4096) against 0.53 ms at N=256. Counting
-  dispatches per warm call (fake kernels on CPU, `meta` as the device) showed
-  why. N=1024 ran 4 Stockham kernels, 26 inter-stage permute/twiddle device ops
-  and 10 host-to-device twiddle copies, plus about 40 host ops rebuilding the
-  twiddles on every call. N=4096 ran 4 kernels, 38 device ops and 10 copies.
-  At about 0.2 ms per dispatch that accounts for the measured time.
-  New `_fft_via_four_step` splits N = N1·N2 (64×64 at N=4096). It runs
-  GEMM(x, W_N1), a twiddle multiply and GEMM(·, W_N2): 2 kernel launches and 12
-  elementwise/transpose device ops, with no per-call host work or copies. Each
-  GEMM accumulates only K = N1 or N2 ≤ 64 terms, so FP32 error drops from
-  about 1.3–2.0e-6 (Stockham, CPU emulation) to 1.3–2.1e-7 at N=512–4096.
-  The DFT matrices and twiddles are built in FP64 with mod-N reduction and
-  cached on the input's device. Forward-only on the NKI path. `"kahan"` stays
-  on the butterfly path. Paths still on Stockham before this change also take
-  four-step now: `"double"` at 1024 < N ≤ 4096 and `"bf16"`/`"ozaki*"` at N > 256.
-- **The single DFT-GEMM path caches W on the device.** It no longer rebuilds
-  the N×N FP64 matrix and copies it host-to-device on every call (2 copies and
-  10 host ops per call at N ≤ 256). For power-of-2 N the inverse 1/N is folded
-  into W. That is an exact power-of-2 scale, so results are unchanged.
-- **Env knobs for device A/B** (read at import):
-  - `TRNFFT_DFT_GEMM_THRESHOLD` (default 256): largest N for the single DFT-GEMM.
-    0 disables every GEMM path.
-  - `TRNFFT_FOUR_STEP_MAX` (default 4096): largest N for four-step. 0 restores
-    the pre-#82 Stockham dispatch.
-  - `TRNFFT_FOUR_STEP_FUSED_TWIDDLE=1`: runs the twiddle as one `_complex_mul_kernel`
-    launch instead of 6 elementwise ops. Off by default because it has not been
-    validated on Trn2.
+- **NKI FFT dispatch for 256 < N ≤ 4096 rebuilt around GEMM launches, defaults
+  chosen from a Trn2 A/B** (`trnfft/fft_core.py`, #82). Spike B7 on Trn2 had
+  batch-32 FFT at 7.1 ms (N=1024) and 10.5 ms (N=4096), against 0.53 ms at
+  N=256. Dispatch counts per warm call, from fake kernels on CPU with `meta`
+  standing in for the device, explain it. N=1024 ran 4 Stockham kernels,
+  26 inter-stage permute/twiddle device ops and 10 host-to-device twiddle
+  copies, and rebuilt the twiddles on the host (about 40 ops) every call.
+  N=4096 ran 4 kernels, 38 device ops and 10 copies.
+  - **Single DFT-GEMM default threshold raised 256 → 1024.** W is cached on
+    the device: no per-call N×N FP64 build or host-to-device copy. For
+    power-of-2 N the inverse 1/N is folded into W, an exact scale.
+  - **New four-step FFT (`_fft_via_four_step`) for 1024 < N ≤ 4096.** N = N1·N2
+    (64×64 at N=4096). It runs GEMM(x, W_N1), a twiddle multiply, then
+    GEMM(·, W_N2): 2 GEMM launches, each accumulating K ≤ 64 terms.
+  - **The four-step twiddle is fused** into one `_complex_mul_kernel` launch.
+  - Trn2 (SDK 2.33 / NKI 0.7.0), batch 32, device-resident warm median ms.
+    Columns: pre-#82 Stockham / four-step / four-step with fused twiddle /
+    single GEMM.
+    - N=512: 5.45 / 1.67 / 1.23 / **0.26**
+    - N=1024: 7.56 / 2.22 / 2.04 / **0.31**
+    - N=2048: 8.22 / 1.58 / **1.20** / 1.08
+    - N=4096: 10.25 / 2.43 / **2.18** / 2.36
+
+    The new defaults are the bold entries. At N=2048 the single GEMM is
+    slightly faster, but four-step is the default there because W would be
+    2048×2048.
+  - Accuracy on Trn2 (rel err vs FP64): single GEMM 1.35e-7 at N=512 and
+    1.54e-7 at N=1024; four-step 1.2e-7 to 1.6e-7 at N=64–4096, the same with
+    the fused twiddle. CPU emulation of Stockham gave 1.3–2.0e-6.
+  - The old comment blaming the 256 cap on "2.2% rel err at N=1024" was wrong.
+    That error came from the pre-#81 FP32 twiddle build, not from PSUM
+    accumulation, and the comment has been replaced.
+  - "kahan" stays on the butterfly path. The bf16 / bf16_refined / ozaki /
+    ozaki_hq GEMM modes keep their characterised N ≤ 256 range
+    (`_LOWP_GEMM_MAX`); above it they fall through to the FP32 GEMM paths.
+- **Env knobs** (read at import):
+  - `TRNFFT_DFT_GEMM_THRESHOLD` (default 1024). 0 disables every GEMM path.
+  - `TRNFFT_FOUR_STEP_MAX` (default 4096). 0 restores the pre-#82 Stockham
+    dispatch above the threshold.
+  - `TRNFFT_FOUR_STEP_FUSED_TWIDDLE` (default 1). 0 uses 6 elementwise device
+    ops instead of the fused kernel.
 
 ### Fixed
+
+- **Bluestein (non-power-of-2 N) chirp is now built in FP64 with k² reduced
+  mod 2N** (`trnfft/fft_core.py`, found in the #82 Trn2 run). The chirp
+  `exp(±iπk²/N)` was computed from an FP32 angle of up to about πN, which put
+  about N·1e-7 relative error into the chirp. Error was 1.2e-4 at N=1000 on
+  Trn2, against 5.1e-7 at N=7; it is the same bug class as #81. CPU results,
+  forward and inverse, batch 4:
+  - N=1000: 1.17e-4 → 3.7e-7
+  - N=4097: 4.4e-4 → 4.0e-7
+  - N=7: 4.2e-7 → 1.1e-7
 
 - **`precision="ozaki_hq"` now meets its 1e-6 bound, and `"ozaki"` its 1.6e-5 bound,
   at N ≤ 256** (`trnfft/fft_core.py`, #81). Spike B5 on Trn2 (SDK 2.33) measured
