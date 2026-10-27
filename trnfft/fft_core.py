@@ -8,7 +8,9 @@ All operations on split real/imaginary tensors for Trainium compatibility.
 
 from __future__ import annotations
 
+import functools
 import math
+import os
 import warnings
 
 import numpy as np
@@ -135,7 +137,45 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
 #   needs Stockham radix-r (Thread B) to break the O(N^2) accumulation
 #   without falling back to butterfly. test_fft_nki_vs_numpy confirmed
 #   N=256 stays inside 1e-3 tol; N=1024 exceeds (observed 2.2% rel err).
-_DFT_GEMM_THRESHOLD = 256
+#
+#   Env knob TRNFFT_DFT_GEMM_THRESHOLD (read at import; tests still
+#   monkeypatch the module constant) lets a device A/B the single-GEMM path
+#   against the four-step / Stockham paths at N=512-4096 (trnfft#82). Raising
+#   it trades accuracy (K=N accumulation in one PSUM pass) for launch count.
+#   Setting it to 0 disables every GEMM path (DFT-GEMM and four-step), which
+#   is what the "force butterfly/Stockham" tests rely on.
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        warnings.warn(f"{name}={raw!r} is not an integer; using {default}", stacklevel=2)
+        return default
+
+
+_DFT_GEMM_THRESHOLD = _env_int("TRNFFT_DFT_GEMM_THRESHOLD", 256)
+
+# Four-step (Bailey) FFT-as-two-GEMMs (trnfft#82). For power-of-2 N with
+# _DFT_GEMM_THRESHOLD < N <= _FOUR_STEP_MAX, N = N1*N2 (N1, N2 <= 64 at
+# N=4096) is computed as GEMM(x, W_N1) -> twiddle -> GEMM(., W_N2): two
+# Tensor-engine launches with K = N1, N2 (smaller per-GEMM accumulation than
+# the validated N=256 single GEMM) instead of 3-4 Stockham kernel launches
+# plus ~26-38 inter-stage permute/twiddle device ops and per-call twiddle
+# H2D copies. Env knob TRNFFT_FOUR_STEP_MAX (0 disables -> pre-#82 dispatch).
+_FOUR_STEP_MAX = _env_int("TRNFFT_FOUR_STEP_MAX", 4096)
+
+# Fuse the four-step twiddle multiply into one NKI complex-mul kernel launch
+# (``_complex_mul_kernel``) instead of 6 elementwise device ops. Off by default
+# until measured on Trn2: env TRNFFT_FOUR_STEP_FUSED_TWIDDLE=1.
+_FOUR_STEP_FUSED_TWIDDLE = os.environ.get("TRNFFT_FOUR_STEP_FUSED_TWIDDLE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Upper bound for the FP64 CPU DFT-GEMM path (precision="double" only).
 # Beyond this N, "double" mode falls through to NKI Stockham (~1e-4 FP32).
@@ -238,6 +278,128 @@ def _dft_matrix_fp64(n: int, inverse: bool) -> tuple[torch.Tensor, torch.Tensor]
     return torch.cos(angles), torch.sin(angles)
 
 
+def _is_power_of_two(v: int) -> bool:
+    return v > 0 and (v & (v - 1)) == 0
+
+
+@functools.lru_cache(maxsize=64)
+def _dft_matrix_cached(
+    n: int, inverse: bool, dtype: torch.dtype, device: torch.device, scale: float = 1.0
+) -> ComplexTensor:
+    """``_dft_matrix_fp64(n, inverse) * scale`` cast to ``dtype`` and resident on ``device``.
+
+    Cached so the N x N FP64 cos/sin build and its host->device copy happen
+    once per (n, direction, dtype, device) instead of on every call (trnfft#82).
+    ``scale`` is used to fold the inverse 1/N into W; for power-of-2 N that is
+    an exact power-of-2 scaling, so results are bit-identical to scaling after.
+    """
+    W_r, W_i = _dft_matrix_fp64(n, inverse)
+    if scale != 1.0:
+        W_r, W_i = W_r * scale, W_i * scale
+    return ComplexTensor(W_r.to(dtype).to(device), W_i.to(dtype).to(device))
+
+
+@functools.lru_cache(maxsize=64)
+def _four_step_twiddle_cached(
+    n1: int, n2: int, inverse: bool, dtype: torch.dtype, device: torch.device, rows: int = 0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Four-step twiddle ``T[n2, k1] = exp(sign*2*pi*i*n2*k1/N)``, (n2, n1), on ``device``.
+
+    Built in FP64 with ``n2*k1`` reduced mod N (same recipe as
+    ``_dft_matrix_fp64``), then cast once. With ``rows > 0`` the twiddle is
+    tiled to a contiguous ``(rows * n2, n1)`` tensor (the fused complex-mul
+    kernel takes equal shapes, no broadcast).
+    """
+    n = n1 * n2
+    sign = 1.0 if inverse else -1.0
+    a = torch.arange(n2, dtype=torch.int64).unsqueeze(1)
+    b = torch.arange(n1, dtype=torch.int64).unsqueeze(0)
+    ang = sign * 2.0 * math.pi * ((a * b) % n).to(torch.float64) / n
+    t_re, t_im = torch.cos(ang).to(dtype), torch.sin(ang).to(dtype)
+    if rows > 0:
+        t_re = t_re.repeat(rows, 1)
+        t_im = t_im.repeat(rows, 1)
+    return t_re.to(device), t_im.to(device)
+
+
+def _four_step_split(n: int) -> tuple[int, int]:
+    """N = N1 * N2 with N1 >= N2, both powers of 2 (N1 = N2 or 2*N2)."""
+    log2n = int(math.log2(n))
+    n2 = 1 << (log2n // 2)
+    return n // n2, n2
+
+
+def _fft_via_four_step(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """Four-step (Bailey) FFT as two complex GEMMs on the Tensor engine (trnfft#82).
+
+    With N = N1*N2, input index n = N2*n1 + n2 and output index k = k1 + N1*k2::
+
+        Y[b, n2, k1] = sum_n1 x[b, N2*n1 + n2] * W_N1[n1, k1]      (GEMM 1, K = N1)
+        Y[b, n2, k1] *= T[n2, k1] = W_N^(n2*k1)                    (twiddle)
+        Z[b, k1, k2] = sum_n2 Y[b, n2, k1] * W_N2[n2, k2]          (GEMM 2, K = N2)
+        X[b, k1 + N1*k2] = Z[b, k1, k2]
+
+    Two kernel launches plus three transposes and the twiddle multiply, versus
+    one launch per Stockham stage plus per-stage pack/unpack permutes and
+    twiddle multiplies. Each GEMM accumulates only K = N1 or N2 (<= 64 at
+    N=4096) terms, so the FP32 error stays at the small-N DFT-GEMM level.
+    W_N1, W_N2 and T are cached on the input's device; for the inverse the
+    1/N is folded into W_N2 (exact for power-of-2 N).
+    """
+    from .nki.dispatch import complex_gemm, complex_mask_apply
+
+    n = x.shape[-1]
+    n1, n2 = _four_step_split(n)
+    orig_shape = x.real.shape
+    dtype, device = x.real.dtype, x.real.device
+
+    re = x.real.reshape(-1, n)
+    im = x.imag.reshape(-1, n)
+    B = re.shape[0]
+    # _complex_gemm_kernel tiles M by min(M, 128) with no tail tile: pad the
+    # batch so B*N1 and B*N2 are multiples of 128 whenever they exceed 128.
+    B_pad = B
+    if (B * n2 > 128 and (B * n2) % 128) or (B * n1 > 128 and (B * n1) % 128):
+        q = 128 // min(n1, n2, 128)
+        B_pad = ((B + q - 1) // q) * q
+    if B_pad != B:
+        pad = torch.zeros(B_pad - B, n, dtype=dtype, device=device)
+        re = torch.cat([re, pad], dim=0)
+        im = torch.cat([im, pad], dim=0)
+
+    W1 = _dft_matrix_cached(n1, inverse, dtype, device)
+    W2 = _dft_matrix_cached(n2, inverse, dtype, device, (1.0 / n) if inverse else 1.0)
+
+    # (B, N1, N2) -> (B, N2, N1): rows (b, n2), contraction axis n1.
+    a_re = re.reshape(B_pad, n1, n2).transpose(1, 2).contiguous().reshape(B_pad * n2, n1)
+    a_im = im.reshape(B_pad, n1, n2).transpose(1, 2).contiguous().reshape(B_pad * n2, n1)
+    Y = complex_gemm(ComplexTensor(a_re, a_im), W1)
+
+    if _FOUR_STEP_FUSED_TWIDDLE:
+        T = ComplexTensor(*_four_step_twiddle_cached(n1, n2, inverse, dtype, device, B_pad))
+        Y = complex_mask_apply(T, Y)
+        y_re = Y.real.reshape(B_pad, n2, n1)
+        y_im = Y.imag.reshape(B_pad, n2, n1)
+    else:
+        t_re, t_im = _four_step_twiddle_cached(n1, n2, inverse, dtype, device)
+        yr = Y.real.reshape(B_pad, n2, n1)
+        yi = Y.imag.reshape(B_pad, n2, n1)
+        y_re = yr * t_re - yi * t_im
+        y_im = yr * t_im + yi * t_re
+
+    # (B, N2, N1) -> (B, N1, N2): rows (b, k1), contraction axis n2.
+    b_re = y_re.transpose(1, 2).contiguous().reshape(B_pad * n1, n2)
+    b_im = y_im.transpose(1, 2).contiguous().reshape(B_pad * n1, n2)
+    Z = complex_gemm(ComplexTensor(b_re, b_im), W2)
+
+    # (B, k1, k2) -> (B, k2, k1) -> natural order k = k1 + N1*k2.
+    X_re = Z.real.reshape(B_pad, n1, n2).transpose(1, 2).contiguous().reshape(B_pad, n)
+    X_im = Z.imag.reshape(B_pad, n1, n2).transpose(1, 2).contiguous().reshape(B_pad, n)
+    if B_pad != B:
+        X_re, X_im = X_re[:B], X_im[:B]
+    return ComplexTensor(X_re.reshape(orig_shape), X_im.reshape(orig_shape))
+
+
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Compute FFT as a single complex matmul: X = W @ x (FP32, NKI path).
 
@@ -256,14 +418,17 @@ def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     x_re = x.real.reshape(-1, n).contiguous()
     x_im = x.imag.reshape(-1, n).contiguous()
 
-    W_r, W_i = _dft_matrix_fp64(n, inverse)
-    W = ComplexTensor(W_r.to(x_re.dtype), W_i.to(x_re.dtype))
+    # Cached on the input's device (trnfft#82): no per-call N x N FP64 build
+    # or host->device copy. For power-of-2 N the inverse 1/N is folded into W
+    # (exact), saving the two scaling ops after the GEMM.
+    fold = inverse and _is_power_of_two(n)
+    W = _dft_matrix_cached(n, inverse, x_re.dtype, x_re.device, (1.0 / n) if fold else 1.0)
 
     X_2d = complex_gemm(ComplexTensor(x_re, x_im), W)
     X_re = X_2d.real.reshape(orig_shape)
     X_im = X_2d.imag.reshape(orig_shape)
     result = ComplexTensor(X_re, X_im)
-    if inverse:
+    if inverse and not fold:
         result = result * (1.0 / n)
     return result
 
@@ -1145,6 +1310,18 @@ def _cooley_tukey_nki_nograd(
 
     if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
         return _fft_via_gemm(x, inverse)
+
+    # Four-step FFT as two GEMMs (trnfft#82): 2 kernel launches instead of one
+    # per Stockham stage plus inter-stage permutes. A threshold of 0 disables
+    # it along with DFT-GEMM ("force butterfly/Stockham").
+    if (
+        _DFT_GEMM_THRESHOLD > 0
+        and n <= _FOUR_STEP_MAX
+        and n >= 4
+        and _is_power_of_two(n)
+        and precision != "kahan"
+    ):
+        return _fft_via_four_step(x, inverse)
 
     # Mixed-radix Stockham (v0.16): optimal [8^a, 4^b] plan for any power-of-2.
     # Only dispatched when mixed gives fewer stages than the best pure alternative.

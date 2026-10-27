@@ -880,3 +880,140 @@ class TestBluesteinDeviceReturn:
         ref = np.fft.fft(x.numpy().astype(np.float64))
         rel = np.linalg.norm(y.to_torch_complex().numpy() - ref) / np.linalg.norm(ref)
         assert rel < 1e-3
+
+
+class TestFourStepDispatch:
+    """Four-step FFT-as-two-GEMMs on the NKI dispatch path (trnfft#82).
+
+    Fake ``torch_xla`` + stand-in kernels (same pattern as
+    ``TestBluesteinDeviceReturn``) let the dispatch path run on CPU and count
+    kernel launches. Stockham kernels raise, so any fall-through is caught.
+    """
+
+    def _install_fakes(self, monkeypatch, device="cpu"):
+        import sys
+        import types
+
+        from trnfft import fft_core as fc
+        from trnfft.nki import dispatch
+
+        fake_xla = types.ModuleType("torch_xla")
+        fake_xla.device = lambda: torch.device(device)
+        monkeypatch.setitem(sys.modules, "torch_xla", fake_xla)
+        fake_bfly = types.ModuleType("trnfft.nki.butterfly")
+        fake_bfly.butterfly_stage_kernel = None
+        fake_bfly.butterfly_stage_kernel_kahan = None
+        monkeypatch.setitem(sys.modules, "trnfft.nki.butterfly", fake_bfly)
+
+        calls = {"gemm": 0, "mul": 0}
+
+        def fake_gemm(a_re, a_im, b_re, b_im):
+            calls["gemm"] += 1
+            for t in (a_re, a_im, b_re, b_im):
+                if t.device != torch.device(device):
+                    raise RuntimeError(f"input tensor is on {t.device} device, expected {device}")
+            # Mirror _complex_gemm_kernel's M tiling (min(M, 128), no tail tile).
+            m = a_re.shape[0]
+            assert m <= 128 or m % 128 == 0, f"M={m} not tileable"
+            return a_re @ b_re - a_im @ b_im, a_re @ b_im + a_im @ b_re
+
+        def fake_mul(a_re, a_im, b_re, b_im):
+            calls["mul"] += 1
+            return a_re * b_re - a_im * b_im, a_re * b_im + a_im * b_re
+
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_complex_gemm_kernel", fake_gemm, raising=False)
+        monkeypatch.setattr(dispatch, "_complex_mul_kernel", fake_mul, raising=False)
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(fc, "_use_nki", lambda: True)
+        monkeypatch.setattr(fc, "_DFT_GEMM_THRESHOLD", 256)
+        monkeypatch.setattr(fc, "_FOUR_STEP_MAX", 4096)
+
+        def _no_stockham(*a, **k):
+            raise AssertionError("Stockham path reached; expected four-step")
+
+        for name in (
+            "_fft_via_stockham_nki",
+            "_fft_via_stockham_nki_r8",
+            "_fft_via_stockham_nki_mixed",
+        ):
+            monkeypatch.setattr(fc, name, _no_stockham)
+        return calls
+
+    @staticmethod
+    def _rel(y, ref):
+        got = y.real.double().numpy() + 1j * y.imag.double().numpy()
+        return np.linalg.norm(got - ref) / np.linalg.norm(ref)
+
+    @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
+    @pytest.mark.parametrize("batch", [1, 32, 33])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_matches_numpy_two_gemm_launches(self, monkeypatch, n, batch, inverse):
+        calls = self._install_fakes(monkeypatch)
+        g = torch.Generator().manual_seed(n + batch)
+        xr, xi = torch.randn(batch, n, generator=g), torch.randn(batch, n, generator=g)
+        y = (trnfft.ifft if inverse else trnfft.fft)(ComplexTensor(xr, xi))
+        xc = xr.double().numpy() + 1j * xi.double().numpy()
+        ref = np.fft.ifft(xc) if inverse else np.fft.fft(xc)
+        assert y.shape == (batch, n)
+        assert self._rel(y, ref) < 1e-5
+        assert calls["gemm"] == 2
+
+    def test_fused_twiddle_uses_one_mul_kernel(self, monkeypatch):
+        from trnfft import fft_core as fc
+
+        calls = self._install_fakes(monkeypatch)
+        monkeypatch.setattr(fc, "_FOUR_STEP_FUSED_TWIDDLE", True)
+        xr, xi = torch.randn(32, 1024), torch.randn(32, 1024)
+        y = trnfft.fft(ComplexTensor(xr, xi))
+        ref = np.fft.fft(xr.double().numpy() + 1j * xi.double().numpy())
+        assert self._rel(y, ref) < 1e-5
+        assert calls == {"gemm": 2, "mul": 1}
+
+    def test_four_step_max_zero_restores_stockham(self, monkeypatch):
+        from trnfft import fft_core as fc
+
+        self._install_fakes(monkeypatch)
+        monkeypatch.setattr(fc, "_FOUR_STEP_MAX", 0)
+        with pytest.raises(AssertionError, match="Stockham path reached"):
+            trnfft.fft(ComplexTensor(torch.randn(4, 1024), torch.randn(4, 1024)))
+
+    def test_threshold_zero_disables_four_step(self, monkeypatch):
+        from trnfft import fft_core as fc
+
+        self._install_fakes(monkeypatch)
+        monkeypatch.setattr(fc, "_DFT_GEMM_THRESHOLD", 0)
+        with pytest.raises(AssertionError, match="Stockham path reached"):
+            trnfft.fft(ComplexTensor(torch.randn(4, 1024), torch.randn(4, 1024)))
+
+    def test_raised_threshold_single_gemm(self, monkeypatch):
+        from trnfft import fft_core as fc
+
+        calls = self._install_fakes(monkeypatch)
+        monkeypatch.setattr(fc, "_DFT_GEMM_THRESHOLD", 1024)
+        xr, xi = torch.randn(32, 1024), torch.randn(32, 1024)
+        y = trnfft.ifft(ComplexTensor(xr, xi))
+        ref = np.fft.ifft(xr.double().numpy() + 1j * xi.double().numpy())
+        assert self._rel(y, ref) < 1e-5
+        assert calls["gemm"] == 1
+
+    def test_stays_on_caller_device(self, monkeypatch):
+        self._install_fakes(monkeypatch, device="meta")
+        x = ComplexTensor(
+            torch.empty(32, 1024, device="meta"), torch.empty(32, 1024, device="meta")
+        )
+        y = trnfft.fft(x)
+        assert y.real.device.type == "meta" and y.imag.device.type == "meta"
+        assert y.shape == (32, 1024)
+
+    def test_env_knobs_parse(self, monkeypatch):
+        from trnfft import fft_core as fc
+
+        monkeypatch.setenv("TRNFFT_TEST_KNOB", "1024")
+        assert fc._env_int("TRNFFT_TEST_KNOB", 256) == 1024
+        monkeypatch.setenv("TRNFFT_TEST_KNOB", "")
+        assert fc._env_int("TRNFFT_TEST_KNOB", 256) == 256
+        monkeypatch.setenv("TRNFFT_TEST_KNOB", "abc")
+        with pytest.warns(UserWarning):
+            assert fc._env_int("TRNFFT_TEST_KNOB", 256) == 256

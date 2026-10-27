@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **NKI FFT at 256 < N ≤ 4096 now runs as two GEMM launches (four-step FFT)**
+  (`trnfft/fft_core.py`, #82). Spike B7 on Trn2 measured batch-32 FFT at
+  7.1 ms (N=1024) and 10.5 ms (N=4096) against 0.53 ms at N=256. Counting
+  dispatches per warm call (fake kernels on CPU, `meta` as the device) showed
+  why. N=1024 ran 4 Stockham kernels, 26 inter-stage permute/twiddle device ops
+  and 10 host-to-device twiddle copies, plus about 40 host ops rebuilding the
+  twiddles on every call. N=4096 ran 4 kernels, 38 device ops and 10 copies.
+  At about 0.2 ms per dispatch that accounts for the measured time.
+  New `_fft_via_four_step` splits N = N1·N2 (64×64 at N=4096). It runs
+  GEMM(x, W_N1), a twiddle multiply and GEMM(·, W_N2): 2 kernel launches and 12
+  elementwise/transpose device ops, with no per-call host work or copies. Each
+  GEMM accumulates only K = N1 or N2 ≤ 64 terms, so FP32 error drops from
+  about 1.3–2.0e-6 (Stockham, CPU emulation) to 1.3–2.1e-7 at N=512–4096.
+  The DFT matrices and twiddles are built in FP64 with mod-N reduction and
+  cached on the input's device. Forward-only on the NKI path. `"kahan"` stays
+  on the butterfly path. Paths still on Stockham before this change also take
+  four-step now: `"double"` at 1024 < N ≤ 4096 and `"bf16"`/`"ozaki*"` at N > 256.
+- **The single DFT-GEMM path caches W on the device.** It no longer rebuilds
+  the N×N FP64 matrix and copies it host-to-device on every call (2 copies and
+  10 host ops per call at N ≤ 256). For power-of-2 N the inverse 1/N is folded
+  into W. That is an exact power-of-2 scale, so results are unchanged.
+- **Env knobs for device A/B** (read at import):
+  - `TRNFFT_DFT_GEMM_THRESHOLD` (default 256): largest N for the single DFT-GEMM.
+    0 disables every GEMM path.
+  - `TRNFFT_FOUR_STEP_MAX` (default 4096): largest N for four-step. 0 restores
+    the pre-#82 Stockham dispatch.
+  - `TRNFFT_FOUR_STEP_FUSED_TWIDDLE=1`: runs the twiddle as one `_complex_mul_kernel`
+    launch instead of 6 elementwise ops. Off by default because it has not been
+    validated on Trn2.
+
 ### Fixed
 
 - **`precision="ozaki_hq"` now meets its 1e-6 bound, and `"ozaki"` its 1.6e-5 bound,
