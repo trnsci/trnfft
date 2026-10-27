@@ -472,15 +472,12 @@ def complex_gemm_bf16(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     the inputs carry (correctness path; no throughput benefit on CPU).
     """
     if _use_nki() and not _use_simulator():
-        import torch_xla
-
-        device = torch_xla.device()
-        a_re = a.real.to(device)
-        a_im = a.imag.to(device)
-        b_re = b.real.to(device)
-        b_im = b.imag.to(device)
+        # Move inputs to the device, then move results back to the caller's
+        # device (like the autograd wrappers). Returning device tensors here
+        # made _fft_via_ozaki_hq mix device and CPU tensors (trnfft#80).
+        (a_re, a_im, b_re, b_im), orig_device = _to_xla(a.real, a.imag, b.real, b.imag)
         c_real, c_imag = _complex_gemm_kernel_bf16(a_re, a_im, b_re, b_im)
-        return ComplexTensor(c_real, c_imag)
+        return ComplexTensor(c_real.to(orig_device), c_imag.to(orig_device))
     if _use_simulator():
         c_real, c_imag = _simulate_kernel(_complex_gemm_kernel_bf16, a.real, a.imag, b.real, b.imag)
         return ComplexTensor(c_real, c_imag)

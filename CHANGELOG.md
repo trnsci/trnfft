@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`complex_gemm_bf16` returns results on the caller's device** (`trnfft/nki/dispatch.py`).
+  The hardware path moved inputs to the device but returned the kernel outputs without
+  moving them back, so `_fft_via_ozaki_hq` mixed device and CPU tensors
+  (`RuntimeError: input tensor is on cpu device, expected neuron`; all four
+  `TestOzakiHQCharacterization` failures on Trn2 native, #80). It now uses the shared
+  `_to_xla` helper and moves `c_real` / `c_imag` back, matching the autograd wrappers and
+  the fft_core drivers. Audit of the other host wrappers in `trnfft/nki/` found no other
+  instance.
+
+### Added
+
+- `tests/test_nki_compile.py` (`nki_simulator` marker): runs the NKI frontend
+  (trace -> MLIR -> verify) on CPU for every `@nki.jit` kernel in `trnfft/nki/` on trn1
+  and trn2. `nki.simulate` does not run the MLIR verifier; this catches verifier errors
+  without hardware. All eight kernels verify on NKI 0.7.0.
+- CPU regression test for the `complex_gemm_bf16` device-return contract
+  (`tests/test_complex.py::TestDispatchDeviceReturn`).
+
 ## [0.22.0] - 2026-05-15
 
 ### Added

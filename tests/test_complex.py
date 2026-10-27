@@ -156,3 +156,43 @@ class TestNKIKernels:
         pytorch_result = mask * spec
         np.testing.assert_allclose(nki_result.real.numpy(), pytorch_result.real.numpy(), atol=1e-5)
         np.testing.assert_allclose(nki_result.imag.numpy(), pytorch_result.imag.numpy(), atol=1e-5)
+
+
+class TestDispatchDeviceReturn:
+    """Host wrappers must return results on the caller's device (trnfft#80).
+
+    Uses a fake ``torch_xla`` and a stand-in kernel whose outputs record
+    every ``.to(...)`` call, so the move-back contract is checked on CPU
+    without Neuron hardware.
+    """
+
+    def test_complex_gemm_bf16_moves_results_to_caller_device(self, monkeypatch):
+        import sys
+        import types
+
+        from trnfft.nki import dispatch
+
+        moved_to = []
+
+        class _KernelOut(torch.Tensor):
+            def to(self, *args, **kwargs):
+                moved_to.append(args[0] if args else kwargs.get("device"))
+                return torch.Tensor.to(self.as_subclass(torch.Tensor), *args, **kwargs)
+
+        fake_xla = types.ModuleType("torch_xla")
+        fake_xla.device = lambda: torch.device("cpu")
+        monkeypatch.setitem(sys.modules, "torch_xla", fake_xla)
+
+        def fake_kernel(a_re, a_im, b_re, b_im):
+            out = torch.zeros(a_re.shape[0], b_re.shape[1])
+            return out.as_subclass(_KernelOut), out.clone().as_subclass(_KernelOut)
+
+        monkeypatch.setattr(dispatch, "_complex_gemm_kernel_bf16", fake_kernel, raising=False)
+        monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+
+        a = ComplexTensor(torch.randn(4, 8), torch.randn(4, 8))
+        b = ComplexTensor(torch.randn(8, 3), torch.randn(8, 3))
+        c = dispatch.complex_gemm_bf16(a, b)
+        assert moved_to == [a.real.device, a.real.device]
+        assert c.real.shape == (4, 3)
