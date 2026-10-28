@@ -35,9 +35,29 @@ NVIDIA has cuFFT, cuBLAS, and native `complex64`. Trainium has none of these. Ev
 ```bash
 pip install trnfft
 
-# With Neuron hardware support
-pip install trnfft[neuron]
+# Trn2/Trn3 with TorchNeuron (native PyTorch, Neuron SDK 2.33+)
+pip install "trnfft[torchneuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
+
+# Trn1 / PyTorch-XLA lineage
+pip install "trnfft[neuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
 ```
+
+Kernels dispatch on whichever Neuron PyTorch lineage is installed:
+
+- **TorchNeuron (native)**: Trn2/Trn3, Neuron SDK 2.33+, Python ≥ 3.12,
+  `torch` 2.14, `torch-neuronx` 2.14.*. Each kernel is a PyTorch custom op
+  (`torch.ops.trnfft.*`) on the `neuron` device; no `torch_xla`. Gradients
+  flow through `torch.library.register_autograd`.
+- **PyTorch/XLA**: Trn1 (and any host on the `torch-neuronx` 2.9 lineage).
+  Kernels dispatch through `torch_xla`, unchanged.
+
+trnfft picks the native path when the native `torch_neuronx` and a `neuron`
+device are present, and the XLA path when `torch_xla` is installed. Set
+`TRNSCI_NKI_DISPATCH=native`, `xla` or `cpu` (shared by all trnsci libraries)
+to force a path. With an editable install (`pip install -e`), set
+`NKI_ENABLE_TRACE_CACHE=0`: the NKI kernel cache only versions installed
+wheels and can serve stale kernels. See
+[installation](docs/installation.md).
 
 ## Usage
 

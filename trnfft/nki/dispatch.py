@@ -12,7 +12,10 @@ Backend selection:
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import sys
+import warnings
 
 try:
     import nki
@@ -428,6 +431,147 @@ def _to_xla(*tensors):
     return [t.to(device) for t in tensors], tensors[0].device
 
 
+# ── Device dispatch path: native TorchNeuron vs XLA ──────────────────────────
+#
+# Two Neuron PyTorch lineages coexist:
+#   native  torch-neuronx 2.14+ (TorchNeuron, Trn2/Trn3): Trainium is a
+#           PyTorch `neuron` device; kernels are custom ops registered via
+#           `torch_neuronx.nki_op` (see `_native.py`).
+#   xla     torch-neuronx 2.9 lineage (PyTorch/XLA; Trn1 and Inf2 stay
+#           here): kernels dispatch on the torch_xla device via `_to_xla()`.
+# Anything else is "cpu": no device path, so a kernel launch outside the
+# simulator goes through `_to_xla` and raises exactly as it did before the
+# native path existed. Detection runs on the first launch, not at import,
+# and the native probe never imports torch_xla.
+
+_NEURON_DEVICE = "neuron"
+_dispatch_path: str | None = None
+_native_ops: dict | None = None
+_xla_deprecation_warned = False
+
+_XLA_DEPRECATION_MESSAGE = (
+    "the PyTorch/XLA path is deprecated on Trn2/Trn3; use TorchNeuron (native). "
+    "Trn1/Inf2 remain supported in maintenance mode."
+)
+
+
+def _native_available() -> bool:
+    try:
+        import torch_neuronx
+    except Exception:
+        return False
+    # The XLA-lineage torch_neuronx has no `nki_op`.
+    if not hasattr(torch_neuronx, "nki_op"):
+        return False
+    try:
+        torch.device(_NEURON_DEVICE)  # torch_neuronx renames PrivateUse1 to "neuron"
+        return torch_neuronx.device_count() > 0
+    except Exception:
+        return False
+
+
+def _torch_xla_installed() -> bool:
+    try:
+        return importlib.util.find_spec("torch_xla") is not None
+    except (ImportError, ValueError):
+        # find_spec raises ValueError for a module in sys.modules whose
+        # __spec__ is None (a stand-in module); it is importable.
+        return "torch_xla" in sys.modules
+
+
+def _detect_dispatch_path() -> str:
+    # TRNSCI_NKI_DISPATCH=auto|native|xla|cpu is shared by every trnsci
+    # library, so one variable pins the whole suite on hosts with both lineages.
+    forced = os.environ.get("TRNSCI_NKI_DISPATCH", "auto").strip().lower()
+    if forced == "native":
+        if not _native_available():
+            raise RuntimeError(
+                "TRNSCI_NKI_DISPATCH=native, but no TorchNeuron backend with a "
+                "'neuron' device is available"
+            )
+        return "native"
+    if forced == "xla":
+        if not _torch_xla_installed():
+            raise RuntimeError("TRNSCI_NKI_DISPATCH=xla, but torch_xla is not installed")
+        return "xla"
+    if forced == "cpu":
+        return "cpu"
+    if forced != "auto":
+        raise ValueError(f"TRNSCI_NKI_DISPATCH must be auto, native, xla, or cpu; got {forced!r}")
+    if _native_available():
+        return "native"
+    if _torch_xla_installed():
+        return "xla"
+    return "cpu"
+
+
+def _maybe_warn_xla_deprecation() -> None:
+    # Dormant: the suite turns this on at TorchNeuron GA (trnsci#35).
+    global _xla_deprecation_warned
+    if _xla_deprecation_warned or os.environ.get("TRNSCI_XLA_DEPRECATION", "") != "1":
+        return
+    _xla_deprecation_warned = True
+    warnings.warn(_XLA_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=3)
+
+
+def _get_dispatch_path() -> str:
+    """Return "native", "xla", or "cpu" (cached after the first call)."""
+    global _dispatch_path
+    if _dispatch_path is None:
+        _dispatch_path = _detect_dispatch_path()
+        if _dispatch_path == "xla":
+            _maybe_warn_xla_deprecation()
+    return _dispatch_path
+
+
+def _is_native() -> bool:
+    """True when kernels launch as native TorchNeuron custom ops."""
+    return _get_dispatch_path() == "native"
+
+
+def _get_native_ops() -> dict:
+    """Import `_native` (registering the trnfft:: custom ops) on first use."""
+    global _native_ops
+    if _native_ops is None:
+        from . import _native
+
+        _native_ops = _native.OPS
+    return _native_ops
+
+
+def _kernel_device() -> torch.device:
+    """Device the multi-stage drivers keep their operands on between launches."""
+    if _is_native():
+        return torch.device(_NEURON_DEVICE)
+    import torch_xla
+
+    return torch_xla.device()
+
+
+def _launch(kernel, op_name: str, *args):
+    """Run one kernel launch on the Neuron device; results return to the caller's device.
+
+    ``args`` are the kernel's positional arguments: tensors and, for the
+    butterfly kernels, Python ints. On the native path the tensors move to
+    ``device="neuron"`` and the ``trnfft::<op_name>`` custom op runs; the XLA
+    path moves them with ``_to_xla`` and calls ``kernel`` directly. Tensors
+    already on the kernel device (the Stockham / butterfly drivers keep them
+    there between stages) are not copied, and the result stays there.
+    """
+    tensors = [a for a in args if isinstance(a, torch.Tensor)]
+    if _is_native():
+        orig = tensors[0].device
+        op = _get_native_ops()[op_name]
+        out = op(*(a.to(_NEURON_DEVICE) if isinstance(a, torch.Tensor) else a for a in args))
+    else:
+        moved, orig = _to_xla(*tensors)
+        it = iter(moved)
+        out = kernel(*(next(it) if isinstance(a, torch.Tensor) else a for a in args))
+    if isinstance(out, tuple | list):
+        return tuple(o.to(orig) for o in out)
+    return out.to(orig)
+
+
 def _simulate_kernel(kernel, *tensors):
     """Route a kernel call through `nki.simulate` on CPU.
 
@@ -475,9 +619,10 @@ def complex_gemm_bf16(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
         # Move inputs to the device, then move results back to the caller's
         # device (like the autograd wrappers). Returning device tensors here
         # made _fft_via_ozaki_hq mix device and CPU tensors (trnfft#80).
-        (a_re, a_im, b_re, b_im), orig_device = _to_xla(a.real, a.imag, b.real, b.imag)
-        c_real, c_imag = _complex_gemm_kernel_bf16(a_re, a_im, b_re, b_im)
-        return ComplexTensor(c_real.to(orig_device), c_imag.to(orig_device))
+        c_real, c_imag = _launch(
+            _complex_gemm_kernel_bf16, "complex_gemm_bf16", a.real, a.imag, b.real, b.imag
+        )
+        return ComplexTensor(c_real, c_imag)
     if _use_simulator():
         c_real, c_imag = _simulate_kernel(_complex_gemm_kernel_bf16, a.real, a.imag, b.real, b.imag)
         return ComplexTensor(c_real, c_imag)

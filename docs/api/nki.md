@@ -20,6 +20,29 @@ trnfft.set_backend("nki")      # Force NKI (fails if not on Trainium)
 | --- | --- |
 | `TRNFFT_USE_SIMULATOR=1` | Route NKI kernels through `nki.simulate(kernel)(np_args)` on CPU instead of the NEFF + hardware path. Requires `nki>=0.3.0`. Correctness iteration only; simulator explicitly skips NEFF compile and SBUF/PSUM capacity checks. See [developing_kernels.md](../developing_kernels.md). |
 
+| `TRNSCI_NKI_DISPATCH=auto\|native\|xla\|cpu` | Suite-wide. Forces the device dispatch path (see below); `auto` (default) detects. Forcing an unavailable path raises. |
+| `TRNSCI_XLA_DEPRECATION=1` | Emit one `DeprecationWarning` when the XLA path is selected. Off by default. |
+
+## Dispatch path
+
+On Neuron hardware, kernels run on one of two `torch-neuronx` lineages,
+detected on the first kernel launch:
+
+- **Native (TorchNeuron, Trn2/Trn3)**: each kernel is a PyTorch custom op on
+  `device="neuron"`, also callable directly and inside
+  `torch.compile(backend="neuron")`: `torch.ops.trnfft.complex_gemm`,
+  `complex_gemm_bf16`, `complex_linear`, `complex_mul`, `butterfly_stage`,
+  `butterfly_stage_kahan`, `stockham_radix4_stage`, `stockham_radix8_w8`.
+  Each takes and returns real/imag tensor pairs. `torch.ops.trnfft.fft`
+  (`x_real, x_imag, inverse, precision`) is the composite FFT that carries
+  the analytic adjoint; `complex_gemm`, `complex_linear` and `complex_mul`
+  have theirs attached with `torch.library.register_autograd`. The ops are
+  registered only once this path is selected.
+- **XLA (Trn1)**: kernels run on the `torch_xla` device, as before.
+
+`set_backend` is unaffected: it still chooses NKI vs PyTorch. See
+[Installation](../installation.md#two-neuron-pytorch-lineages).
+
 ## NKI kernels
 
 ### Complex GEMM

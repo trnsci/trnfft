@@ -48,7 +48,10 @@ trnfft/
 │   ├── plan.py              # FFTPlan with caching
 │   ├── nki/
 │   │   ├── __init__.py
-│   │   ├── dispatch.py      # PyTorch ↔ NKI auto-dispatch + GEMM/mask kernels
+│   │   ├── dispatch.py      # PyTorch ↔ NKI auto-dispatch, GEMM/mask kernels, native/XLA launch path
+│   │   ├── _native.py       # TorchNeuron custom ops (nki_op + register_autograd), loaded lazily
+│   │   ├── autograd.py      # Analytic adjoints; autograd.Function wrappers for the XLA path
+│   │   ├── stockham.py      # Stockham radix-4 / radix-8 stage kernels
 │   │   └── butterfly.py     # NKI butterfly kernel stubs (validate on hardware)
 ├── tests/
 │   ├── conftest.py          # Fixtures, hardware detection

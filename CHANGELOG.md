@@ -142,6 +142,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Native PyTorch dispatch on TorchNeuron, alongside XLA (#80).** On
+  TorchNeuron (Neuron SDK 2.33+, `torch-neuronx` 2.14, PyTorch 2.14,
+  Trn2/Trn3) every NKI kernel is registered as a PyTorch custom op with
+  `torch_neuronx.nki_op` and dispatched on `device="neuron"`, with no
+  `torch_xla` import. Ops: `trnfft::complex_gemm`, `complex_gemm_bf16`,
+  `complex_linear`, `complex_mul`, `butterfly_stage`, `butterfly_stage_kahan`,
+  `stockham_radix4_stage`, `stockham_radix8_w8`, plus the composite
+  `trnfft::fft`. Complex values stay real/imag pairs. Kernel bodies are
+  unchanged. Earlier Trn2 results ran through a test-only `torch_xla`
+  stand-in; this is the real native path, and it has not run on hardware yet.
+  - The dispatch path is detected on the first kernel launch: native when
+    `torch_neuronx` exports `nki_op` and a `neuron` device is available, XLA
+    when `torch_xla` is installed, otherwise none. The XLA path (Trn1) is
+    unchanged, as are the PyTorch fallback and `TRNFFT_USE_SIMULATOR`.
+  - One launch helper, `dispatch._launch`, carries every kernel launch: the
+    host wrappers, `complex_gemm_bf16`, the autograd forwards, the butterfly
+    driver, and the row-chunked Stockham stages (`_launch_stockham_stage`,
+    #83), which keep their operands on the device between stages. The
+    single-GEMM DFT and the fused four-step (#82) go through it via
+    `complex_gemm` / `complex_mask_apply`.
+  - Autograd on the native path uses `torch.library.register_autograd` on
+    `complex_gemm`, `complex_linear`, `complex_mul` and `trnfft::fft` (the
+    `fft_autograd` adjoint, IFFT·n / FFT/n). The formulas are shared with the
+    `torch.autograd.Function` wrappers, which the XLA path keeps.
+  - Custom ops are registered lazily (`trnfft/nki/_native.py` is imported only
+    when the native path is selected), so CPU-only installs and the XLA
+    lineage see no import-time side effects.
+  - `TRNSCI_NKI_DISPATCH=auto|native|xla|cpu` forces the dispatch path (a
+    suite-wide variable shared by all trnsci libraries). Forcing an
+    unavailable path raises instead of falling back.
+  - `TRNSCI_XLA_DEPRECATION=1` makes the XLA path emit one
+    `DeprecationWarning`. Off by default (trnsci#35).
+  - New `[torchneuron]` extra (`torch>=2.14`, `torch-neuronx>=2.14`,
+    `nki>=0.6`); `[neuron]` stays the PyTorch/XLA lineage.
+  - Tests: `tests/test_native_dispatch.py` (CPU: path selection, launch
+    routing, lazy registration, schemas, fake shapes, the deprecation hook,
+    and register_autograd gradients against torch references);
+    `tests/test_nki_native.py` (`@pytest.mark.neuron`, native only: each op
+    against `nki.simulate`, end-to-end FFT, gradients, `torch.compile`).
+    `conftest.py` sets `NKI_ENABLE_TRACE_CACHE=0` by default.
+
 - `tests/test_nki_compile.py` (`nki_simulator` marker): runs the NKI frontend
   (trace -> MLIR -> verify) on CPU for every `@nki.jit` kernel in `trnfft/nki/` on trn1
   and trn2. `nki.simulate` does not run the MLIR verifier; this catches verifier errors
