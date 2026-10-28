@@ -7,6 +7,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **NKI FFT dispatch for 256 < N ≤ 4096 rebuilt around GEMM launches, defaults
+  chosen from a Trn2 A/B** (`trnfft/fft_core.py`, #82). Spike B7 on Trn2 had
+  batch-32 FFT at 7.1 ms (N=1024) and 10.5 ms (N=4096), against 0.53 ms at
+  N=256. Dispatch counts per warm call, from fake kernels on CPU with `meta`
+  standing in for the device, explain it. N=1024 ran 4 Stockham kernels,
+  26 inter-stage permute/twiddle device ops and 10 host-to-device twiddle
+  copies, and rebuilt the twiddles on the host (about 40 ops) every call.
+  N=4096 ran 4 kernels, 38 device ops and 10 copies.
+  - **Single DFT-GEMM default threshold raised 256 → 1024.** W is cached on
+    the device: no per-call N×N FP64 build or host-to-device copy. For
+    power-of-2 N the inverse 1/N is folded into W, an exact scale.
+  - **New four-step FFT (`_fft_via_four_step`) for 1024 < N ≤ 4096.** N = N1·N2
+    (64×64 at N=4096). It runs GEMM(x, W_N1), a twiddle multiply, then
+    GEMM(·, W_N2): 2 GEMM launches, each accumulating K ≤ 64 terms.
+  - **The four-step twiddle is fused** into one `_complex_mul_kernel` launch.
+  - Trn2 (SDK 2.33 / NKI 0.7.0), batch 32, device-resident warm median ms.
+    Columns: pre-#82 Stockham / four-step / four-step with fused twiddle /
+    single GEMM.
+    - N=512: 5.45 / 1.67 / 1.23 / **0.26**
+    - N=1024: 7.56 / 2.22 / 2.04 / **0.31**
+    - N=2048: 8.22 / 1.58 / **1.20** / 1.08
+    - N=4096: 10.25 / 2.43 / **2.18** / 2.36
+
+    The new defaults are the bold entries. At N=2048 the single GEMM is
+    slightly faster, but four-step is the default there because W would be
+    2048×2048.
+  - Accuracy on Trn2 (rel err vs FP64): single GEMM 1.35e-7 at N=512 and
+    1.54e-7 at N=1024; four-step 1.2e-7 to 1.6e-7 at N=64–4096, the same with
+    the fused twiddle. CPU emulation of Stockham gave 1.3–2.0e-6.
+  - The old comment blaming the 256 cap on "2.2% rel err at N=1024" was wrong.
+    That error came from the pre-#81 FP32 twiddle build, not from PSUM
+    accumulation, and the comment has been replaced.
+  - "kahan" stays on the butterfly path. The bf16 / bf16_refined / ozaki /
+    ozaki_hq GEMM modes keep their characterised N ≤ 256 range
+    (`_LOWP_GEMM_MAX`); above it they fall through to the FP32 GEMM paths.
+- **Env knobs** (read at import):
+  - `TRNFFT_DFT_GEMM_THRESHOLD` (default 1024). 0 disables every GEMM path.
+  - `TRNFFT_FOUR_STEP_MAX` (default 4096). 0 restores the pre-#82 Stockham
+    dispatch above the threshold.
+  - `TRNFFT_FOUR_STEP_FUSED_TWIDDLE` (default 1). 0 uses 6 elementwise device
+    ops instead of the fused kernel.
+
+### Fixed
+
+- **`precision="kahan"` is no longer less accurate than `"fast"`** (#82). On
+  Trn2 at bbff7be, `TestKahanCharacterization` failed at Bluestein N=997:
+  kahan 4.09e-7 against fast 2.62e-7, where the tests require kahan ≤ 1.5×fast.
+  The fast path had moved to the single-GEMM and four-step GEMM paths, but
+  kahan's inner power-of-2 FFTs stayed on the Kahan butterfly, which
+  measures 1.9e-7 to 4.6e-7 on trn1. The GEMM paths are more accurate on
+  Trn2 (1.2e-7 to 1.6e-7), so `"kahan"` now uses them up to N=4096, the same
+  as `"fast"`. The Kahan butterfly still applies above N=4096, or at any N with
+  `_DFT_GEMM_THRESHOLD = 0`. Bluestein keeps the compensated chirp multiplies.
+  The butterfly twiddles on the NKI and CPU paths are now built in FP64 and
+  cast once.
+  - CPU with fake kernels on the NKI dispatch path, using the neuron test's
+    max-rel metric at seed 42. Columns: fast / kahan before → kahan after.
+    - N=997: 3.37e-7 / 3.55e-7 → 3.44e-7
+    - N=1009: 3.21e-7 / 4.09e-7 → 3.80e-7
+    - N=8193: 3.66e-6 / 5.47e-7 → 2.59e-7. At this size fast uses Stockham
+      and kahan the butterfly.
+    - N=4096 (power of 2): 2.46e-7 / 4.25e-7 → 2.46e-7. Before the fix this
+      ratio was 1.73×, a latent failure of the same contract.
+  - Over 20 seeds the kahan/fast ratio at N=997 and N=1009 now averages
+    1.00 and is at most 1.16.
+
+- **Bluestein (non-power-of-2 N) chirp is now built in FP64 with k² reduced
+  mod 2N** (`trnfft/fft_core.py`, found in the #82 Trn2 run). The chirp
+  `exp(±iπk²/N)` was computed from an FP32 angle of up to about πN, which put
+  about N·1e-7 relative error into the chirp. Error was 1.2e-4 at N=1000 on
+  Trn2, against 5.1e-7 at N=7; it is the same bug class as #81. CPU results,
+  forward and inverse, batch 4:
+  - N=1000: 1.17e-4 → 3.7e-7
+  - N=4097: 4.4e-4 → 4.0e-7
+  - N=7: 4.2e-7 → 1.1e-7
+
+- **`precision="ozaki_hq"` now meets its 1e-6 bound, and `"ozaki"` its 1.6e-5 bound,
+  at N ≤ 256** (`trnfft/fft_core.py`, #81). Spike B5 on Trn2 (SDK 2.33) measured
+  ozaki_hq at 4.9e-6 / 9.9e-6 / 2.0e-5 and ozaki at 5.9e-6 / 1.0e-5 / 2.0e-5 at
+  N=64/128/256, so HQ gave no gain. CPU emulation reproduces those numbers to two
+  digits. There were two causes:
+  1. The DFT matrix was built as `cos(2π·k·j/N)` in FP32 with no `k·j mod N`
+     reduction. Angles up to ~2πN rounded to FP32 give a twiddle error of about
+     N·1e-7 relative, which neither split can remove. That error grows linearly
+     with N and is the same for both modes.
+  2. ozaki_hq split W only 2-way, which leaves a ~u_bf16² residual in W
+     (~1.3–1.9e-6 even with exact twiddles).
+
+  New `_dft_matrix_fp64` builds W in FP64 with angles reduced mod N. All DFT-GEMM
+  paths now use it (`fast`, `double`, `bf16`, `ozaki`, `ozaki_hq`). Both Ozaki
+  modes split W from FP64. ozaki_hq splits W 3-way and uses the triangular
+  6-term product (level(W) + level(x) ≤ 2), so it still runs 6 matmuls. CPU
+  results: ozaki 3.4e-6–3.8e-6, ozaki_hq 6.8e-8–1.1e-7. The old "≈ 2e-9" ozaki_hq
+  claim ignored the FP32 output floor and has been removed. The N=512 B5 row
+  never ran Ozaki: both modes dispatch only for N ≤ 256 and fall through to FP32
+  Stockham above that. This is now documented. Hardware re-check pending.
+
+- **`complex_gemm_bf16` returns results on the caller's device** (`trnfft/nki/dispatch.py`).
+  The hardware path moved inputs to the device but returned the kernel outputs without
+  moving them back, so `_fft_via_ozaki_hq` mixed device and CPU tensors
+  (`RuntimeError: input tensor is on cpu device, expected neuron`; all four
+  `TestOzakiHQCharacterization` failures on Trn2 native, #80). It now uses the shared
+  `_to_xla` helper and moves `c_real` / `c_imag` back, matching the autograd wrappers and
+  the fft_core drivers. Audit of the other host wrappers in `trnfft/nki/` found no other
+  instance.
+
+- **Bluestein (non-power-of-2) FFT keeps every tensor on the caller's device**
+  (`trnfft/fft_core.py::_bluestein`, #80 follow-up). `fft`/`ifft` at every
+  non-power-of-2 length failed on Trn2 native with `RuntimeError: input tensor is on
+  cpu device, expected neuron`. The chirp, the zero-padded `y` and the filter `h` were
+  built with CPU-default `torch.arange`/`torch.zeros`, so `x * chirp` mixed a device
+  input with a CPU chirp. They are now created on (or moved to) `x.real.device`; `h` is
+  built with one vectorized wrap instead of a per-element loop. The same CPU-default
+  factory pattern is fixed in the batch padding of the NKI butterfly/Stockham drivers,
+  the bit-reversal indices and CPU butterfly twiddles, the PyTorch Stockham reference
+  (`trnfft/stockham.py`), the four-step twiddles (`trnfft/nki/multicore.py`), and the
+  `irfft`/`stft`/`istft`/`n=` padding buffers and default windows (`trnfft/api.py`).
+  CPU-verified (meta-device stand-in); hardware re-check pending.
+
+### Added
+
+- `tests/test_nki_compile.py` (`nki_simulator` marker): runs the NKI frontend
+  (trace -> MLIR -> verify) on CPU for every `@nki.jit` kernel in `trnfft/nki/` on trn1
+  and trn2. `nki.simulate` does not run the MLIR verifier; this catches verifier errors
+  without hardware. All eight kernels verify on NKI 0.7.0.
+- CPU regression test for the `complex_gemm_bf16` device-return contract
+  (`tests/test_complex.py::TestDispatchDeviceReturn`).
+- CPU regression test for non-power-of-2 FFT/IFFT device placement through the NKI
+  dispatch path (`tests/test_fft.py::TestBluesteinDeviceReturn`). The `meta` device
+  stands in for `neuron` (it also rejects mixing with CPU tensors); fails before the fix.
+
 ## [0.22.0] - 2026-05-15
 
 ### Added

@@ -8,7 +8,9 @@ All operations on split real/imaginary tensors for Trainium compatibility.
 
 from __future__ import annotations
 
+import functools
 import math
+import os
 import warnings
 
 import numpy as np
@@ -72,7 +74,7 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
     sign = 1.0 if inverse else -1.0
 
     # Bit-reversal permutation
-    indices = _bit_reverse_indices(n, log2n)
+    indices = _bit_reverse_indices(n, log2n).to(x.real.device)
     re = x.real[..., indices].clone()
     im = x.imag[..., indices].clone()
 
@@ -83,9 +85,9 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
         half = m >> 1  # Half group
 
         # Twiddle: exp(sign * 2πi * k / m) for k = 0..half-1
-        angles = sign * 2.0 * math.pi * torch.arange(half, dtype=re.dtype) / m
-        tw_re = torch.cos(angles)
-        tw_im = torch.sin(angles)
+        angles = sign * 2.0 * math.pi * torch.arange(half, dtype=torch.float64) / m
+        tw_re = torch.cos(angles).to(dtype=re.dtype, device=re.device)
+        tw_im = torch.sin(angles).to(dtype=re.dtype, device=re.device)
 
         for k in range(half):
             # All butterflies at position k within their group, across all groups
@@ -126,16 +128,64 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
 #   straight win — asymmetric hardware affordances flip the usual
 #   complexity-vs-constant tradeoff.
 #
-#   Threshold set to 256: measured upper bound where FP32 O(N^2)
-#   nc_matmul accumulation stays within 1e-3 relative error vs numpy
-#   reference. Widened bench on trn1 (2026-04-13, docs/design-notes/
-#   fft-is-a-gemm.md) shows the launch-count win extends cleanly to
-#   N=1024 (5.3× over butterfly), with a hard perf cliff at N=2048.
-#   The 256 cap is precision-bound, not perf-bound — raising it further
-#   needs Stockham radix-r (Thread B) to break the O(N^2) accumulation
-#   without falling back to butterfly. test_fft_nki_vs_numpy confirmed
-#   N=256 stays inside 1e-3 tol; N=1024 exceeds (observed 2.2% rel err).
-_DFT_GEMM_THRESHOLD = 256
+#   Default 1024 (trnfft#82). Trn2 (SDK 2.33 / NKI 0.7.0, 2026-10-27), batch
+#   32, device-resident warm median: single GEMM 0.26 ms (N=512) / 0.31 ms
+#   (N=1024) vs four-step 1.23 / 2.04 ms (fused twiddle) vs pre-#82 Stockham
+#   5.45 / 7.56 ms. Device rel err vs FP64: 1.35e-7 (N=512), 1.54e-7
+#   (N=1024). The earlier 256 cap cited "2.2% rel err at N=1024" on trn1;
+#   that was the pre-#81 FP32 twiddle build (angles ~2*pi*N rounded to
+#   FP32), not the K=N PSUM accumulation, and is obsolete. At N=2048 the
+#   single GEMM (1.08 ms) and four-step (1.20 ms) are close; at N=4096
+#   four-step wins (2.18 vs 2.36 ms) and the N^2 W stops being cheap.
+#
+#   The low-precision GEMM modes (bf16 / bf16_refined / ozaki / ozaki_hq)
+#   keep their validated N <= 256 range via _LOWP_GEMM_MAX.
+#
+#   Env knob TRNFFT_DFT_GEMM_THRESHOLD (read at import; tests still
+#   monkeypatch the module constant) lets a device A/B the single-GEMM path
+#   against the four-step / Stockham paths. Setting it to 0 disables every
+#   GEMM path (DFT-GEMM and four-step), which is what the "force
+#   butterfly/Stockham" tests rely on.
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        warnings.warn(f"{name}={raw!r} is not an integer; using {default}", stacklevel=2)
+        return default
+
+
+_DFT_GEMM_THRESHOLD = _env_int("TRNFFT_DFT_GEMM_THRESHOLD", 1024)
+
+# Upper N for the bf16 / bf16_refined / ozaki / ozaki_hq GEMM modes, capped
+# further by _DFT_GEMM_THRESHOLD. Their error bounds are characterised at
+# N <= 256 only; above that they fall through to the FP32 single-GEMM /
+# four-step paths.
+_LOWP_GEMM_MAX = 256
+
+# Four-step (Bailey) FFT-as-two-GEMMs (trnfft#82). For power-of-2 N with
+# _DFT_GEMM_THRESHOLD < N <= _FOUR_STEP_MAX, N = N1*N2 (N1, N2 <= 64 at
+# N=4096) is computed as GEMM(x, W_N1) -> twiddle -> GEMM(., W_N2): two
+# Tensor-engine launches with K = N1, N2 instead of 3-4 Stockham kernel
+# launches plus ~26-38 inter-stage permute/twiddle device ops and per-call
+# twiddle H2D copies. With the default threshold it covers N=2048/4096:
+# Trn2 1.20 / 2.18 ms (fused twiddle) vs Stockham 8.22 / 10.25 ms, device rel
+# err 1.2e-7-1.6e-7. Env TRNFFT_FOUR_STEP_MAX (0 -> pre-#82 Stockham dispatch).
+_FOUR_STEP_MAX = _env_int("TRNFFT_FOUR_STEP_MAX", 4096)
+
+# Fuse the four-step twiddle multiply into one NKI complex-mul kernel launch
+# (``_complex_mul_kernel``) instead of 6 elementwise device ops. Default on
+# (trnfft#82): validated on Trn2, same accuracy, 1.67 -> 1.23 ms (N=512),
+# 2.43 -> 2.18 ms (N=4096). Env TRNFFT_FOUR_STEP_FUSED_TWIDDLE=0 to disable.
+_FOUR_STEP_FUSED_TWIDDLE = os.environ.get("TRNFFT_FOUR_STEP_FUSED_TWIDDLE", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Upper bound for the FP64 CPU DFT-GEMM path (precision="double" only).
 # Beyond this N, "double" mode falls through to NKI Stockham (~1e-4 FP32).
@@ -173,6 +223,9 @@ _FORCE_OZAKI_HQ = False
 # trn1 does NOT provide this — BF16 products are rounded to BF16 before PSUM,
 # leaving no signal for the correction terms to capture. Measured result on
 # trn1: ozaki ≈ ozaki_hq ≈ bf16 (~1.7e-3 rel error at N=64).
+# trn2 (SDK 2.33 / NKI 0.7.0, spike B5, 2026-10-27): ozaki/ozaki_hq matched the
+# CPU emulation to two digits, i.e. products were not the limit. The remaining
+# error was the FP32 twiddle build, fixed in trnfft#81.
 #
 # trn2/trn3 may provide FP32 product precision via TF32/MXFP8 tensor cores
 # (same gap NVIDIA TF32 exploits). Run TestOzakiHQCharacterization to verify,
@@ -218,12 +271,151 @@ def _ozaki_or_fallback(x: ComplexTensor, inverse: bool, hq: bool) -> ComplexTens
     return _fft_via_ozaki_hq(x, inverse) if hq else _fft_via_ozaki(x, inverse)
 
 
+def _dft_matrix_fp64(n: int, inverse: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (cos, sin) of the N×N DFT matrix in FP64, angles reduced mod N.
+
+    ``k*j`` is reduced modulo N in exact integer arithmetic before the angle is
+    formed, so every angle lies in [0, 2π) and the FP64 cos/sin are correctly
+    rounded to ~1e-16. Building W directly as ``cos(2π·k·j/N)`` in FP32 (the
+    pre-#81 code) makes the angle up to ~2πN and rounds it to FP32, giving a
+    twiddle error of ~N·1e-7 rel (5e-6 at N=64, 2e-5 at N=256). That error is
+    a floor no Ozaki split can get under (trnfft#81).
+    """
+    sign = 1.0 if inverse else -1.0
+    k = torch.arange(n, dtype=torch.int64)
+    kj = (k.unsqueeze(1) * k.unsqueeze(0)) % n
+    angles = sign * 2.0 * math.pi * kj.to(torch.float64) / n
+    return torch.cos(angles), torch.sin(angles)
+
+
+def _is_power_of_two(v: int) -> bool:
+    return v > 0 and (v & (v - 1)) == 0
+
+
+@functools.lru_cache(maxsize=64)
+def _dft_matrix_cached(
+    n: int, inverse: bool, dtype: torch.dtype, device: torch.device, scale: float = 1.0
+) -> ComplexTensor:
+    """``_dft_matrix_fp64(n, inverse) * scale`` cast to ``dtype`` and resident on ``device``.
+
+    Cached so the N x N FP64 cos/sin build and its host->device copy happen
+    once per (n, direction, dtype, device) instead of on every call (trnfft#82).
+    ``scale`` is used to fold the inverse 1/N into W; for power-of-2 N that is
+    an exact power-of-2 scaling, so results are bit-identical to scaling after.
+    """
+    W_r, W_i = _dft_matrix_fp64(n, inverse)
+    if scale != 1.0:
+        W_r, W_i = W_r * scale, W_i * scale
+    return ComplexTensor(W_r.to(dtype).to(device), W_i.to(dtype).to(device))
+
+
+@functools.lru_cache(maxsize=64)
+def _four_step_twiddle_cached(
+    n1: int, n2: int, inverse: bool, dtype: torch.dtype, device: torch.device, rows: int = 0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Four-step twiddle ``T[n2, k1] = exp(sign*2*pi*i*n2*k1/N)``, (n2, n1), on ``device``.
+
+    Built in FP64 with ``n2*k1`` reduced mod N (same recipe as
+    ``_dft_matrix_fp64``), then cast once. With ``rows > 0`` the twiddle is
+    tiled to a contiguous ``(rows * n2, n1)`` tensor (the fused complex-mul
+    kernel takes equal shapes, no broadcast).
+    """
+    n = n1 * n2
+    sign = 1.0 if inverse else -1.0
+    a = torch.arange(n2, dtype=torch.int64).unsqueeze(1)
+    b = torch.arange(n1, dtype=torch.int64).unsqueeze(0)
+    ang = sign * 2.0 * math.pi * ((a * b) % n).to(torch.float64) / n
+    t_re, t_im = torch.cos(ang).to(dtype), torch.sin(ang).to(dtype)
+    if rows > 0:
+        t_re = t_re.repeat(rows, 1)
+        t_im = t_im.repeat(rows, 1)
+    return t_re.to(device), t_im.to(device)
+
+
+def _four_step_split(n: int) -> tuple[int, int]:
+    """N = N1 * N2 with N1 >= N2, both powers of 2 (N1 = N2 or 2*N2)."""
+    log2n = int(math.log2(n))
+    n2 = 1 << (log2n // 2)
+    return n // n2, n2
+
+
+def _fft_via_four_step(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """Four-step (Bailey) FFT as two complex GEMMs on the Tensor engine (trnfft#82).
+
+    With N = N1*N2, input index n = N2*n1 + n2 and output index k = k1 + N1*k2::
+
+        Y[b, n2, k1] = sum_n1 x[b, N2*n1 + n2] * W_N1[n1, k1]      (GEMM 1, K = N1)
+        Y[b, n2, k1] *= T[n2, k1] = W_N^(n2*k1)                    (twiddle)
+        Z[b, k1, k2] = sum_n2 Y[b, n2, k1] * W_N2[n2, k2]          (GEMM 2, K = N2)
+        X[b, k1 + N1*k2] = Z[b, k1, k2]
+
+    Two kernel launches plus three transposes and the twiddle multiply, versus
+    one launch per Stockham stage plus per-stage pack/unpack permutes and
+    twiddle multiplies. Each GEMM accumulates only K = N1 or N2 (<= 64 at
+    N=4096) terms, so the FP32 error stays at the small-N DFT-GEMM level.
+    W_N1, W_N2 and T are cached on the input's device; for the inverse the
+    1/N is folded into W_N2 (exact for power-of-2 N).
+    """
+    from .nki.dispatch import complex_gemm, complex_mask_apply
+
+    n = x.shape[-1]
+    n1, n2 = _four_step_split(n)
+    orig_shape = x.real.shape
+    dtype, device = x.real.dtype, x.real.device
+
+    re = x.real.reshape(-1, n)
+    im = x.imag.reshape(-1, n)
+    B = re.shape[0]
+    # _complex_gemm_kernel tiles M by min(M, 128) with no tail tile: pad the
+    # batch so B*N1 and B*N2 are multiples of 128 whenever they exceed 128.
+    B_pad = B
+    if (B * n2 > 128 and (B * n2) % 128) or (B * n1 > 128 and (B * n1) % 128):
+        q = 128 // min(n1, n2, 128)
+        B_pad = ((B + q - 1) // q) * q
+    if B_pad != B:
+        pad = torch.zeros(B_pad - B, n, dtype=dtype, device=device)
+        re = torch.cat([re, pad], dim=0)
+        im = torch.cat([im, pad], dim=0)
+
+    W1 = _dft_matrix_cached(n1, inverse, dtype, device)
+    W2 = _dft_matrix_cached(n2, inverse, dtype, device, (1.0 / n) if inverse else 1.0)
+
+    # (B, N1, N2) -> (B, N2, N1): rows (b, n2), contraction axis n1.
+    a_re = re.reshape(B_pad, n1, n2).transpose(1, 2).contiguous().reshape(B_pad * n2, n1)
+    a_im = im.reshape(B_pad, n1, n2).transpose(1, 2).contiguous().reshape(B_pad * n2, n1)
+    Y = complex_gemm(ComplexTensor(a_re, a_im), W1)
+
+    if _FOUR_STEP_FUSED_TWIDDLE:
+        T = ComplexTensor(*_four_step_twiddle_cached(n1, n2, inverse, dtype, device, B_pad))
+        Y = complex_mask_apply(T, Y)
+        y_re = Y.real.reshape(B_pad, n2, n1)
+        y_im = Y.imag.reshape(B_pad, n2, n1)
+    else:
+        t_re, t_im = _four_step_twiddle_cached(n1, n2, inverse, dtype, device)
+        yr = Y.real.reshape(B_pad, n2, n1)
+        yi = Y.imag.reshape(B_pad, n2, n1)
+        y_re = yr * t_re - yi * t_im
+        y_im = yr * t_im + yi * t_re
+
+    # (B, N2, N1) -> (B, N1, N2): rows (b, k1), contraction axis n2.
+    b_re = y_re.transpose(1, 2).contiguous().reshape(B_pad * n1, n2)
+    b_im = y_im.transpose(1, 2).contiguous().reshape(B_pad * n1, n2)
+    Z = complex_gemm(ComplexTensor(b_re, b_im), W2)
+
+    # (B, k1, k2) -> (B, k2, k1) -> natural order k = k1 + N1*k2.
+    X_re = Z.real.reshape(B_pad, n1, n2).transpose(1, 2).contiguous().reshape(B_pad, n)
+    X_im = Z.imag.reshape(B_pad, n1, n2).transpose(1, 2).contiguous().reshape(B_pad, n)
+    if B_pad != B:
+        X_re, X_im = X_re[:B], X_im[:B]
+    return ComplexTensor(X_re.reshape(orig_shape), X_im.reshape(orig_shape))
+
+
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Compute FFT as a single complex matmul: X = W @ x (FP32, NKI path).
 
     Routes onto the Trainium Tensor engine via `complex_gemm`. PSUM
-    accumulation on Trainium is always FP32; this path achieves ~1e-3
-    relative error at N=256 (the dispatch threshold). For FP64 accuracy,
+    accumulation on Trainium is always FP32; Trn2 measured 1.35e-7 / 1.54e-7
+    relative error at N=512 / 1024 (default threshold 1024, trnfft#82). For FP64 accuracy,
     use ``precision="double"`` which routes to :func:`_fft_via_gemm_double`.
 
     Shape handling: flattens leading batch dims to 2D (B, N), does
@@ -236,17 +428,17 @@ def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     x_re = x.real.reshape(-1, n).contiguous()
     x_im = x.imag.reshape(-1, n).contiguous()
 
-    sign = 1.0 if inverse else -1.0
-    k = torch.arange(n, dtype=x_re.dtype)
-    kj = k.unsqueeze(1) * k.unsqueeze(0)
-    angles = sign * 2.0 * math.pi * kj / n
-    W = ComplexTensor(torch.cos(angles), torch.sin(angles))
+    # Cached on the input's device (trnfft#82): no per-call N x N FP64 build
+    # or host->device copy. For power-of-2 N the inverse 1/N is folded into W
+    # (exact), saving the two scaling ops after the GEMM.
+    fold = inverse and _is_power_of_two(n)
+    W = _dft_matrix_cached(n, inverse, x_re.dtype, x_re.device, (1.0 / n) if fold else 1.0)
 
     X_2d = complex_gemm(ComplexTensor(x_re, x_im), W)
     X_re = X_2d.real.reshape(orig_shape)
     X_im = X_2d.imag.reshape(orig_shape)
     result = ComplexTensor(X_re, X_im)
-    if inverse:
+    if inverse and not fold:
         result = result * (1.0 / n)
     return result
 
@@ -274,11 +466,7 @@ def _fft_via_gemm_double(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     x_re_cpu = x.real.detach().cpu().double()
     x_im_cpu = x.imag.detach().cpu().double()
 
-    sign = 1.0 if inverse else -1.0
-    k = torch.arange(n, dtype=torch.float64)
-    kj = k.unsqueeze(1) * k.unsqueeze(0)
-    angles = sign * 2.0 * math.pi * kj / n
-    W = ComplexTensor(torch.cos(angles), torch.sin(angles))
+    W = ComplexTensor(*_dft_matrix_fp64(n, inverse))
 
     orig_shape = x_re_cpu.shape
     x_re_2d = x_re_cpu.reshape(-1, n).contiguous()
@@ -324,12 +512,9 @@ def _fft_via_gemm_bf16(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     x_re = x.real.reshape(-1, n).to(torch.bfloat16).contiguous()
     x_im = x.imag.reshape(-1, n).to(torch.bfloat16).contiguous()
 
-    sign = 1.0 if inverse else -1.0
-    k = torch.arange(n, dtype=torch.float32)  # FP32 angles for accuracy
-    kj = k.unsqueeze(1) * k.unsqueeze(0)
-    angles = sign * 2.0 * math.pi * kj / n
     # Quantize W to BF16 — this is the BF16 DFT-matrix approximation.
-    W = ComplexTensor(torch.cos(angles).bfloat16(), torch.sin(angles).bfloat16())
+    W_r, W_i = _dft_matrix_fp64(n, inverse)
+    W = ComplexTensor(W_r.bfloat16(), W_i.bfloat16())
 
     # complex_gemm_bf16 returns FP32 (PSUM not rounded to BF16).
     X_2d = complex_gemm_bf16(ComplexTensor(x_re, x_im), W)
@@ -384,7 +569,7 @@ def _fft_iterative_refinement(x: ComplexTensor, inverse: bool, steps: int = 1) -
 def _ozaki_split_bf16(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Split FP32 tensor into BF16 high + low parts (1-level ORO split)."""
     x_high = x.bfloat16()
-    x_low = (x - x_high.float()).bfloat16()
+    x_low = (x - x_high.to(x.dtype)).bfloat16()
     return x_high, x_low
 
 
@@ -400,9 +585,9 @@ def _ozaki_split_3way_bf16(
     Magnitudes: |x_h1| ~ |x|, |x_h2| ~ u_bf16·|x|, |x_h3| ~ u_bf16²·|x|.
     """
     x_h1 = x.bfloat16()
-    r1 = x - x_h1.float()  # FP32 residual — NOT cast to BF16 here
+    r1 = x - x_h1.to(x.dtype)  # FP32/FP64 residual — NOT cast to BF16 here
     x_h2 = r1.bfloat16()
-    x_h3 = (r1 - x_h2.float()).bfloat16()
+    x_h3 = (r1 - x_h2.to(x.dtype)).bfloat16()
     return x_h1, x_h2, x_h3
 
 
@@ -414,26 +599,26 @@ def _fft_via_ozaki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     directly so each term takes exactly the same hardware path as the working
     BF16 benchmark.
 
-    Expected accuracy: O(sqrt(N) * u_bf16^2) ≈ 8e-6–1.6e-5 rel error at N=64–256.
+    Expected accuracy: ~3.5e-6–4e-6 rel error at N=64–256 (dominated by the
+    dropped W_l@x_l term and the W/x split residuals, all O(u_bf16^2)). W is built
+    and split from FP64 (trnfft#81); the earlier FP32 W added ~N·1e-7 of twiddle
+    error on top.
     Cost: 3× BF16 DFT-GEMM ≈ 2× FP32 DFT-GEMM.
     """
     n = x.shape[-1]
     orig_shape = x.real.shape
 
-    sign = 1.0 if inverse else -1.0
-    k = torch.arange(n, dtype=torch.float32)
-    kj = k.unsqueeze(1) * k.unsqueeze(0)
-    angles = sign * 2.0 * math.pi * kj / n
-    W_r_fp32 = torch.cos(angles)  # (n, n) FP32
-    W_i_fp32 = torch.sin(angles)
+    # W in FP64 (angles reduced mod n) and split from FP64: an FP32 W carries
+    # ~N·1e-7 twiddle error that the split cannot remove (trnfft#81).
+    W_r_fp64, W_i_fp64 = _dft_matrix_fp64(n, inverse)
 
     # Ozaki splits (CPU → BF16)
     x_re_fp32 = x.real.reshape(-1, n).contiguous()
     x_im_fp32 = x.imag.reshape(-1, n).contiguous()
     x_r_h, x_r_l = _ozaki_split_bf16(x_re_fp32)
     x_i_h, x_i_l = _ozaki_split_bf16(x_im_fp32)
-    W_r_h, W_r_l = _ozaki_split_bf16(W_r_fp32)
-    W_i_h, W_i_l = _ozaki_split_bf16(W_i_fp32)
+    W_r_h, W_r_l = _ozaki_split_bf16(W_r_fp64)
+    W_i_h, W_i_l = _ozaki_split_bf16(W_i_fp64)
 
     def _term(xr, xi, wr, wi) -> ComplexTensor:
         """One BF16 DFT-GEMM term using the validated BF16 kernel path."""
@@ -478,17 +663,24 @@ def _fft_via_ozaki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
 
 def _fft_via_ozaki_hq(x: ComplexTensor, inverse: bool) -> ComplexTensor:
-    """2-level Ozaki DFT-GEMM: W 2-split × x 3-split → 6 BF16 matmuls, FP32 accumulation.
+    """2-level Ozaki DFT-GEMM: W 3-split × x 3-split → 6 BF16 matmuls, FP32 accumulation.
 
-    Achieves O(sqrt(N)·u_bf16^4) ≈ 2e-9 rel error at N=64 — near-FP64 accuracy
-    without leaving the Tensor Engine.
+    Target: ≤ 1e-6 rel error at N ≤ 256. The FP32 output (and FP32 PSUM sum of the
+    six terms) sets the floor: measured ~7e-8 (N=64) to ~1.1e-7 (N=256) with exact
+    BF16 products (CPU emulation). The earlier "O(u_bf16^4) ≈ 2e-9" claim ignored
+    that FP32 floor.
 
-    Split structure:
-      x 3-way: x_h1 (BF16), x_h2 (BF16 of FP32 residual), x_h3 (BF16 of 2nd residual)
-      W 2-way: W_h (BF16), W_l (BF16 of FP32 residual)
+    Split structure (both from the higher-precision source, FP32 residuals or
+    better between levels):
+      x 3-way: x_h1, x_h2, x_h3 (BF16) from the FP32 input
+      W 3-way: W_h1, W_h2, W_h3 (BF16) from the FP64 DFT matrix
 
-    Six cross-terms (all combinations W_{h,l} × x_{h1,h2,h3}):
-      W_h@x_h1, W_h@x_h2, W_h@x_h3, W_l@x_h1, W_l@x_h2, W_l@x_h3
+    Six cross-terms, triangular (level(W) + level(x) ≤ 2):
+      W_h1@x_h1, W_h1@x_h2, W_h1@x_h3, W_h2@x_h1, W_h2@x_h2, W_h3@x_h1
+
+    Before trnfft#81 W was built in FP32 (twiddle error ~N·1e-7) and split only
+    2-way (residual ~u_bf16^2), so ozaki_hq landed at ozaki's level (4.9e-6 at
+    N=64, 2.0e-5 at N=256 on trn2).
 
     Cost: 6× BF16 DFT-GEMM ≈ 3.5× FP32 DFT-GEMM.
     Data-dependency trick forces sequential XLA graph execution (same as _fft_via_ozaki).
@@ -496,19 +688,16 @@ def _fft_via_ozaki_hq(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     n = x.shape[-1]
     orig_shape = x.real.shape
 
-    sign = 1.0 if inverse else -1.0
-    k = torch.arange(n, dtype=torch.float32)
-    kj = k.unsqueeze(1) * k.unsqueeze(0)
-    angles = sign * 2.0 * math.pi * kj / n
-    W_r_fp32 = torch.cos(angles)
-    W_i_fp32 = torch.sin(angles)
+    W_r_fp64, W_i_fp64 = _dft_matrix_fp64(n, inverse)
 
     x_re_fp32 = x.real.reshape(-1, n).contiguous()
     x_im_fp32 = x.imag.reshape(-1, n).contiguous()
 
-    # 2-way split of W (same as 1-level Ozaki)
-    W_r_h, W_r_l = _ozaki_split_bf16(W_r_fp32)
-    W_i_h, W_i_l = _ozaki_split_bf16(W_i_fp32)
+    # 3-way split of W, taken from FP64 (trnfft#81). A 2-way W split leaves a
+    # ~u_bf16^2 ≈ 1.5e-5 residual in W itself, capping the result at ~1.3-1.9e-6
+    # rel error however finely x is split.
+    W_r_h1, W_r_h2, W_r_h3 = _ozaki_split_3way_bf16(W_r_fp64)
+    W_i_h1, W_i_h2, W_i_h3 = _ozaki_split_3way_bf16(W_i_fp64)
 
     # 3-way split of x (FP32 residuals between levels — the 2-level key)
     x_r_h1, x_r_h2, x_r_h3 = _ozaki_split_3way_bf16(x_re_fp32)
@@ -520,22 +709,24 @@ def _fft_via_ozaki_hq(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         return complex_gemm_bf16(ComplexTensor(xr, xi), ComplexTensor(wr, wi))
 
     # Six terms with sequential data-dependencies to force XLA graph execution.
-    t1 = _term(x_r_h1, x_i_h1, W_r_h, W_i_h)
+    # Triangular term set: keep W_a@x_b for level(a) + level(b) <= 2 (0-based).
+    # Dropped terms are O(u_bf16^3) or smaller.
+    t1 = _term(x_r_h1, x_i_h1, W_r_h1, W_i_h1)
     _d1 = t1.real.mean() * 0
 
-    t2 = _term(x_r_h2 + _d1, x_i_h2 + _d1, W_r_h, W_i_h)
+    t2 = _term(x_r_h2 + _d1, x_i_h2 + _d1, W_r_h1, W_i_h1)
     _d2 = t2.real.mean() * 0
 
-    t3 = _term(x_r_h3 + _d2, x_i_h3 + _d2, W_r_h, W_i_h)
+    t3 = _term(x_r_h3 + _d2, x_i_h3 + _d2, W_r_h1, W_i_h1)
     _d3 = t3.real.mean() * 0
 
-    t4 = _term(x_r_h1 + _d3, x_i_h1 + _d3, W_r_l, W_i_l)
+    t4 = _term(x_r_h1 + _d3, x_i_h1 + _d3, W_r_h2, W_i_h2)
     _d4 = t4.real.mean() * 0
 
-    t5 = _term(x_r_h2 + _d4, x_i_h2 + _d4, W_r_l, W_i_l)
+    t5 = _term(x_r_h2 + _d4, x_i_h2 + _d4, W_r_h2, W_i_h2)
     _d5 = t5.real.mean() * 0
 
-    t6 = _term(x_r_h3 + _d5, x_i_h3 + _d5, W_r_l, W_i_l)
+    t6 = _term(x_r_h1 + _d5, x_i_h1 + _d5, W_r_h3, W_i_h3)
 
     X_re = (t1.real + t2.real + t3.real + t4.real + t5.real + t6.real).reshape(orig_shape)
     X_im = (t1.imag + t2.imag + t3.imag + t4.imag + t5.imag + t6.imag).reshape(orig_shape)
@@ -680,7 +871,7 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         pad_im = flat_im
     else:
         B_pad = ((B + PMAX - 1) // PMAX) * PMAX
-        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype)
+        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype, device=flat_re.device)
         pad_re = torch.cat([flat_re, padding], dim=0)
         pad_im = torch.cat([flat_im, padding], dim=0)
 
@@ -822,7 +1013,7 @@ def _fft_via_stockham_nki_r8(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         pad_im = flat_im
     else:
         B_pad = ((B + PMAX - 1) // PMAX) * PMAX
-        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype)
+        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype, device=flat_re.device)
         pad_re = torch.cat([flat_re, padding], dim=0)
         pad_im = torch.cat([flat_im, padding], dim=0)
 
@@ -957,7 +1148,7 @@ def _fft_via_stockham_nki_mixed(x: ComplexTensor, inverse: bool) -> ComplexTenso
         B_pad, pad_re, pad_im = B, flat_re, flat_im
     else:
         B_pad = ((B + PMAX - 1) // PMAX) * PMAX
-        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype)
+        padding = torch.zeros(B_pad - B, n, dtype=flat_re.dtype, device=flat_re.device)
         pad_re = torch.cat([flat_re, padding], dim=0)
         pad_im = torch.cat([flat_im, padding], dim=0)
 
@@ -1077,9 +1268,12 @@ def _cooley_tukey_nki_nograd(
 
     For N <= _DFT_GEMM_THRESHOLD the butterfly path is bypassed in favor of
     :func:`_fft_via_gemm`, which routes onto the Tensor engine (one matmul)
-    instead of the Vector engine (log2(N) butterfly stages). "fast" precision
-    only — the kahan variant stays on the butterfly path so the compensated
-    complex multiply remains available for users who explicitly want it.
+    instead of the Vector engine (log2(N) butterfly stages); up to
+    _FOUR_STEP_MAX the four-step two-GEMM path is used. Both apply to "kahan"
+    as well, since they are more accurate than the Kahan butterfly on Trn2
+    (trnfft#82). Above _FOUR_STEP_MAX, "kahan" uses the compensated butterfly
+    and "fast" uses Stockham. Set _DFT_GEMM_THRESHOLD = 0 to force the Kahan
+    butterfly at any N.
     """
     from .nki.butterfly import butterfly_stage_kernel, butterfly_stage_kernel_kahan
     from .nki.dispatch import _use_simulator
@@ -1110,25 +1304,38 @@ def _cooley_tukey_nki_nograd(
         return _fft_via_gemm_double(x, inverse)
 
     # "bf16" mode: BF16 compute on Tensor Engine, FP32 PSUM → FP32 output.
-    if precision == "bf16" and n <= _DFT_GEMM_THRESHOLD:
+    if precision == "bf16" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _fft_via_gemm_bf16(x, inverse)
 
     # "bf16_refined" mode: BF16 + one iterative correction → near-FP32 accuracy.
-    if precision == "bf16_refined" and n <= _DFT_GEMM_THRESHOLD:
+    if precision == "bf16_refined" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _fft_iterative_refinement(x, inverse, steps=1)
 
     # "ozaki_hq" mode: 2-level Ozaki, 6 matmuls, O(sqrt(N)*u_bf16^4) error.
     # Requires FP32 product precision in nc_matmul; not available on trn1.
-    if precision == "ozaki_hq" and n <= _DFT_GEMM_THRESHOLD:
+    if precision == "ozaki_hq" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _ozaki_or_fallback(x, inverse, hq=True)
 
     # "ozaki" mode: 1-level BF16 split, 3 matmuls, O(sqrt(N)*u_bf16^2) error.
     # Requires FP32 product precision in nc_matmul; not available on trn1.
-    if precision == "ozaki" and n <= _DFT_GEMM_THRESHOLD:
+    if precision == "ozaki" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _ozaki_or_fallback(x, inverse, hq=False)
 
-    if n <= _DFT_GEMM_THRESHOLD and precision != "kahan":
+    # "kahan" takes the GEMM paths too (trnfft#82). On Trn2 the single GEMM /
+    # four-step measure 1.2e-7-1.6e-7 rel err, below the Kahan butterfly
+    # (1.9e-7-4.6e-7, trn1): the PSUM accumulates in FP32 with no per-stage
+    # rounding to compensate. Keeping kahan on the butterfly made it *worse*
+    # than "fast" once fast moved to the GEMM paths (Bluestein N=997 on Trn2:
+    # kahan 4.09e-7 vs fast 2.62e-7). Kahan's compensated chirp multiplies in
+    # Bluestein still apply. Threshold 0 still forces the Kahan butterfly.
+    if n <= _DFT_GEMM_THRESHOLD:
         return _fft_via_gemm(x, inverse)
+
+    # Four-step FFT as two GEMMs (trnfft#82): 2 kernel launches instead of one
+    # per Stockham stage plus inter-stage permutes. A threshold of 0 disables
+    # it along with DFT-GEMM ("force butterfly/Stockham").
+    if _DFT_GEMM_THRESHOLD > 0 and n <= _FOUR_STEP_MAX and n >= 4 and _is_power_of_two(n):
+        return _fft_via_four_step(x, inverse)
 
     # Mixed-radix Stockham (v0.16): optimal [8^a, 4^b] plan for any power-of-2.
     # Only dispatched when mixed gives fewer stages than the best pure alternative.
@@ -1177,7 +1384,7 @@ def _cooley_tukey_nki_nograd(
         pad_im = flat_im
     else:
         B = ((B_orig + PMAX - 1) // PMAX) * PMAX
-        padding = torch.zeros(B - B_orig, n, dtype=flat_re.dtype)
+        padding = torch.zeros(B - B_orig, n, dtype=flat_re.dtype, device=flat_re.device)
         pad_re = torch.cat([flat_re, padding], dim=0)
         pad_im = torch.cat([flat_im, padding], dim=0)
 
@@ -1187,7 +1394,7 @@ def _cooley_tukey_nki_nograd(
     device = None if use_sim else torch_xla.device()
 
     # Bit-reversal permutation along the last dim.
-    indices = _bit_reverse_indices(n, log2n)
+    indices = _bit_reverse_indices(n, log2n).to(pad_re.device)
     re = pad_re[..., indices]
     im = pad_im[..., indices]
     if not use_sim:
@@ -1203,9 +1410,10 @@ def _cooley_tukey_nki_nograd(
 
         # Precompute twiddle factors for this stage. Expand to (total_groups, half)
         # so every batch row / group row has matching partition-dim values.
-        angles = sign * 2.0 * math.pi * torch.arange(half, dtype=x.real.dtype) / m
-        tw_re_1d = torch.cos(angles)
-        tw_im_1d = torch.sin(angles)
+        # FP64 angles/cos/sin, cast once (trnfft#82; #81 recipe).
+        angles = sign * 2.0 * math.pi * torch.arange(half, dtype=torch.float64) / m
+        tw_re_1d = torch.cos(angles).to(x.real.dtype)
+        tw_im_1d = torch.sin(angles).to(x.real.dtype)
         tw_re_bcast = tw_re_1d.unsqueeze(0).expand(total_groups, half).contiguous()
         tw_im_bcast = tw_im_1d.unsqueeze(0).expand(total_groups, half).contiguous()
 
@@ -1312,13 +1520,35 @@ def _bluestein(
     m = padded_n if padded_n is not None else (1 << (2 * n - 2).bit_length())
 
     sign = 1.0 if inverse else -1.0
+    # Every tensor built here lives on the caller's device. The chirp, the
+    # zero-padded y and the filter h were created on CPU (torch default), so
+    # on a Neuron device ``x * chirp`` raised "input tensor is on cpu device,
+    # expected neuron" at every non-power-of-2 length (trnfft#80 follow-up).
+    device = x.real.device
 
     # Chirp sequence: W_N^(k^2/2) = exp(sign * πi * k^2 / N)
-    k = torch.arange(n, dtype=x.dtype)
-    chirp_angles = sign * math.pi * k * k / n
-    chirp_re = torch.cos(chirp_angles)
-    chirp_im = torch.sin(chirp_angles)
-    chirp = ComplexTensor(chirp_re, chirp_im)
+    # Built in FP64 with k^2 reduced mod 2N (exp(i*pi*k^2/N) has period 2N in
+    # k^2), then cast. The FP32 angle pi*k^2/N reaches ~pi*N, so rounding it
+    # gave a chirp error of ~N*1e-7 rel: 1.2e-4 at N=1000 on Trn2 and CPU
+    # alike (same bug class as trnfft#81, found in the #82 hardware run).
+    k = torch.arange(n, dtype=torch.int64)
+    k2 = (k * k) % (2 * n)
+    chirp_angles = sign * math.pi * k2.to(torch.float64) / n
+    chirp_re = torch.cos(chirp_angles).to(x.dtype)
+    chirp_im = torch.sin(chirp_angles).to(x.dtype)
+
+    # Filter h = conj(chirp) with circular wrap, built on CPU in one shot
+    # (no per-element device writes), then moved with the chirp.
+    h_re = torch.zeros(m, dtype=x.dtype)
+    h_im = torch.zeros(m, dtype=x.dtype)
+    h_re[:n] = chirp_re
+    h_im[:n] = -chirp_im  # conjugate
+    if n > 1:
+        h_re[m - n + 1 :] = torch.flip(chirp_re[1:], dims=[0])
+        h_im[m - n + 1 :] = -torch.flip(chirp_im[1:], dims=[0])  # conjugate
+
+    chirp = ComplexTensor(chirp_re.to(device), chirp_im.to(device))
+    h = ComplexTensor(h_re.to(device), h_im.to(device))
 
     # Step 1: y[n] = x[n] * chirp[n]
     if precision == "kahan":
@@ -1328,21 +1558,13 @@ def _bluestein(
 
     # Step 2: Zero-pad y to length m
     batch_shape = x.shape[:-1]
-    y_pad_re = torch.zeros(*batch_shape, m, dtype=x.dtype)
-    y_pad_im = torch.zeros(*batch_shape, m, dtype=x.dtype)
+    y_pad_re = torch.zeros(*batch_shape, m, dtype=x.dtype, device=device)
+    y_pad_im = torch.zeros(*batch_shape, m, dtype=x.dtype, device=device)
     y_pad_re[..., :n] = y.real
     y_pad_im[..., :n] = y.imag
     y_padded = ComplexTensor(y_pad_re, y_pad_im)
 
-    # Step 3: Build filter h = conj(chirp) with circular wrap
-    h_re = torch.zeros(m, dtype=x.dtype)
-    h_im = torch.zeros(m, dtype=x.dtype)
-    h_re[:n] = chirp_re
-    h_im[:n] = -chirp_im  # conjugate
-    for i in range(1, n):
-        h_re[m - i] = chirp_re[i]
-        h_im[m - i] = -chirp_im[i]  # conjugate
-    h = ComplexTensor(h_re, h_im)
+    # Step 3: filter h (built above, already on ``device``)
 
     # Step 4: Circular convolution via FFT
     Y = _cooley_tukey(y_padded, inverse=False, precision=precision)

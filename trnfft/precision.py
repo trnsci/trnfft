@@ -3,8 +3,10 @@
 Three modes trade off speed vs numerical accuracy:
 
 * ``"fast"`` (default) — straight FP32 throughout. Matches the behavior of
-  every trnfft release prior to v0.11.0. Bluestein at N ≥ 500 accumulates
-  ~2e-2 relative error from the 3-FFT chain.
+  every trnfft release prior to v0.11.0. Bluestein (non-power-of-2 N) measures
+  ~4e-7 rel error at N=1000/4097 on CPU since the chirp is built in FP64 with
+  k² reduced mod 2N (trnfft#82). Before that the FP32 chirp angle gave 1.2e-4
+  at N=1000 and 4.4e-4 at N=4097.
 * ``"kahan"`` — compensated complex multiply (Dekker 2Prod) in the Bluestein
   chirp multiplications on the host, plus a Kahan variant of the NKI
   butterfly kernel. Measured butterfly rel error (trn1, SDK 2.29, 2026-04-22):
@@ -18,6 +20,13 @@ Three modes trade off speed vs numerical accuracy:
 
   Roughly 2× the op count of "fast" in the compensated sections. Use when
   forward-error budget for butterfly stages is ≤ 3e-7 (vs "fast"'s ≤ 4e-6).
+
+  Since trnfft#82, power-of-2 FFTs with N ≤ 4096 on the NKI path use the same
+  single-GEMM / four-step GEMM paths as "fast" in both modes. On Trn2 those
+  measure 1.2e-7 to 1.6e-7, which beats the Kahan butterfly. The Kahan
+  butterfly applies above N=4096, or at any N with ``_DFT_GEMM_THRESHOLD = 0``.
+  Bluestein keeps its compensated chirp multiplies. The contract is that
+  "kahan" is never less accurate than "fast".
 * ``"double"`` — promotes math to FP64 for maximum accuracy. Affects two paths:
 
   1. **Bluestein** (non-power-of-2 N): promotes the entire chirp/pad/filter
@@ -41,20 +50,31 @@ Three modes trade off speed vs numerical accuracy:
   near-FP32 at ≈1.5-2× BF16 cost. Suitable for chained FFT pipelines where
   accumulated rounding matters. Hardware validation pending (v0.17).
 
-* ``"ozaki_hq"`` — 2-level Ozaki (3-way x split + 2-way W split) for N ≤ 256.
-  6 BF16 matmuls. Theoretical O(sqrt(N)·u_bf16^4) ≈ 2e-9 rel error at N=64.
+* ``"ozaki_hq"`` — 2-level Ozaki (3-way x split + 3-way W split, triangular
+  6-term product) for N ≤ 256. 6 BF16 matmuls. Target ≤ 1e-6 rel error; the FP32
+  output floor gives ~7e-8 (N=64) to ~1.1e-7 (N=256) with exact BF16 products
+  (CPU emulation, after trnfft#81). The earlier "O(u_bf16^4) ≈ 2e-9" figure ignored
+  the FP32 floor. Before #81 (FP32 twiddles, 2-way W split) trn2 measured
+  4.9e-6 / 9.9e-6 / 2.0e-5 at N=64/128/256, the same as "ozaki" (spike B5, SDK 2.33).
   **Hardware-gated**: requires nc_matmul to compute BF16×BF16 products at FP32
-  precision before PSUM accumulation. trn1 does not provide this — measured
-  ozaki_hq ≈ bf16 ≈ 1.7e-3 on trn1 (SDK 2.29.0). trn2/trn3 likely do (TF32/MXFP8
-  product precision). Emits RuntimeWarning and falls back to "bf16" unless
+  precision before PSUM accumulation. trn1 measured ozaki_hq ≈ bf16 ≈ 1.7e-3
+  (SDK 2.29.0). Emits RuntimeWarning and falls back to "bf16" unless
   ``trnfft.set_ozaki_product_precision_verified(True)`` has been called.
 
 * ``"ozaki"`` — 1-level Ozaki-scheme DFT-GEMM for N ≤ 256 on NKI hardware.
-  3 BF16 matmuls (W_h@x_h + W_h@x_l + W_l@x_h). Theoretical O(u_bf16^2) ≈ 1.6e-5
-  rel error at N=256. **Hardware-gated**: same product-precision constraint as
-  "ozaki_hq". On trn1, measured error equals single-pass BF16. Emits RuntimeWarning
-  and falls back to "bf16" unless verified. Run TestOzakiHQCharacterization to test
-  your hardware, then call set_ozaki_product_precision_verified(True) to enable.
+  3 BF16 matmuls (W_h@x_h + W_h@x_l + W_l@x_h). Bound 1.6e-5 rel error at
+  N ≤ 256 (O(u_bf16^2)); CPU emulation gives ~3.5e-6–4e-6 after trnfft#81. Before
+  #81, trn2 measured 5.9e-6 / 1.0e-5 / 2.0e-5 at N=64/128/256, the N=256 value over
+  the bound, all of it from FP32 twiddle generation. **Hardware-gated**: same
+  product-precision constraint as "ozaki_hq". On trn1, measured error equals
+  single-pass BF16. Emits RuntimeWarning and falls back to "bf16" unless verified.
+  Run TestOzakiHQCharacterization to test your hardware, then call
+  set_ozaki_product_precision_verified(True) to enable.
+
+  Both Ozaki modes dispatch only for N ≤ 256 (``_LOWP_GEMM_MAX``). At larger
+  N, "ozaki"/"ozaki_hq" fall through to the FP32 single-GEMM (N ≤ 1024) or
+  four-step (N ≤ 4096) path, which has the "fast" accuracy (~1.5e-7 on Trn2)
+  with no Ozaki correction.
 
 
 Backend interaction: "kahan" and "double" do not disable the NKI backend
