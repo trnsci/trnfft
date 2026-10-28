@@ -161,6 +161,77 @@ def _env_int(name: str, default: int) -> int:
 
 _DFT_GEMM_THRESHOLD = _env_int("TRNFFT_DFT_GEMM_THRESHOLD", 1024)
 
+
+# Rows per Stockham kernel launch (trnfft#83). The stage kernels take a
+# (total_groups, r) operand and the compiler unrolls their 128-row tile loop,
+# so the kernel body grows with the row count. On Trn2 (SDK 2.33 / NKI 0.7.0)
+# N=2^25 put [8388608, 4] (2^23 rows) through the radix-4 kernel and BIR
+# emission failed ("body blob exceeds uint32 offset range"). N <= 2^24 passed:
+# the largest launches there were 2^21 rows (radix-8 at N=2^24, radix-4 at
+# N=2^23). Each row is one independent r-point butterfly group (its own
+# twiddle row, no cross-row reads), so larger stages are split into row chunks
+# of at most this many rows, launched in a Python loop and concatenated. The
+# kernels tile rows in blocks of 128, so a chunked launch computes exactly what
+# the unchunked launch computes for those rows. Env TRNFFT_MAX_ROWS_PER_LAUNCH,
+# read per call; rounded down to a multiple of 128, minimum 128.
+_MAX_ROWS_PER_LAUNCH = 1 << 21
+_STOCKHAM_ROW_TILE = 128
+
+
+def _max_rows_per_launch() -> int:
+    cap = _env_int("TRNFFT_MAX_ROWS_PER_LAUNCH", _MAX_ROWS_PER_LAUNCH)
+    return max(_STOCKHAM_ROW_TILE, (cap // _STOCKHAM_ROW_TILE) * _STOCKHAM_ROW_TILE)
+
+
+def _plan_row_chunks(total_rows: int, max_rows: int) -> list[tuple[int, int]]:
+    """Split ``total_rows`` into ``[start, stop)`` launches of <= ``max_rows``.
+
+    ``max_rows`` is rounded down to a multiple of 128 (minimum 128) so every
+    chunk boundary lands on a kernel row-tile boundary. Returns one chunk
+    covering all rows when no split is needed.
+    """
+    if total_rows <= 0:
+        raise ValueError(f"total_rows must be positive, got {total_rows}")
+    cap = max(_STOCKHAM_ROW_TILE, (max_rows // _STOCKHAM_ROW_TILE) * _STOCKHAM_ROW_TILE)
+    if total_rows <= cap:
+        return [(0, total_rows)]
+    return [(start, min(start + cap, total_rows)) for start in range(0, total_rows, cap)]
+
+
+def _launch_stockham_stage(kernel, rows_re, rows_im, arg_c, arg_d, use_sim: bool, per_row_cd: bool):
+    """Run a Stockham stage kernel over ``(total_groups, r)`` operands.
+
+    ``arg_c``/``arg_d`` are per-row twiddles (``per_row_cd=True``, sliced with
+    the rows) or a shared matrix such as W_8 (passed whole to every launch).
+    Launches are split per :func:`_plan_row_chunks` (trnfft#83).
+    """
+
+    def _run(a, b, c, d):
+        if use_sim:
+            import nki as _nki
+
+            o_re, o_im = _nki.simulate(kernel)(
+                a.detach().cpu().numpy(),
+                b.detach().cpu().numpy(),
+                c.detach().cpu().numpy(),
+                d.detach().cpu().numpy(),
+            )
+            return torch.from_numpy(np.asarray(o_re)), torch.from_numpy(np.asarray(o_im))
+        return kernel(a, b, c, d)
+
+    chunks = _plan_row_chunks(rows_re.shape[0], _max_rows_per_launch())
+    if len(chunks) == 1:
+        return _run(rows_re, rows_im, arg_c, arg_d)
+    outs_re, outs_im = [], []
+    for start, stop in chunks:
+        c = arg_c[start:stop].contiguous() if per_row_cd else arg_c
+        d = arg_d[start:stop].contiguous() if per_row_cd else arg_d
+        o_re, o_im = _run(rows_re[start:stop].contiguous(), rows_im[start:stop].contiguous(), c, d)
+        outs_re.append(o_re)
+        outs_im.append(o_im)
+    return torch.cat(outs_re, dim=0), torch.cat(outs_im, dim=0)
+
+
 # Upper N for the bf16 / bf16_refined / ozaki / ozaki_hq GEMM modes, capped
 # further by _DFT_GEMM_THRESHOLD. Their error bounds are characterised at
 # N <= 256 only; above that they fall through to the FP32 single-GEMM /
@@ -922,19 +993,9 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         re_groups = re_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
         im_groups = im_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
 
-        if use_sim:
-            import nki as _nki
-
-            out_re_np, out_im_np = _nki.simulate(stockham_radix4_stage_kernel)(
-                re_groups.detach().cpu().numpy(),
-                im_groups.detach().cpu().numpy(),
-                tw_r.detach().cpu().numpy(),
-                tw_i.detach().cpu().numpy(),
-            )
-            out_re = torch.from_numpy(np.asarray(out_re_np))
-            out_im = torch.from_numpy(np.asarray(out_im_np))
-        else:
-            out_re, out_im = stockham_radix4_stage_kernel(re_groups, im_groups, tw_r, tw_i)
+        out_re, out_im = _launch_stockham_stage(
+            stockham_radix4_stage_kernel, re_groups, im_groups, tw_r, tw_i, use_sim, per_row_cd=True
+        )
 
         # Stockham output permutation: (B, L, M, 4) -> (B, 4, L, M) -> (B, N)
         out_re_4d = out_re.reshape(B_pad, L, M, 4)
@@ -1073,19 +1134,9 @@ def _fft_via_stockham_nki_r8(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         pre_re = re_groups * tw_r - im_groups * tw_i
         pre_im = re_groups * tw_i + im_groups * tw_r
 
-        if use_sim:
-            import nki as _nki
-
-            out_re_np, out_im_np = _nki.simulate(stockham_radix8_w8_kernel)(
-                pre_re.detach().cpu().numpy(),
-                pre_im.detach().cpu().numpy(),
-                w8_re.detach().cpu().numpy(),
-                w8_im.detach().cpu().numpy(),
-            )
-            out_re = torch.from_numpy(np.asarray(out_re_np))
-            out_im = torch.from_numpy(np.asarray(out_im_np))
-        else:
-            out_re, out_im = stockham_radix8_w8_kernel(pre_re, pre_im, w8_re, w8_im)
+        out_re, out_im = _launch_stockham_stage(
+            stockham_radix8_w8_kernel, pre_re, pre_im, w8_re, w8_im, use_sim, per_row_cd=False
+        )
 
         # Stockham output permutation: (B, L, M, 8) → (B, 8, L, M) → (B, N)
         out_re_8d = out_re.reshape(B_pad, L, M, 8)
@@ -1204,33 +1255,19 @@ def _fft_via_stockham_nki_mixed(x: ComplexTensor, inverse: bool) -> ComplexTenso
         if r == 8:
             pre_re = re_groups * tw_r - im_groups * tw_i
             pre_im = re_groups * tw_i + im_groups * tw_r
-            if use_sim:
-                import nki as _nki
-
-                out_re_np, out_im_np = _nki.simulate(stockham_radix8_w8_kernel)(
-                    pre_re.detach().cpu().numpy(),
-                    pre_im.detach().cpu().numpy(),
-                    w8_re.detach().cpu().numpy(),
-                    w8_im.detach().cpu().numpy(),
-                )
-                out_re = torch.from_numpy(np.asarray(out_re_np))
-                out_im = torch.from_numpy(np.asarray(out_im_np))
-            else:
-                out_re, out_im = stockham_radix8_w8_kernel(pre_re, pre_im, w8_re, w8_im)
+            out_re, out_im = _launch_stockham_stage(
+                stockham_radix8_w8_kernel, pre_re, pre_im, w8_re, w8_im, use_sim, per_row_cd=False
+            )
         else:
-            if use_sim:
-                import nki as _nki
-
-                out_re_np, out_im_np = _nki.simulate(stockham_radix4_stage_kernel)(
-                    re_groups.detach().cpu().numpy(),
-                    im_groups.detach().cpu().numpy(),
-                    tw_r.detach().cpu().numpy(),
-                    tw_i.detach().cpu().numpy(),
-                )
-                out_re = torch.from_numpy(np.asarray(out_re_np))
-                out_im = torch.from_numpy(np.asarray(out_im_np))
-            else:
-                out_re, out_im = stockham_radix4_stage_kernel(re_groups, im_groups, tw_r, tw_i)
+            out_re, out_im = _launch_stockham_stage(
+                stockham_radix4_stage_kernel,
+                re_groups,
+                im_groups,
+                tw_r,
+                tw_i,
+                use_sim,
+                per_row_cd=True,
+            )
 
         out_re_rd = out_re.reshape(B_pad, L, M, r)
         out_im_rd = out_im.reshape(B_pad, L, M, r)
