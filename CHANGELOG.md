@@ -53,6 +53,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`precision="bf16_refined"` gave no refinement** (`trnfft/fft_core.py`,
+  #86). Trn2 measured 1.95e-3 / 2.03e-3 / 2.08e-3 normwise relative error at
+  N=64/128/256, the same as plain `"bf16"`, against a 1e-5 promise. CPU
+  emulation of the BF16 kernel reproduces those numbers to 3 digits, so the
+  fault was in the algorithm, not in the device path or the dispatch. The
+  #82 routing still reaches `_fft_iterative_refinement` for N ≤ 256. The cause
+  was that the IR-1 step reconstructed x from X̂ with the BF16 inverse DFT.
+  With an approximate operator on both sides, the residual's correction
+  cancels the forward BF16 W error but adds the inverse's error, which is the
+  same size. The error stays O(u_bf16). The reconstruction now uses the FP32
+  DFT-GEMM (`_fft_via_gemm`, W built in FP64). CPU emulation gives 3.6e-6
+  (N=2) to 4.9e-6 (N=256), forward and inverse, max over 20 seeds, which is
+  2× under the unchanged 1e-5 bound. More steps converge to the FP32 floor
+  (2.9e-7 at N=256 with 3 steps). Cost per step is now two BF16 GEMMs plus one
+  FP32 GEMM, so the mode is not cheaper than `"fast"`. The docstrings say so.
+- **`precision="bf16"` bound restated to 3e-3** (`trnfft/precision.py`, #86).
+  The error is BF16 rounding of W and x, about u_bf16 = 2^-9. It grows slowly
+  with log N: 1.9e-3 (N=2) to 2.16e-3 (N=256) worst case over 20 seeds on CPU,
+  and Trn2 measured 2.06e-3 / 2.09e-3 at N=128/256. The old "≈1e-3 at N=256"
+  text, read as a 2e-3 bound, had no headroom over u_bf16.
+- New CPU tests (`TestBF16BoundsRegression`) pin both modes against their
+  bounds at N=2–256, forward and inverse, and pin the NKI dispatch of
+  bf16/bf16_refined for N ≤ `_LOWP_GEMM_MAX`.
 - **FFT N ≥ 2^25 failed on Trn2 with "body blob exceeds uint32 offset range"**
   (`trnfft/fft_core.py`, #83). Each Stockham stage launches one kernel over a
   `(B·N/r, r)` operand, and the compiler unrolls the kernel's 128-row tile

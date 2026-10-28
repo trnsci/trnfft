@@ -486,7 +486,7 @@ def complex_gemm_bf16(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     # into a FP32 PSUM; on CPU torch.matmul accumulates in BF16 without the
     # FP32 PSUM, giving ~50% error at N=64. Casting to FP32 first matches the
     # hardware's FP32 accumulation quality at the cost of BF16 quantisation of
-    # W and x (which is the intended accuracy regime: ~1e-3 rel error at N=256).
+    # W and x (which is the intended accuracy regime: ~2e-3 rel error, u_bf16).
     a_fp32 = ComplexTensor(a.real.float(), a.imag.float())
     b_fp32 = ComplexTensor(b.real.float(), b.imag.float())
     result = complex_matmul(a_fp32, b_fp32)

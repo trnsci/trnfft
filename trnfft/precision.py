@@ -41,14 +41,24 @@ Three modes trade off speed vs numerical accuracy:
 * ``"bf16"`` — BF16 DFT-GEMM for N ≤ 256 on NKI hardware. W and x computed
   in BF16 on the Tensor Engine; the FP32 PSUM accumulator is preserved as
   output rather than rounded back to BF16 ("PSUM is a free FP32 accumulator").
-  ≈2× Tensor Engine throughput vs "fast". BF16 W quantisation limits accuracy
-  to ≈1e-3 rel error at N=256. Hardware validation pending (v0.17).
+  Rounding W and x to BF16 sets the error: normwise relative error about
+  u_bf16 = 2^-9, growing slowly with log N. CPU emulation gives 1.9e-3 (N=2) to
+  2.16e-3 (N=256), max over 20 seeds. Trn2 measured 2.06e-3 / 2.09e-3 at
+  N=128/256 (SDK 2.33, trnfft#86), which is the CPU value to 3 digits.
+  **Bound: 3e-3** for N ≤ 256. The earlier "≈1e-3 at N=256" figure was
+  optimistic, and a 2e-3 reading of it left no headroom over u_bf16.
 
-* ``"bf16_refined"`` — BF16 DFT-GEMM + one iterative correction step (IR-1).
-  Algorithm: X̂ = fft_bf16(x); r = x − IFFT(X̂); X̂ += fft_bf16(r). The
-  residual r corrects the BF16 W quantisation error, driving accuracy to
-  near-FP32 at ≈1.5-2× BF16 cost. Suitable for chained FFT pipelines where
-  accumulated rounding matters. Hardware validation pending (v0.17).
+* ``"bf16_refined"`` — BF16 DFT-GEMM + one iterative-refinement step (IR-1).
+  Algorithm: X̂ = fft_bf16(x); r = x − ifft_fp32(X̂); X̂ += fft_bf16(r). The
+  reconstruction ifft_fp32 is the FP32 DFT-GEMM with an exact (FP64-built) W.
+  That is what cancels the O(u_bf16) error of the BF16 W. Through trnfft#86 the
+  reconstruction also used BF16, so the step corrected nothing. Trn2 measured
+  1.95e-3 / 2.03e-3 / 2.08e-3 at N=64/128/256, the same as "bf16". With the
+  FP32 reconstruction, CPU emulation gives 3.6e-6 (N=2) to 4.9e-6 (N=256),
+  forward and inverse. **Bound: 1e-5** for N ≤ 256. Cost: two BF16 GEMMs plus
+  one FP32 GEMM, which is more than "fast" (one FP32 GEMM, ~1.5e-7 to 3e-7).
+  "bf16_refined" is not a faster route to FP32 accuracy. Above N=256 it falls
+  through to the "fast" paths.
 
 * ``"ozaki_hq"`` — 2-level Ozaki (3-way x split + 3-way W split, triangular
   6-term product) for N ≤ 256. 6 BF16 matmuls. Target ≤ 1e-6 rel error; the FP32
@@ -83,6 +93,8 @@ globally — they only change the code path inside ``_bluestein``,
 kernel selection), and ``_fft_via_gemm_double``. The "bf16" and "bf16_refined"
 modes route through ``_fft_via_gemm_bf16`` and ``_fft_iterative_refinement``
 respectively, which call ``complex_gemm_bf16`` (the PSUM-FP32 kernel).
+``_fft_iterative_refinement`` also calls ``complex_gemm`` (FP32) for the
+residual reconstruction.
 """
 
 from __future__ import annotations
@@ -93,7 +105,7 @@ _precision: str = "fast"
 
 
 def set_precision(mode: str) -> None:
-    """Set the global precision mode. One of {"fast", "kahan", "double", "bf16", "bf16_refined"}."""
+    """Set the global precision mode. One of ``_VALID``."""
     global _precision
     if mode not in _VALID:
         raise ValueError(f"precision mode must be one of {_VALID}; got {mode!r}")
