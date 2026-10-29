@@ -564,9 +564,13 @@ def _fft_via_gemm_bf16(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     (hardware invariant on trn1). The BF16 kernel keeps the PSUM as FP32 output
     instead of rounding back to BF16 — "PSUM is a free FP32 accumulator."
 
-    BF16 Tensor Engine throughput is ≈2× FP32. The BF16 W matrix quantisation
-    limits accuracy to ≈1e-3 rel error at N=256. For near-FP32 accuracy, use
-    :func:`_fft_iterative_refinement` (one correction step at no extra NEFF cost).
+    BF16 Tensor Engine throughput is ≈2× FP32. Rounding W and x to BF16 sets
+    the accuracy. The normwise relative error is about u_bf16 = 2^-9 and grows
+    slowly with log N. Measured (CPU emulation, which Trn2 reproduces to 3 digits;
+    max over 20 seeds): 1.9e-3 (N=2) to 2.16e-3 (N=256). Trn2 measured 2.06e-3 /
+    2.09e-3 at N=128/256 (trnfft#86). Stated bound: 3e-3 for N ≤ 256. For
+    ~5e-6, use :func:`_fft_iterative_refinement`, which costs an extra BF16 GEMM
+    and an FP32 GEMM.
 
     On CPU (no NKI): falls back to ``complex_matmul`` with BF16 inputs — same
     dtype semantics, no throughput benefit but identical correctness test path.
@@ -579,7 +583,7 @@ def _fft_via_gemm_bf16(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     # Cast x to BF16 for compute. W is built in FP32 then quantized to BF16:
     # computing angles in BF16 introduces large errors for high k*j products
     # (BF16 loses precision for integers > 128). Computing in FP32 and quantizing
-    # W entries to BF16 gives the correct ~1e-3 rel error regime.
+    # W entries to BF16 gives the intended ~2e-3 (u_bf16) rel error regime.
     x_re = x.real.reshape(-1, n).to(torch.bfloat16).contiguous()
     x_im = x.imag.reshape(-1, n).to(torch.bfloat16).contiguous()
 
@@ -598,39 +602,56 @@ def _fft_via_gemm_bf16(x: ComplexTensor, inverse: bool) -> ComplexTensor:
 
 
 def _fft_iterative_refinement(x: ComplexTensor, inverse: bool, steps: int = 1) -> ComplexTensor:
-    """BF16 DFT-GEMM + IR correction steps. Near-FP32 accuracy.
+    """BF16 DFT-GEMM + iterative-refinement (IR) correction steps.
 
     Algorithm (forward FFT case, inverse analogous):
 
     .. code-block:: text
 
-        X̂ = fft_bf16(x)                  # BF16 compute, FP32 PSUM output
+        X̂ = fft_bf16(x)                  # BF16 W and x, FP32 PSUM output
         for _ in range(steps):
-            x_rec = ifft_bf16(X̂)          # reconstruct time domain
-            r = x_fp32 - x_rec            # FP32 residual (small after one step)
-            δ = fft_bf16(r)               # BF16 FFT of residual
-            X̂ = X̂ + δ                    # apply correction
+            x_rec = ifft_fp32(X̂)          # FP32 DFT-GEMM (exact W from FP64)
+            r = x_fp32 - x_rec            # FP32 residual, |r| ~ u_bf16·|x|
+            δ = fft_bf16(r)               # BF16 FFT of the small residual
+            X̂ = X̂ + δ
 
-    Cost: (1 + steps) BF16 FFTs + steps inverse FFTs.
-    One correction step (IR-1) corrects the BF16 W quantisation error, driving
-    accuracy to near-FP32. Subsequent steps give diminishing returns.
+    The residual must be computed with the accurate operator. Write the BF16
+    transform as W̃ = W + E with ‖E‖ ~ u_bf16·‖W‖. With an exact reconstruction,
+    r = x − W⁻¹W̃x = −W⁻¹Ex and X̂ + W̃r = Wx − EW⁻¹Ex, so the O(u_bf16) term
+    cancels and O(u_bf16²) is left. Before trnfft#86 the reconstruction used the
+    BF16 inverse W̃' = W⁻¹ + E' as well. Then r = −(W⁻¹E + E'W)x, and the
+    correction cancels Ex but leaves −WE'Wx, which is the same size: the error
+    stays O(u_bf16). Trn2 measured
+    1.95e-3 / 2.03e-3 / 2.08e-3 at N=64/128/256, the same as plain "bf16", and
+    CPU emulation reproduces those values to 3 digits.
+
+    Measured normwise relative error (CPU emulation of the BF16 kernel, which
+    is exact for BF16×BF16 products with FP32 accumulation; batch 8 complex
+    Gaussian, max over 20 seeds): 3.6e-6 (N=2) to 4.9e-6 (N=256), forward and
+    inverse. Stated bound: 1e-5 for N ≤ 256 (``_LOWP_GEMM_MAX``). What remains
+    is mostly the BF16 rounding of r: about u_bf16 times the ~2e-3 relative size
+    of r.
+
+    Cost per step: two BF16 GEMMs plus one FP32 GEMM. That is more than the
+    single FP32 GEMM of "fast", which is also more accurate (1.5e-7 to 3e-7).
+    This mode makes sense where the BF16 forward result is consumed anyway and
+    a near-FP32 correction is wanted. It is not a faster route to FP32 accuracy.
     """
-    # Step 1: BF16 FFT in the requested direction → FP32 output from PSUM.
-    x_hat = _fft_via_gemm_bf16(x, inverse)
+    xf = ComplexTensor(x.real.float(), x.imag.float())
+
+    # BF16 FFT in the requested direction, FP32 output from PSUM.
+    x_hat = _fft_via_gemm_bf16(xf, inverse)
 
     for _ in range(steps):
-        # Reconstruct the input from the current estimate.
-        # Apply the inverse transform of x_hat (opposite direction + scaling).
-        # _fft_via_gemm_bf16 with inverse=True already applies the 1/N factor.
-        x_rec = _fft_via_gemm_bf16(x_hat, not inverse)
+        # Reconstruct the input with the FP32 DFT-GEMM in the opposite direction.
+        # This has to be accurate (see docstring): a BF16 reconstruction leaves the
+        # error at O(u_bf16), and that was trnfft#86. _fft_via_gemm applies 1/N for
+        # inverse=True.
+        x_rec = _fft_via_gemm(x_hat, not inverse)
 
-        # Residual: original input minus reconstruction (in FP32 for accuracy).
-        r = ComplexTensor(
-            x.real.float() - x_rec.real,
-            x.imag.float() - x_rec.imag,
-        )
+        # FP32 residual, small (~u_bf16 relative), so BF16 is enough to transform it.
+        r = ComplexTensor(xf.real - x_rec.real, xf.imag - x_rec.imag)
 
-        # BF16 FFT of the residual, same direction as the original transform.
         delta = _fft_via_gemm_bf16(r, inverse)
         x_hat = ComplexTensor(x_hat.real + delta.real, x_hat.imag + delta.imag)
 
@@ -1344,7 +1365,7 @@ def _cooley_tukey_nki_nograd(
     if precision == "bf16" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _fft_via_gemm_bf16(x, inverse)
 
-    # "bf16_refined" mode: BF16 + one iterative correction → near-FP32 accuracy.
+    # "bf16_refined" mode: BF16 + one IR step with FP32 residual → ~5e-6 (#86).
     if precision == "bf16_refined" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _fft_iterative_refinement(x, inverse, steps=1)
 

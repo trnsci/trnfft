@@ -168,8 +168,9 @@ class TestBF16Precision:
 
     CPU-runnable: the BF16 dtype flows through the PyTorch complex_matmul
     fallback path (no NKI required). Tests verify correctness contract:
-      - "bf16": output is FP32, error bounded by BF16 W quantisation
-      - "bf16_refined": one correction step drives error toward FP32 quality
+      - "bf16": output is FP32
+      - both modes dispatch without error
+    Error bounds are pinned in TestBF16BoundsRegression.
     """
 
     @pytest.mark.parametrize("n", [64, 128, 256])
@@ -184,50 +185,6 @@ class TestBF16Precision:
             f"Expected FP32 output from BF16 path, got {result.real.dtype}"
         )
         assert result.imag.dtype == torch.float32
-
-    @pytest.mark.parametrize("n", [64, 128, 256])
-    def test_bf16_error_within_bf16_budget(self, n):
-        """BF16 path error bounded by BF16 W quantisation (~1e-2 conservative)."""
-        from trnfft.complex import ComplexTensor
-        from trnfft.fft_core import _fft_via_gemm_bf16
-
-        torch.manual_seed(42)
-        x = torch.randn(n)
-        ct = ComplexTensor(x, torch.zeros(n))
-        result = _fft_via_gemm_bf16(ct, inverse=False)
-        expected = np.fft.fft(x.numpy().astype(np.float64))
-        err = np.abs(result.real.numpy() - expected.real).max() / (
-            np.abs(expected.real).max() + 1e-10
-        )
-        assert err < 1e-1, f"N={n}: BF16 rel error {err:.2e} exceeds 1e-1"
-
-    @pytest.mark.parametrize("n", [64, 128, 256])
-    def test_bf16_refined_better_than_bf16(self, n):
-        """IR-1 correction step stays within BF16 error budget on CPU.
-
-        On hardware: IR-1 corrects the BF16 W quantisation error → near-FP32.
-        On CPU: the IFFT reconstruction uses BF16 too, so the improvement at
-        small N may be marginal. The test checks both results stay within the
-        BF16 error budget (not that refined is strictly better than baseline —
-        that strict comparison is hardware-only, tested in TestBF16Hardware).
-        """
-        from trnfft.complex import ComplexTensor
-        from trnfft.fft_core import _fft_iterative_refinement, _fft_via_gemm_bf16
-
-        torch.manual_seed(42)
-        x = torch.randn(n)
-        ct = ComplexTensor(x, torch.zeros(n))
-        expected = np.fft.fft(x.numpy().astype(np.float64))
-
-        bf16 = _fft_via_gemm_bf16(ct, inverse=False)
-        refined = _fft_iterative_refinement(ct, inverse=False, steps=1)
-
-        err_bf16 = np.abs(bf16.real.numpy() - expected.real).max()
-        err_ref = np.abs(refined.real.numpy() - expected.real).max()
-
-        # Both must stay within BF16 error budget (conservative bound).
-        assert err_bf16 < 1e-1, f"N={n}: bf16 baseline {err_bf16:.2e} exceeds budget"
-        assert err_ref < 1e-1, f"N={n}: refined {err_ref:.2e} exceeds BF16 budget"
 
     def test_bf16_precision_mode_dispatches(self):
         """set_precision('bf16') + trnfft.fft routes to BF16 path and returns FP32."""
@@ -555,3 +512,98 @@ class TestOzakiBoundsRegression:
         ref = torch.fft.ifft(torch.complex(xr.double(), xi.double()))
         got = torch.complex(out.real.double(), out.imag.double())
         assert (torch.linalg.norm(got - ref) / torch.linalg.norm(ref)).item() < 5e-7
+
+
+class TestBF16BoundsRegression:
+    """Regression for trnfft#86: "bf16" / "bf16_refined" vs the precision.py bounds.
+
+    complex_gemm_bf16's CPU fallback multiplies BF16 values in FP32 (exact) and
+    accumulates in FP32, as the PSUM does. Trn2 (SDK 2.33, spike B5) matched the
+    CPU numbers to 3 digits: bf16_refined 1.945e-3 / 2.029e-3 / 2.078e-3 at
+    N=64/128/256 before the fix, and the same for "bf16" at N=128/256. Error is a
+    relative Frobenius norm vs FP64 torch.fft, as in B5 (batch 8, seed N).
+    """
+
+    BF16_BOUND = 3e-3  # precision.py; measured max 2.16e-3 (N=256, 20 seeds)
+    REFINED_BOUND = 1e-5  # precision.py; measured max 4.9e-6 (N=256, 20 seeds)
+
+    @staticmethod
+    def _case(n, inverse):
+        g = torch.Generator().manual_seed(n)
+        xr = torch.randn(8, n, generator=g, dtype=torch.float64)
+        xi = torch.randn(8, n, generator=g, dtype=torch.float64)
+        c = torch.complex(xr, xi)
+        ref = torch.fft.ifft(c) if inverse else torch.fft.fft(c)
+        return ComplexTensor(xr.float(), xi.float()), ref
+
+    @staticmethod
+    def _rel(out, ref):
+        got = torch.complex(out.real.double(), out.imag.double())
+        return (torch.linalg.norm(got - ref) / torch.linalg.norm(ref)).item()
+
+    @pytest.mark.parametrize("inverse", [False, True])
+    @pytest.mark.parametrize("n", [2, 16, 64, 128, 256])
+    def test_bf16_within_bound(self, n, inverse):
+        from trnfft.fft_core import _fft_via_gemm_bf16
+
+        x, ref = self._case(n, inverse)
+        err = self._rel(_fft_via_gemm_bf16(x, inverse), ref)
+        # The error is BF16 rounding of W and x, ~u_bf16 = 2^-9 = 1.95e-3; it does
+        # not shrink below ~1e-3. A value under that means BF16 is not in effect.
+        assert 1e-3 < err < self.BF16_BOUND, f"N={n} inv={inverse}: bf16 rel err {err:.3e}"
+
+    @pytest.mark.parametrize("inverse", [False, True])
+    @pytest.mark.parametrize("n", [2, 16, 64, 128, 256])
+    def test_bf16_refined_within_bound(self, n, inverse):
+        from trnfft.fft_core import _fft_iterative_refinement, _fft_via_gemm_bf16
+
+        x, ref = self._case(n, inverse)
+        err_ref = self._rel(_fft_iterative_refinement(x, inverse, steps=1), ref)
+        err_bf16 = self._rel(_fft_via_gemm_bf16(x, inverse), ref)
+        # 2x headroom under the stated bound. Pre-#86 err_ref was ~2e-3 (no gain).
+        assert err_ref < self.REFINED_BOUND / 2, f"N={n} inv={inverse}: {err_ref:.3e}"
+        assert err_ref < err_bf16 / 100, (
+            f"N={n} inv={inverse}: refined {err_ref:.3e} vs bf16 {err_bf16:.3e}"
+        )
+
+    def test_bf16_refined_more_steps_reach_fp32_floor(self):
+        from trnfft.fft_core import _fft_iterative_refinement
+
+        x, ref = self._case(256, False)
+        # IR converges: each step multiplies the error by ~u_bf16.
+        assert self._rel(_fft_iterative_refinement(x, False, steps=3), ref) < 1e-6
+
+    @pytest.mark.parametrize("n", [64, 128, 256, 512])
+    @pytest.mark.parametrize("mode", ["bf16", "bf16_refined"])
+    def test_nki_dispatch_takes_lowp_path(self, monkeypatch, mode, n):
+        """The NKI dispatcher routes N <= _LOWP_GEMM_MAX to the BF16 drivers.
+
+        #82 raised _DFT_GEMM_THRESHOLD to 1024 and added _LOWP_GEMM_MAX = 256.
+        This pins that "bf16_refined" still reaches _fft_iterative_refinement at
+        N=64-256 and falls through to the FP32 GEMM above 256.
+        """
+        import trnfft.nki.dispatch as dispatch
+        from trnfft import fft_core
+
+        calls = []
+
+        def tag(name):
+            def f(x, inverse, *a, **k):
+                calls.append(name)
+                return x
+
+            return f
+
+        import trnfft.nki.butterfly as butterfly
+
+        # Without nki installed the kernels are not defined; the dispatcher only
+        # imports them, the paths under test never launch them.
+        for k in ("butterfly_stage_kernel", "butterfly_stage_kernel_kahan"):
+            monkeypatch.setattr(butterfly, k, None, raising=False)
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: True)
+        monkeypatch.setattr(fft_core, "_fft_via_gemm_bf16", tag("bf16"))
+        monkeypatch.setattr(fft_core, "_fft_iterative_refinement", tag("bf16_refined"))
+        monkeypatch.setattr(fft_core, "_fft_via_gemm", tag("gemm"))
+        x = ComplexTensor(torch.randn(2, n), torch.randn(2, n))
+        fft_core._cooley_tukey_nki_nograd(x, inverse=False, precision=mode)
+        assert calls == [mode if n <= fft_core._LOWP_GEMM_MAX else "gemm"]
