@@ -249,6 +249,42 @@ class TestFFTSimulator:
             trnfft.set_backend("auto")
 
 
+class TestFourStepFusedSimulator:
+    """Batch-fused four-step kernel vs the unfused driver and numpy (trnfft#82)."""
+
+    @pytest.mark.parametrize("n,batch", [(256, 5), (512, 24), (2048, 9), (4096, 32)])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_matches_unfused_and_numpy(self, n, batch, inverse):
+        from trnfft import ComplexTensor
+        from trnfft.fft_core import _fft_via_four_step, _fft_via_four_step_fused
+
+        g = torch.Generator().manual_seed(n + batch)
+        xr, xi = torch.randn(batch, n, generator=g), torch.randn(batch, n, generator=g)
+        x = ComplexTensor(xr, xi)
+        fused = _fft_via_four_step_fused(x, inverse)
+        unfused = _fft_via_four_step(x, inverse)
+        xc = xr.double().numpy() + 1j * xi.double().numpy()
+        ref = np.fft.ifft(xc) if inverse else np.fft.fft(xc)
+        got = fused.real.double().numpy() + 1j * fused.imag.double().numpy()
+        assert np.linalg.norm(got - ref) / np.linalg.norm(ref) < 1e-6
+        scale = unfused.real.abs().max()
+        assert (fused.real - unfused.real).abs().max() / scale < 1e-6
+        assert (fused.imag - unfused.imag).abs().max() / scale < 1e-6
+
+    def test_ragged_batch_matches_numpy(self):
+        # B=38 at N=4096: packs of 2 rows, a 3-pack tail group. The unfused
+        # driver's twiddle kernel cannot take this batch (B*N/128 = 1216).
+        from trnfft import ComplexTensor
+        from trnfft.fft_core import _fft_via_four_step_fused
+
+        g = torch.Generator().manual_seed(38)
+        xr, xi = torch.randn(38, 4096, generator=g), torch.randn(38, 4096, generator=g)
+        y = _fft_via_four_step_fused(ComplexTensor(xr, xi), False)
+        ref = np.fft.fft(xr.double().numpy() + 1j * xi.double().numpy())
+        got = y.real.double().numpy() + 1j * y.imag.double().numpy()
+        assert np.linalg.norm(got - ref) / np.linalg.norm(ref) < 1e-6
+
+
 class TestBF16GEMMSimulator:
     """BF16 complex GEMM kernel smoke test under nki.simulate (v0.17).
 

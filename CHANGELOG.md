@@ -55,6 +55,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `-m slow` is given. `TestKahanCharacterization` at N=8193 (about 19 min on
     Trn2) is marked slow so the default `-m neuron` run stays short.
 
+### Changed
+
+- **Batched FFT: one fused four-step kernel launch per batch (#82 follow-up).**
+  New `four_step_fft_kernel` (`trnfft/nki/four_step.py`, native op
+  `trnfft::four_step_fft`) runs the whole four-step transform (GEMM, twiddle,
+  GEMM) for a group of rows in SBUF/PSUM. It reads the batch once and writes it
+  once, with no transposes. The unfused driver needed 2 GEMM launches, 1
+  twiddle launch and 6 transpose copies, each over the whole batch. Default
+  for FP32 power-of-2 512 ≤ N ≤ 4096. N ≤ 256 keeps the single DFT-GEMM.
+  - Where the time went: profiling on Trn2 at N=4096 put 78% of B=1024
+    (10.9 of 13.9 ms) inside the two `_complex_gemm_kernel` launches, which
+    re-transpose A through DMA on each of 512 M-tiles with a 64-wide moving
+    operand. At B=16 the cost was the ~0.3 ms dispatch floor times ~9 device
+    ops. Host Python was about 1.6 ms per call, overlapped with the device.
+  - Kernel layout: each row is read as an `(N1, N2)` matrix whose partition
+    axis is already step 1's contraction axis. P = 128/N2 rows are packed per
+    stationary operand, and step 2 uses a block-diagonal W2, so all 128 PE
+    columns are used. X_re and X_im are stacked on the contraction axis
+    against `[[W1r, W1i], [-W1i, W1r]]`, so complex step 1 is one K=128
+    matmul. Trn2 at N=4096, B=1024: one row per stationary 3.13 ms, packed
+    rows 1.31 ms, two-matmul step 1 0.88 ms, one K=128 matmul 0.79 ms
+    (kernel only). Splitting the twiddle across GpSimd/Scalar made it slower
+    and was dropped.
+  - Trn2 (SDK 2.33 / NKI 0.7.0), device-resident warm median ms, before →
+    after (2-thread CPU `torch.fft.fft` in brackets): N=4096 B=1024 10.11 →
+    0.93 [10.97]; B=128 3.27 → 0.44 [0.38]; N=2048 B=1024 2.67 → 0.62
+    [1.33]; N=1024 B=1024 0.83 → 0.54 [0.58]. Rel err vs FP64 is unchanged
+    at 2048/4096 (1.5e-7/1.6e-7) and lower at 512/1024 (1.22e-7/1.41e-7,
+    was 1.36e-7/1.54e-7). Results are not bit-identical to the unfused
+    driver (step 1 accumulates K=2·N1 in one pass): max abs difference is
+    6e-5 on outputs of order 10².
+  - It also removes an unfused-driver limit: at N=4096 the fused-twiddle
+    `_complex_mul_kernel` asserted for any B > 16 that is not a multiple of
+    16 (e.g. B=38). The fused kernel takes any B.
+  - Knobs: `TRNFFT_FOUR_STEP_BATCH_FUSED=0` restores the unfused dispatch.
+    `TRNFFT_FOUR_STEP_FUSED_MIN` (default 512) sets the lower N bound.
+    `TRNFFT_FOUR_STEP_FUSED_MAX_ROWS` (default 4096) splits larger batches
+    into several launches, because first-call compile time grows with B
+    (3 s at B=1024, 17 s at B=8192).
+  - `scripts/bench_batched_fft.py` reproduces the table.
+
 ## [0.23.0] - 2026-10-28
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron device) — see trnsci/trnsci#35.

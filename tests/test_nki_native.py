@@ -118,6 +118,7 @@ class TestNativeDispatch:
             "butterfly_stage_kahan",
             "stockham_radix4_stage",
             "stockham_radix8_w8",
+            "four_step_fft",
             "fft",
         ):
             assert hasattr(torch.ops.trnfft, name), name
@@ -192,6 +193,49 @@ class TestNativeOpsEager:
         ]
         out = torch.ops.trnfft.stockham_radix8_w8(*_dev(*args))
         _assert_pair_close(out, _simulate(stockham_radix8_w8_kernel, *args), rtol=1e-4, atol=1e-4)
+
+
+class TestNativeFourStepFused:
+    """Batch-fused four-step kernel on device (trnfft#82 follow-up)."""
+
+    def test_op_matches_simulator(self):
+        from trnfft import fft_core as fc
+        from trnfft.nki.four_step import four_step_fft_kernel
+
+        consts = fc._four_step_fused_consts(64, 64, False, torch.float32, torch.device("cpu"), 2, 8)
+        args = [_rand(38, 4096, seed=1), _rand(38, 4096, seed=2), *consts]
+        out = torch.ops.trnfft.four_step_fft(*_dev(*args))
+        assert out[0].device.type == "neuron"
+        _assert_pair_close(out, _simulate(four_step_fft_kernel, *args), rtol=1e-4, atol=1e-3)
+
+    # Ragged batches exercise P < 128 // N2 (odd B) and the tail group.
+    @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
+    @pytest.mark.parametrize("batch", [1, 3, 38, 1024])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_fft_matches_numpy(self, nki_backend, n, batch, inverse):
+        from trnfft import fft_core as fc
+
+        x = ComplexTensor(_rand(batch, n, seed=n + batch), _rand(batch, n, seed=n - batch))
+        xc = _np_complex(x)
+        ref = np.fft.ifft(xc) if inverse else np.fft.fft(xc)
+        x = ComplexTensor(x.real.to("neuron"), x.imag.to("neuron"))
+        assert fc._use_fused_four_step(x, n)
+        y = (trnfft.ifft if inverse else trnfft.fft)(x)
+        assert y.real.device.type == "neuron"
+        # FP32 four-step on Trn2 measures 1.2e-7 to 1.6e-7.
+        assert _rel(_np_complex(y), ref) < 5e-7
+
+    def test_row_chunks_match_one_launch(self, nki_backend, monkeypatch):
+        from trnfft import fft_core as fc
+
+        x = ComplexTensor(
+            _rand(40, 4096, seed=11).to("neuron"), _rand(40, 4096, seed=12).to("neuron")
+        )
+        whole = trnfft.fft(x)
+        monkeypatch.setattr(fc, "_FOUR_STEP_FUSED_MAX_ROWS", 16)
+        chunked = trnfft.fft(x)
+        assert torch.equal(whole.real.cpu(), chunked.real.cpu())
+        assert torch.equal(whole.imag.cpu(), chunked.imag.cpu())
 
 
 class TestNativeFFT:

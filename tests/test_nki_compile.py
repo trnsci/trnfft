@@ -52,6 +52,23 @@ def _butterfly_inputs(b, n, stage):
     )
 
 
+def _four_step_inputs(b, n):
+    # Shapes as _fft_via_four_step_fused passes them: x (B, N), W1 block
+    # (2*N1, 2*N1), T (P*N2, Q*N1), block-diagonal W2 (P*N2, P*N2).
+    from trnfft.nki.four_step import four_step_group_packs, four_step_pack_rows
+
+    log2n = n.bit_length() - 1
+    n2 = 1 << (log2n // 2)
+    n1 = n // n2
+    p = four_step_pack_rows(n2, b)
+    q = four_step_group_packs(n1, b, p)
+    return (
+        (_f32(b, n), _f32(b, n), _f32(2 * n1, 2 * n1))
+        + (_f32(p * n2, q * n1), _f32(p * n2, q * n1), _f32(p * n2, p * n2), _f32(p * n2, p * n2)),
+        {},
+    )
+
+
 # case id -> (module, kernel name, input factory returning (args, kwargs))
 _CASES = {
     "butterfly-s0": ("butterfly", "butterfly_stage_kernel", lambda: _butterfly_inputs(8, 16, 0)),
@@ -86,6 +103,14 @@ _CASES = {
         "stockham_radix8_w8_kernel",
         lambda: ((_f32(64, 8), _f32(64, 8), _f32(8, 8), _f32(8, 8)), {}),
     ),
+    "four-step-4096-tail": (
+        "four_step",
+        "four_step_fft_kernel",
+        lambda: _four_step_inputs(38, 4096),
+    ),
+    "four-step-2048": ("four_step", "four_step_fft_kernel", lambda: _four_step_inputs(16, 2048)),
+    "four-step-4096-odd": ("four_step", "four_step_fft_kernel", lambda: _four_step_inputs(3, 4096)),
+    "four-step-256-b1": ("four_step", "four_step_fft_kernel", lambda: _four_step_inputs(1, 256)),
     "complex-gemm": (
         "dispatch",
         "_complex_gemm_kernel",
