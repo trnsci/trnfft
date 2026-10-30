@@ -581,7 +581,8 @@ class TestBF16BoundsRegression:
 
         #82 raised _DFT_GEMM_THRESHOLD to 1024 and added _LOWP_GEMM_MAX = 256.
         This pins that "bf16_refined" still reaches _fft_iterative_refinement at
-        N=64-256 and falls through to the FP32 GEMM above 256.
+        N=64-256 and falls through to an FP32 path (single GEMM or the fused
+        four-step) above 256.
         """
         import trnfft.nki.dispatch as dispatch
         from trnfft import fft_core
@@ -604,7 +605,8 @@ class TestBF16BoundsRegression:
         monkeypatch.setattr(dispatch, "_use_simulator", lambda: True)
         monkeypatch.setattr(fft_core, "_fft_via_gemm_bf16", tag("bf16"))
         monkeypatch.setattr(fft_core, "_fft_iterative_refinement", tag("bf16_refined"))
-        monkeypatch.setattr(fft_core, "_fft_via_gemm", tag("gemm"))
+        monkeypatch.setattr(fft_core, "_fft_via_gemm", tag("fp32"))
+        monkeypatch.setattr(fft_core, "_fft_via_four_step_fused", tag("fp32"))
         x = ComplexTensor(torch.randn(2, n), torch.randn(2, n))
         fft_core._cooley_tukey_nki_nograd(x, inverse=False, precision=mode)
-        assert calls == [mode if n <= fft_core._LOWP_GEMM_MAX else "gemm"]
+        assert calls == [mode if n <= fft_core._LOWP_GEMM_MAX else "fp32"]

@@ -38,6 +38,7 @@ EXPECTED_NKI_OPS = {
     "butterfly_stage_kahan",
     "stockham_radix4_stage",
     "stockham_radix8_w8",
+    "four_step_fft",
 }
 # Plus the composite FFT op (torch.library.custom_op) that carries the adjoint.
 EXPECTED_OPS = EXPECTED_NKI_OPS | {"fft"}
@@ -436,7 +437,8 @@ class TestLazyRegistration:
         for name, (fn, mutates, _) in recorded.items():
             schema = torch.library.infer_schema(fn, mutates_args=mutates)
             assert schema.endswith("-> (Tensor, Tensor)"), (name, schema)
-            assert schema.split("->")[0].count("Tensor") == 4, (name, schema)
+            n_in = 7 if name == "trnfft::four_step_fft" else 4
+            assert schema.split("->")[0].count("Tensor") == n_in, (name, schema)
         bfly = torch.library.infer_schema(recorded["trnfft::butterfly_stage"][0], mutates_args={})
         assert "SymInt n, SymInt stage" in bfly
         fft_schema = str(torch.ops.trnfft.fft.default._schema)
@@ -470,6 +472,10 @@ class TestLazyRegistration:
         assert fake("stockham_radix8_w8")(meta(64, 8), meta(64, 8), meta(8, 8), meta(8, 8))[
             0
         ].shape == (64, 8)
+        fs = fake("four_step_fft")(
+            meta(9, 4096), meta(9, 4096), meta(128, 128), *[meta(64, 512)] * 2, *[meta(64, 64)] * 2
+        )
+        assert fs[0].shape == fs[1].shape == (9, 4096)
         yr, yi = torch.ops.trnfft.fft(meta(3, 256), meta(3, 256), False, "fast")
         assert yr.shape == yi.shape == (3, 256)
 
@@ -487,6 +493,19 @@ def _linear_ref(x_re, x_im, w_re, w_im):
 
 def _mul_ref(a_re, a_im, b_re, b_im):
     return a_re * b_re - a_im * b_im, a_re * b_im + a_im * b_re
+
+
+def _four_step_ref(x_re, x_im, w1_blk, t_re, t_im, w2_re, w2_im):
+    # four_step_fft_kernel math: X[b] as (N1, N2), Y = (X^T W1) * T, O = W2^T Y.
+    b, n = x_re.shape
+    n1 = w1_blk.shape[0] // 2
+    n2 = n // n1
+    W1 = torch.complex(w1_blk[:n1, :n1], w1_blk[:n1, n1:])
+    X = torch.complex(x_re, x_im).reshape(b, n1, n2)
+    Y = torch.einsum("bij,ik->bjk", X, W1) * torch.complex(t_re[:n2, :n1], t_im[:n2, :n1])
+    W2 = torch.complex(w2_re[:n2, :n2], w2_im[:n2, :n2])
+    O = torch.einsum("jl,bjk->blk", W2, Y).reshape(b, n)
+    return O.real.contiguous(), O.imag.contiguous()
 
 
 @pytest.fixture
@@ -516,7 +535,7 @@ def native_cpu(monkeypatch, native_module):
     monkeypatch.setattr(butterfly, "butterfly_stage_kernel", None, raising=False)
     monkeypatch.setattr(butterfly, "butterfly_stage_kernel_kahan", None, raising=False)
 
-    calls = {"gemm": 0, "linear": 0, "mul": 0}
+    calls = {"gemm": 0, "linear": 0, "mul": 0, "four_step": 0}
 
     def counted(name, fn):
         def k(*args):
@@ -530,6 +549,11 @@ def native_cpu(monkeypatch, native_module):
         dispatch, "_complex_linear_kernel", counted("linear", _linear_ref), raising=False
     )
     monkeypatch.setattr(dispatch, "_complex_mul_kernel", counted("mul", _mul_ref), raising=False)
+    from trnfft.nki import four_step
+
+    monkeypatch.setattr(
+        four_step, "four_step_fft_kernel", counted("four_step", _four_step_ref), raising=False
+    )
 
     # The XLA-path autograd.Functions must not run on the native path.
     def no_function(*a, **k):
@@ -599,7 +623,7 @@ class TestNativeAutogradCPU:
     @pytest.mark.parametrize("n", [64, 2048])
     @pytest.mark.parametrize("inverse", [False, True])
     def test_fft_op_forward_and_backward(self, native_cpu, monkeypatch, n, inverse):
-        # n=64: single DFT-GEMM; n=2048: four-step (two GEMMs + fused twiddle).
+        # n=64: single DFT-GEMM; n=2048: batch-fused four-step (one launch).
         from trnfft import fft_core as fc
 
         monkeypatch.setattr(fc, "_DFT_GEMM_THRESHOLD", 1024)
@@ -607,7 +631,7 @@ class TestNativeAutogradCPU:
         x_re, x_im = _rand(4, n, seed=1), _rand(4, n, seed=2)
         fn = trnfft.ifft if inverse else trnfft.fft
         y = fn(ComplexTensor(x_re, x_im))
-        assert native_cpu["gemm"] >= 1
+        assert native_cpu["four_step" if n > 1024 else "gemm"] >= 1
 
         xc = torch.complex(x_re.detach().double(), x_im.detach().double()).requires_grad_(True)
         ref = (torch.fft.ifft if inverse else torch.fft.fft)(xc)

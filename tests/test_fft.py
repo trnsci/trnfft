@@ -861,6 +861,7 @@ class TestBluesteinDeviceReturn:
         # Route the padded power-of-2 sub-FFTs (up to m=2048 for n=1000)
         # through the DFT-GEMM wrapper, the path the fake kernel covers.
         monkeypatch.setattr(fc, "_DFT_GEMM_THRESHOLD", 4096)
+        monkeypatch.setattr(fc, "_FOUR_STEP_BATCH_FUSED", False)
 
     @pytest.mark.parametrize("n", [7, 127, 129, 1000])
     @pytest.mark.parametrize("inverse", [False, True])
@@ -890,12 +891,12 @@ class TestFourStepDispatch:
     kernel launches. Stockham kernels raise, so any fall-through is caught.
     """
 
-    def _install_fakes(self, monkeypatch, device="cpu"):
+    def _install_fakes(self, monkeypatch, device="cpu", batch_fused=False):
         import sys
         import types
 
         from trnfft import fft_core as fc
-        from trnfft.nki import dispatch
+        from trnfft.nki import dispatch, four_step
 
         fake_xla = types.ModuleType("torch_xla")
         fake_xla.device = lambda: torch.device(device)
@@ -905,7 +906,7 @@ class TestFourStepDispatch:
         fake_bfly.butterfly_stage_kernel_kahan = None
         monkeypatch.setitem(sys.modules, "trnfft.nki.butterfly", fake_bfly)
 
-        calls = {"gemm": 0, "mul": 0}
+        calls = {"gemm": 0, "mul": 0, "four_step": 0}
 
         def fake_gemm(a_re, a_im, b_re, b_im):
             calls["gemm"] += 1
@@ -921,9 +922,35 @@ class TestFourStepDispatch:
             calls["mul"] += 1
             return a_re * b_re - a_im * b_im, a_re * b_im + a_im * b_re
 
+        def fake_four_step(x_re, x_im, w1_blk, t_re, t_im, w2_re, w2_im):
+            # Mirrors four_step_fft_kernel: X[b] as (N1, N2), Y = X^T W1,
+            # Y *= T, O = W2^T Y, O[b] as (N2, N1) is the natural-order output.
+            calls["four_step"] += 1
+            calls.setdefault("rows", []).append(x_re.shape[0])
+            b, n = x_re.shape
+            n1 = w1_blk.shape[0] // 2
+            n2 = n // n1
+            p, q = w2_re.shape[0] // n2, t_re.shape[1] // n1
+            assert n1 * n2 == n and n1 <= 64 and p * n2 <= 128 and b % p == 0
+            assert t_re.shape == (p * n2, q * n1) and q * n1 <= 512
+            if device == "meta":
+                return torch.empty_like(x_re), torch.empty_like(x_im)
+            w1r, w1i = w1_blk[:n1, :n1], w1_blk[:n1, n1:]
+            assert torch.equal(w1_blk[n1:, :n1], -w1i) and torch.equal(w1_blk[n1:, n1:], w1r)
+            assert torch.equal(t_re, t_re[:n2, :n1].repeat(p, q))
+            w2r, w2i = w2_re[:n2, :n2], w2_im[:n2, :n2]
+            assert torch.equal(w2_re, torch.block_diag(*[w2r] * p))
+            X = torch.complex(x_re, x_im).reshape(b, n1, n2)
+            Y = torch.einsum("bij,ik->bjk", X, torch.complex(w1r, w1i))
+            Y = Y * torch.complex(t_re[:n2, :n1], t_im[:n2, :n1])
+            O = torch.einsum("jl,bjk->blk", torch.complex(w2r, w2i), Y).reshape(b, n)
+            return O.real.contiguous(), O.imag.contiguous()
+
         monkeypatch.setattr(dispatch, "HAS_NKI", True)
         monkeypatch.setattr(dispatch, "_complex_gemm_kernel", fake_gemm, raising=False)
         monkeypatch.setattr(dispatch, "_complex_mul_kernel", fake_mul, raising=False)
+        monkeypatch.setattr(four_step, "four_step_fft_kernel", fake_four_step, raising=False)
+        monkeypatch.setattr(fc, "_FOUR_STEP_BATCH_FUSED", batch_fused)
         monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
         monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
         monkeypatch.setattr(fc, "_use_nki", lambda: True)
@@ -973,7 +1000,7 @@ class TestFourStepDispatch:
         y = trnfft.fft(ComplexTensor(xr, xi))
         ref = np.fft.fft(xr.double().numpy() + 1j * xi.double().numpy())
         assert self._rel(y, ref) < 1e-5
-        assert calls == {"gemm": 2, "mul": 1}
+        assert calls == {"gemm": 2, "mul": 1, "four_step": 0}
 
     def test_four_step_max_zero_restores_stockham(self, monkeypatch):
         from trnfft import fft_core as fc
@@ -1032,6 +1059,9 @@ class TestFourStepDispatch:
             "TRNFFT_DFT_GEMM_THRESHOLD",
             "TRNFFT_FOUR_STEP_MAX",
             "TRNFFT_FOUR_STEP_FUSED_TWIDDLE",
+            "TRNFFT_FOUR_STEP_BATCH_FUSED",
+            "TRNFFT_FOUR_STEP_FUSED_MIN",
+            "TRNFFT_FOUR_STEP_FUSED_MAX_ROWS",
         )
         if any(os.environ.get(k) for k in knobs):
             pytest.skip("trnfft env knob set; defaults overridden")
@@ -1040,6 +1070,9 @@ class TestFourStepDispatch:
         assert fc._DFT_GEMM_THRESHOLD == 1024
         assert fc._FOUR_STEP_MAX == 4096
         assert fc._FOUR_STEP_FUSED_TWIDDLE is True
+        assert fc._FOUR_STEP_BATCH_FUSED is True
+        assert fc._FOUR_STEP_FUSED_MIN == 512
+        assert fc._FOUR_STEP_FUSED_MAX_ROWS == 4096
         assert fc._LOWP_GEMM_MAX == 256
 
     @pytest.mark.parametrize("n,expect_gemms", [(1024, 1), (2048, 2), (4096, 2)])
@@ -1103,6 +1136,126 @@ class TestFourStepDispatch:
         finally:
             set_precision(old)
         assert errs["kahan"] <= 1.5 * errs["fast"], errs
+
+
+class TestFourStepBatchFused(TestFourStepDispatch):
+    """Batch-fused four-step: one ``four_step_fft_kernel`` launch per call.
+
+    Reuses the TestFourStepDispatch fakes with a stand-in for the fused kernel
+    that checks its operand layout and mirrors its math.
+    """
+
+    @pytest.mark.parametrize("n", [512, 1024, 2048, 4096])
+    @pytest.mark.parametrize("batch", [1, 9, 33])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_matches_numpy_one_launch(self, monkeypatch, n, batch, inverse):
+        calls = self._install_fakes(monkeypatch, batch_fused=True)
+        g = torch.Generator().manual_seed(n + batch)
+        xr, xi = torch.randn(batch, n, generator=g), torch.randn(batch, n, generator=g)
+        y = (trnfft.ifft if inverse else trnfft.fft)(ComplexTensor(xr, xi))
+        xc = xr.double().numpy() + 1j * xi.double().numpy()
+        ref = np.fft.ifft(xc) if inverse else np.fft.fft(xc)
+        assert y.shape == (batch, n)
+        assert self._rel(y, ref) < 1e-5
+        assert (calls["gemm"], calls["mul"], calls["four_step"]) == (0, 0, 1)
+
+    def test_leading_dims_preserved(self, monkeypatch):
+        calls = self._install_fakes(monkeypatch, batch_fused=True)
+        xr, xi = torch.randn(3, 5, 2048), torch.randn(3, 5, 2048)
+        y = trnfft.fft(ComplexTensor(xr, xi))
+        ref = np.fft.fft(xr.double().numpy() + 1j * xi.double().numpy())
+        assert y.shape == (3, 5, 2048)
+        assert self._rel(y, ref) < 1e-5
+        assert calls["four_step"] == 1
+
+    @pytest.mark.parametrize(
+        "n,expect", [(256, (1, 0)), (512, (0, 1)), (1024, (0, 1)), (2048, (0, 1)), (4096, (0, 1))]
+    )
+    def test_default_threshold_routing_fused(self, monkeypatch, n, expect):
+        from trnfft import fft_core as fc
+
+        calls = self._install_fakes(monkeypatch, batch_fused=True)
+        monkeypatch.setattr(fc, "_DFT_GEMM_THRESHOLD", 1024)
+        trnfft.fft(ComplexTensor(torch.randn(16, n), torch.randn(16, n)))
+        assert (calls["gemm"], calls["four_step"]) == expect
+
+    def test_fused_matches_unfused(self, monkeypatch):
+        """Same constants and math: the two drivers agree to FP32 rounding."""
+        from trnfft import fft_core as fc
+
+        self._install_fakes(monkeypatch, batch_fused=True)
+        xr, xi = torch.randn(17, 4096), torch.randn(17, 4096)
+        x = ComplexTensor(xr, xi)
+        a = fc._fft_via_four_step_fused(x, inverse=False)
+        b = fc._fft_via_four_step(x, inverse=False)
+        scale = b.real.abs().max()
+        assert (a.real - b.real).abs().max() / scale < 1e-5
+        assert (a.imag - b.imag).abs().max() / scale < 1e-5
+
+    def test_non_fp32_uses_unfused(self, monkeypatch):
+        calls = self._install_fakes(monkeypatch, batch_fused=True)
+        x = ComplexTensor(torch.randn(4, 2048).double(), torch.randn(4, 2048).double())
+        from trnfft import fft_core as fc
+
+        fc._cooley_tukey_nki_nograd(x, inverse=False)
+        assert calls["four_step"] == 0 and calls["gemm"] == 2
+
+    def test_knob_off_uses_unfused(self, monkeypatch):
+        calls = self._install_fakes(monkeypatch, batch_fused=False)
+        trnfft.fft(ComplexTensor(torch.randn(4, 4096), torch.randn(4, 4096)))
+        assert calls["four_step"] == 0 and calls["gemm"] == 2
+
+    def test_stays_on_caller_device_fused(self, monkeypatch):
+        calls = self._install_fakes(monkeypatch, device="meta", batch_fused=True)
+        x = ComplexTensor(
+            torch.empty(32, 4096, device="meta"), torch.empty(32, 4096, device="meta")
+        )
+        y = trnfft.fft(x)
+        assert y.real.device.type == "meta" and y.imag.device.type == "meta"
+        assert y.shape == (32, 4096)
+        assert calls["four_step"] == 1
+
+    @pytest.mark.parametrize(
+        "n2,batch,expect", [(64, 1, 1), (64, 1024, 2), (64, 33, 1), (32, 6, 2), (16, 24, 8)]
+    )
+    def test_pack_rows(self, n2, batch, expect):
+        from trnfft.nki.four_step import four_step_pack_rows
+
+        assert four_step_pack_rows(n2, batch) == expect
+
+    @pytest.mark.parametrize(
+        "n1,batch,pack,expect", [(64, 2, 2, 1), (64, 1024, 2, 8), (32, 64, 4, 16)]
+    )
+    def test_group_packs(self, n1, batch, pack, expect):
+        from trnfft.nki.four_step import four_step_group_packs
+
+        assert four_step_group_packs(n1, batch, pack) == expect
+
+    def test_fits(self):
+        from trnfft import fft_core as fc
+
+        assert fc._four_step_fused_fits(4096)
+        assert not fc._four_step_fused_fits(8192)
+
+    def test_fused_min_knob(self, monkeypatch):
+        from trnfft import fft_core as fc
+
+        calls = self._install_fakes(monkeypatch, batch_fused=True)
+        monkeypatch.setattr(fc, "_DFT_GEMM_THRESHOLD", 1024)
+        monkeypatch.setattr(fc, "_FOUR_STEP_FUSED_MIN", 2048)
+        trnfft.fft(ComplexTensor(torch.randn(4, 1024), torch.randn(4, 1024)))
+        assert (calls["gemm"], calls["four_step"]) == (1, 0)
+
+    def test_row_chunks(self, monkeypatch):
+        from trnfft import fft_core as fc
+
+        calls = self._install_fakes(monkeypatch, batch_fused=True)
+        monkeypatch.setattr(fc, "_FOUR_STEP_FUSED_MAX_ROWS", 8)
+        xr, xi = torch.randn(21, 2048), torch.randn(21, 2048)
+        y = trnfft.fft(ComplexTensor(xr, xi))
+        ref = np.fft.fft(xr.double().numpy() + 1j * xi.double().numpy())
+        assert self._rel(y, ref) < 1e-5
+        assert calls["rows"] == [8, 8, 5]
 
 
 class TestBluesteinChirpPrecision:

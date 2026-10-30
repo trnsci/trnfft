@@ -38,6 +38,7 @@ from torch_neuronx import nki_op
 from . import autograd as _ag
 from . import butterfly as _bfly
 from . import dispatch as _d
+from . import four_step as _fs
 from . import stockham as _st
 
 Pair = tuple[torch.Tensor, torch.Tensor]
@@ -184,6 +185,23 @@ def stockham_radix8_w8(
     return _st.stockham_radix8_w8_kernel(a_re, a_im, w8_re, w8_im)
 
 
+@nki_op(
+    "trnfft::four_step_fft",
+    mutates_args={},
+    fake_fn=lambda x_re, x_im, w1_blk, t_re, t_im, w2_re, w2_im: _fake_like(x_re),
+)
+def four_step_fft(
+    x_re: torch.Tensor,
+    x_im: torch.Tensor,
+    w1_blk: torch.Tensor,
+    t_re: torch.Tensor,
+    t_im: torch.Tensor,
+    w2_re: torch.Tensor,
+    w2_im: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _fs.four_step_fft_kernel(x_re, x_im, w1_blk, t_re, t_im, w2_re, w2_im)
+
+
 # ── Composite FFT (carries the FFT-level adjoint) ────────────────────────────
 
 
@@ -239,5 +257,6 @@ OPS = {
     "butterfly_stage_kahan": butterfly_stage_kahan,
     "stockham_radix4_stage": stockham_radix4_stage,
     "stockham_radix8_w8": stockham_radix8_w8,
+    "four_step_fft": four_step_fft,
     "fft": fft,
 }

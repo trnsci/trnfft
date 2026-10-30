@@ -138,6 +138,10 @@ def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> C
 #   single GEMM (1.08 ms) and four-step (1.20 ms) are close; at N=4096
 #   four-step wins (2.18 vs 2.36 ms) and the N^2 W stops being cheap.
 #
+#   With the batch-fused four-step kernel enabled (the default, see
+#   _FOUR_STEP_BATCH_FUSED) the single GEMM only serves N < 512
+#   (_FOUR_STEP_FUSED_MIN); this threshold still bounds it otherwise.
+#
 #   The low-precision GEMM modes (bf16 / bf16_refined / ozaki / ozaki_hq)
 #   keep their validated N <= 256 range via _LOWP_GEMM_MAX.
 #
@@ -263,6 +267,31 @@ _FOUR_STEP_FUSED_TWIDDLE = os.environ.get("TRNFFT_FOUR_STEP_FUSED_TWIDDLE", "1")
     "true",
     "yes",
 )
+
+# Batch-fused four-step kernel (trnfft#82 follow-up): the whole four-step
+# transform for a group of rows in one NKI launch (``four_step_fft_kernel``),
+# with no transposes and one HBM read and write of the batch, instead of
+# 2 GEMM launches + 1 twiddle launch + 6 transpose copies over the full batch.
+# Trn2 (SDK 2.33 / NKI 0.7.0), N=4096, device-resident warm median: B=1024
+# 10.39 -> 0.89 ms, B=128 3.41 -> 0.50 ms, rel err unchanged (1.58e-7).
+# It also replaces the single DFT-GEMM from _FOUR_STEP_FUSED_MIN up: at
+# N=512/1024, B=1024 it measured 0.37/0.49 ms vs 0.51/0.86 ms with lower
+# error (1.22e-7/1.41e-7 vs 1.36e-7/1.54e-7); at N=256 the single GEMM stays
+# ahead at large B. Env TRNFFT_FOUR_STEP_BATCH_FUSED=0 restores the unfused
+# driver and the single GEMM up to _DFT_GEMM_THRESHOLD for A/B.
+_FOUR_STEP_BATCH_FUSED = os.environ.get("TRNFFT_FOUR_STEP_BATCH_FUSED", "1").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+_FOUR_STEP_FUSED_MIN = _env_int("TRNFFT_FOUR_STEP_FUSED_MIN", 512)
+
+# Rows per fused four-step launch. The kernel body is unrolled per row group,
+# so the first-call compile grows with B (Trn2, N=4096: 3 s at B=1024, 17 s at
+# B=8192); larger batches are split into launches of at most this many rows,
+# which share one compiled shape. Throughput is linear in B either way
+# (B=4096: 2.48 ms, B=8192: 4.73 ms in one launch).
+_FOUR_STEP_FUSED_MAX_ROWS = _env_int("TRNFFT_FOUR_STEP_FUSED_MAX_ROWS", 4096)
 
 # Upper bound for the FP64 CPU DFT-GEMM path (precision="double" only).
 # Beyond this N, "double" mode falls through to NKI Stockham (~1e-4 FP32).
@@ -414,6 +443,102 @@ def _four_step_split(n: int) -> tuple[int, int]:
     log2n = int(math.log2(n))
     n2 = 1 << (log2n // 2)
     return n // n2, n2
+
+
+def _use_fused_four_step(x: ComplexTensor, n: int) -> bool:
+    """Route ``n`` to :func:`_fft_via_four_step_fused` (FP32, power of 2, in range)."""
+    return (
+        _FOUR_STEP_BATCH_FUSED
+        and _DFT_GEMM_THRESHOLD > 0
+        and max(_FOUR_STEP_FUSED_MIN, 4) <= n <= _FOUR_STEP_MAX
+        and _is_power_of_two(n)
+        and x.real.dtype == torch.float32
+        and _four_step_fused_fits(n)
+    )
+
+
+def _four_step_fused_fits(n: int) -> bool:
+    """``four_step_fft_kernel`` stacks re/im of N1 on 128 partitions: N1, N2 <= 64, N <= 4096."""
+    n1, n2 = _four_step_split(n)
+    return n1 <= 64 and n2 <= 64
+
+
+@functools.lru_cache(maxsize=64)
+def _four_step_fused_consts(
+    n1: int,
+    n2: int,
+    inverse: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+    pack: int,
+    packs: int,
+) -> tuple[torch.Tensor, ...]:
+    """Constant operands of ``four_step_fft_kernel``, resident on ``device``.
+
+    ``(W1_blk, T_re, T_im, W2_re, W2_im)``. ``W1_blk`` is the real block form
+    ``[[W1r, W1i], [-W1i, W1r]]`` of W_N1. ``W2`` is block-diagonal with
+    ``pack`` copies of W_N2 (1/N folded in for the inverse, as in the unfused
+    driver). ``T`` is ``T[n2, k1]`` tiled ``pack`` times along the partition
+    axis and ``packs`` times along the free axis, ``(pack*N2, packs*N1)``.
+    """
+    n = n1 * n2
+    cpu = torch.device("cpu")
+    W1 = _dft_matrix_cached(n1, inverse, dtype, cpu)
+    W2 = _dft_matrix_cached(n2, inverse, dtype, cpu, (1.0 / n) if inverse else 1.0)
+    t_re, t_im = _four_step_twiddle_cached(n1, n2, inverse, dtype, cpu)
+    w1_blk = torch.cat(
+        [torch.cat([W1.real, W1.imag], dim=1), torch.cat([-W1.imag, W1.real], dim=1)], dim=0
+    )
+    out = (
+        w1_blk,
+        t_re.repeat(pack, packs),
+        t_im.repeat(pack, packs),
+        torch.block_diag(*[W2.real] * pack),
+        torch.block_diag(*[W2.imag] * pack),
+    )
+    return tuple(t.contiguous().to(device) for t in out)
+
+
+def _fft_via_four_step_fused(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """Four-step FFT for the whole batch in one NKI launch (trnfft#82 follow-up).
+
+    Same math and constants as :func:`_fft_via_four_step`, but
+    ``four_step_fft_kernel`` keeps each group of rows in SBUF/PSUM between the
+    two GEMMs and the twiddle and reads the input in its natural layout, so
+    there are no transposes, no batch padding and no intermediate HBM tensors:
+    one launch, one read and one write of the (B, N) batch. Batches above
+    ``_FOUR_STEP_FUSED_MAX_ROWS`` rows are split into several launches.
+    """
+    from .nki import four_step as _fs
+    from .nki.dispatch import _launch, _simulate_kernel, _use_simulator
+
+    # Looked up at call time: the kernel exists only when nki is importable
+    # (the CPU dispatch tests install a stand-in).
+    kernel = getattr(_fs, "four_step_fft_kernel", None)
+
+    n = x.shape[-1]
+    n1, n2 = _four_step_split(n)
+    orig_shape = x.real.shape
+    re = x.real.reshape(-1, n).contiguous()
+    im = x.imag.reshape(-1, n).contiguous()
+
+    def _run(r, i):
+        pack = _fs.four_step_pack_rows(n2, r.shape[0])
+        packs = _fs.four_step_group_packs(n1, r.shape[0], pack)
+        consts = _four_step_fused_consts(n1, n2, inverse, r.dtype, r.device, pack, packs)
+        if _use_simulator():
+            return _simulate_kernel(kernel, r, i, *consts)
+        return _launch(kernel, "four_step_fft", r, i, *consts)
+
+    rows = re.shape[0]
+    cap = max(1, _FOUR_STEP_FUSED_MAX_ROWS)
+    if rows <= cap:
+        o_re, o_im = _run(re, im)
+    else:
+        outs = [_run(re[s : s + cap], im[s : s + cap]) for s in range(0, rows, cap)]
+        o_re = torch.cat([o[0] for o in outs], dim=0)
+        o_im = torch.cat([o[1] for o in outs], dim=0)
+    return ComplexTensor(o_re.reshape(orig_shape), o_im.reshape(orig_shape))
 
 
 def _fft_via_four_step(x: ComplexTensor, inverse: bool) -> ComplexTensor:
@@ -1395,6 +1520,12 @@ def _cooley_tukey_nki_nograd(
     # Requires FP32 product precision in nc_matmul; not available on trn1.
     if precision == "ozaki" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _ozaki_or_fallback(x, inverse, hq=False)
+
+    # Batch-fused four-step (one launch per batch, trnfft#82 follow-up) from
+    # _FOUR_STEP_FUSED_MIN to _FOUR_STEP_MAX; it beats the single GEMM there.
+    # A threshold of 0 still disables every GEMM path.
+    if _use_fused_four_step(x, n):
+        return _fft_via_four_step_fused(x, inverse)
 
     # "kahan" takes the GEMM paths too (trnfft#82). On Trn2 the single GEMM /
     # four-step measure 1.2e-7-1.6e-7 rel err, below the Kahan butterfly
