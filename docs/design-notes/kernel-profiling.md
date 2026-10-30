@@ -166,8 +166,8 @@ tensors for all stages on CPU before the stage loop. The per-stage pack/unpack s
 
 ```python
 # Old (2 materializing copies per stage):
-re_groups = re.reshape(B, L, 4, M).permute(0,1,3,2).contiguous().reshape(G, 4)
-re = out.reshape(B, L, M, 4).permute(0,3,1,2).contiguous().reshape(B, n)
+re_groups = re.reshape(B, L, 4, M).permute(0, 1, 3, 2).contiguous().reshape(G, 4)
+re = out.reshape(B, L, M, 4).permute(0, 3, 1, 2).contiguous().reshape(B, n)
 
 # New (2 gather ops per stage):
 re_groups = re.view(-1)[pack_idx].reshape(G, 4)

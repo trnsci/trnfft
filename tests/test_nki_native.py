@@ -76,16 +76,36 @@ def _rel(got: np.ndarray, ref: np.ndarray) -> float:
 
 class TestNativeDispatch:
     def test_native_path_never_imports_torch_xla(self):
+        """Path selection and op registration in a fresh interpreter never
+        import torch_xla.
+
+        The subprocess deliberately stops before any kernel launch: inside
+        the suite the parent pytest already holds the visible NeuronCore, so
+        a launch in a child process fails in ``nrt_init``. The launch half of
+        the check runs in-process in ``test_launch_does_not_import_torch_xla``.
+        """
         code = (
             "import sys, torch, trnfft; "
-            "from trnfft.nki.dispatch import _get_dispatch_path; "
-            "trnfft.set_backend('nki'); "
-            "trnfft.fft(torch.randn(4, 256)); trnfft.fft(torch.randn(1 << 14)); "
-            "trnfft.fft(torch.randn(1000)); "
-            "assert _get_dispatch_path() == 'native'; "
+            "from trnfft.nki import dispatch as d; "
+            "assert d._dispatch_path is None; "
+            "assert d._native_available(), 'no native backend'; "
+            "d._dispatch_path = 'native'; "
+            "d._get_native_ops(); "
+            "assert 'trnfft.nki._native' in sys.modules; "
+            "assert hasattr(torch.ops.trnfft, 'complex_gemm'); "
+            "assert hasattr(torch.ops.trnfft, 'fft'); "
             "assert 'torch_xla' not in sys.modules, 'torch_xla imported'"
         )
         subprocess.run([sys.executable, "-c", code], check=True)
+
+    def test_launch_does_not_import_torch_xla(self, nki_backend):
+        if "torch_xla" in sys.modules:
+            pytest.skip("torch_xla was imported by another test in this process")
+        x = ComplexTensor(_rand(4, 256, seed=1), _rand(4, 256, seed=2))
+        y = trnfft.fft(x)
+        assert _rel(_np_complex(y), np.fft.fft(_np_complex(x))) < 1e-5
+        assert "trnfft.nki._native" in sys.modules, "kernel did not launch"
+        assert "torch_xla" not in sys.modules
 
     def test_ops_registered_in_torch_ops(self):
         _ops()

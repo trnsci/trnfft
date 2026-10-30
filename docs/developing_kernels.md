@@ -36,13 +36,9 @@ The autograd `forward` and the FFT driver branch on `_use_simulator()`:
 
 ```python
 if _use_simulator():
-    c_real, c_imag = _simulate_kernel(
-        _complex_gemm_kernel, a_real, a_imag, b_real, b_imag
-    )
+    c_real, c_imag = _simulate_kernel(_complex_gemm_kernel, a_real, a_imag, b_real, b_imag)
 else:
-    c_real, c_imag = _launch(
-        _complex_gemm_kernel, "complex_gemm", a_real, a_imag, b_real, b_imag
-    )
+    c_real, c_imag = _launch(_complex_gemm_kernel, "complex_gemm", a_real, a_imag, b_real, b_imag)
 ```
 
 `_simulate_kernel(kernel, *torch_tensors)` (in `trnfft/nki/dispatch.py`)

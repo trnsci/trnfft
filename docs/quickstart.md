@@ -39,10 +39,10 @@ from trnfft import ComplexTensor
 z = ComplexTensor(torch.randn(4, 4), torch.randn(4, 4))
 
 # Arithmetic
-w = z * z          # element-wise complex multiply
-m = z @ z          # complex matrix multiply
-c = z.conj()       # conjugate
-mag = z.abs()      # magnitude
+w = z * z  # element-wise complex multiply
+m = z @ z  # complex matrix multiply
+c = z.conj()  # conjugate
+mag = z.abs()  # magnitude
 phase = z.angle()  # phase
 ```
 
@@ -71,6 +71,6 @@ print(trnfft.HAS_NKI)
 
 # Force backend
 trnfft.set_backend("pytorch")  # Always use PyTorch ops
-trnfft.set_backend("nki")      # Always use NKI (fails if not on Trainium)
-trnfft.set_backend("auto")     # NKI if available, else PyTorch (default)
+trnfft.set_backend("nki")  # Always use NKI (fails if not on Trainium)
+trnfft.set_backend("auto")  # NKI if available, else PyTorch (default)
 ```

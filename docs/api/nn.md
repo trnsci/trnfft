@@ -36,6 +36,7 @@ Applies ReLU to the magnitude while preserving phase. The learnable bias `b` all
 from trnfft import ComplexTensor, stft, istft
 from trnfft.nn import ComplexLinear, ComplexModReLU
 
+
 class MaskEstimator(nn.Module):
     def __init__(self, n_fft=512, hidden=256):
         super().__init__()
@@ -51,12 +52,12 @@ class MaskEstimator(nn.Module):
         # Process per-frame
         b, f, t = noisy_spec.shape
         x = ComplexTensor(
-            noisy_spec.real.permute(0,2,1).reshape(-1, f),
-            noisy_spec.imag.permute(0,2,1).reshape(-1, f),
+            noisy_spec.real.permute(0, 2, 1).reshape(-1, f),
+            noisy_spec.imag.permute(0, 2, 1).reshape(-1, f),
         )
         mask = self.net(x)
         return ComplexTensor(
-            mask.real.reshape(b, t, f).permute(0,2,1),
-            mask.imag.reshape(b, t, f).permute(0,2,1),
+            mask.real.reshape(b, t, f).permute(0, 2, 1),
+            mask.imag.reshape(b, t, f).permute(0, 2, 1),
         )
 ```

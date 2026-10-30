@@ -7,11 +7,11 @@ trnfft auto-detects Trainium hardware and dispatches to optimized NKI kernels wh
 ```python
 import trnfft
 
-trnfft.HAS_NKI          # True if nki (>=0.3.0) is installed
-trnfft.get_backend()    # Current setting: "auto", "pytorch", or "nki"
-trnfft.set_backend("auto")     # NKI if available, else PyTorch (default)
+trnfft.HAS_NKI  # True if nki (>=0.3.0) is installed
+trnfft.get_backend()  # Current setting: "auto", "pytorch", or "nki"
+trnfft.set_backend("auto")  # NKI if available, else PyTorch (default)
 trnfft.set_backend("pytorch")  # Force PyTorch (any device)
-trnfft.set_backend("nki")      # Force NKI (fails if not on Trainium)
+trnfft.set_backend("nki")  # Force NKI (fails if not on Trainium)
 ```
 
 ## Environment variables

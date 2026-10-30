@@ -90,6 +90,7 @@ ignore = [
 [tool.pytest.ini_options]
 markers = [
     "neuron: requires Neuron hardware (trn1/trn2 instance)",
+    "slow: long-running tests, skipped unless --run-slow or -m slow",
     "nki_simulator: runs under nki.simulate (CPU); requires nki>=0.3.0 + TRNFFT_USE_SIMULATOR=1",
 ]
 testpaths = ["tests"]
