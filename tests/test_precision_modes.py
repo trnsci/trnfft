@@ -49,7 +49,8 @@ class TestKahanCharacterization:
     improvement is expected but left to the printed output to document.
     """
 
-    @pytest.mark.parametrize("n", [997, 1009, 8193])
+    # N=8193 takes ~19 min on Trn2 (SDK 2.33); opt in with --run-slow or -m slow.
+    @pytest.mark.parametrize("n", [997, 1009, pytest.param(8193, marks=pytest.mark.slow)])
     def test_kahan_bluestein_error_vs_fp64(self, nki_backend, n):
         """Compare fast vs kahan FP32 error against a scipy fp64 reference.
 

@@ -36,17 +36,32 @@ The autograd `forward` and the FFT driver branch on `_use_simulator()`:
 
 ```python
 if _use_simulator():
-    c_real, c_imag = _simulate_kernel(
-        _complex_gemm_kernel, a_real, a_imag, b_real, b_imag
-    )
+    c_real, c_imag = _simulate_kernel(_complex_gemm_kernel, a_real, a_imag, b_real, b_imag)
 else:
-    (ar, ai, br, bi), orig = _to_xla(a_real, a_imag, b_real, b_imag)
-    c_real, c_imag = _complex_gemm_kernel(ar, ai, br, bi)
-    c_real, c_imag = c_real.to(orig), c_imag.to(orig)
+    c_real, c_imag = _launch(_complex_gemm_kernel, "complex_gemm", a_real, a_imag, b_real, b_imag)
 ```
 
 `_simulate_kernel(kernel, *torch_tensors)` (in `trnfft/nki/dispatch.py`)
 marshals numpy in/out, calling `nki.simulate(kernel)(*np_args)`.
+
+`_launch(kernel, op_name, *args)` is the one hardware launch helper. On the
+native TorchNeuron path (Trn2/Trn3) it moves tensor arguments to
+`device="neuron"` and calls the `trnfft::<op_name>` custom op; on the XLA path
+(Trn1) it moves them with `_to_xla()` and calls `kernel` directly. Results go
+back to the caller's device; operands the Stockham / butterfly drivers already
+keep on the kernel device (`_kernel_device()`) are not copied. A new kernel
+needs a matching annotated wrapper in `trnfft/nki/_native.py` and an entry in
+its `OPS` table, plus a case in `tests/test_nki_compile.py`.
+
+On the native path the analytic adjoints in `trnfft/nki/autograd.py` are
+attached to the registered ops with `torch.library.register_autograd`
+(`complex_gemm`, `complex_linear`, `complex_mul`, and the composite
+`trnfft::fft`); the XLA path keeps the `torch.autograd.Function` wrappers.
+
+| Variable | Effect |
+|---|---|
+| `TRNSCI_NKI_DISPATCH=auto\|native\|xla\|cpu` | Suite-wide. Forces the dispatch path; `auto` (default) detects. Forcing an unavailable path raises. |
+| `NKI_ENABLE_TRACE_CACHE=0` | TorchNeuron setting. Turns off the cross-process NKI kernel cache, which cannot version editable installs. `tests/conftest.py` sets it. |
 
 ## NKI 0.3.0 calling convention (since this is the floor)
 

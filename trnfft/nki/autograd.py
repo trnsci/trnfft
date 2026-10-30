@@ -30,6 +30,13 @@ Adjoints (all for complex operators; storage is split-real/imag):
       dx = ifft(dy) * n              -- our ifft divides by n; re-scale
 * IFFT                          y = fft(x, n, inverse=True)
       dx = fft(dy) / n
+
+Dispatch paths: on the XLA path (Trn1) and in the simulator the
+``torch.autograd.Function`` classes below carry the adjoints, unchanged. On
+the native TorchNeuron path (Trn2/Trn3) the same backward formulas
+(``*_backward`` below) are attached to the registered ``trnfft::`` custom
+ops with ``torch.library.register_autograd`` (see ``_native.py``), and the
+``*_autograd`` fronts call those ops instead of the Functions.
 """
 
 from __future__ import annotations
@@ -38,6 +45,61 @@ import torch
 
 # NOTE: These Functions import kernel helpers at call time to avoid circular
 # imports with dispatch.py and fft_core.py.
+
+
+def _native_op(name: str):
+    """The registered ``trnfft::<name>`` op on the native path, else None."""
+    from .dispatch import _get_native_ops, _is_native, _use_simulator
+
+    if _use_simulator() or not _is_native():
+        return None
+    return _get_native_ops()[name]
+
+
+def _launch_native(kernel_name: str, op_name: str, *tensors):
+    from . import dispatch
+
+    return dispatch._launch(getattr(dispatch, kernel_name, None), op_name, *tensors)
+
+
+# ---------------------------------------------------------------------------
+# Analytic adjoints (shared by the Functions and the native register_autograd)
+# ---------------------------------------------------------------------------
+
+
+def complex_mul_backward(a_real, a_imag, b_real, b_imag, grad_c_real, grad_c_imag):
+    # dA = dC * conj(B); dB = dC * conj(A)
+    dA_real = grad_c_real * b_real + grad_c_imag * b_imag
+    dA_imag = grad_c_imag * b_real - grad_c_real * b_imag
+    dB_real = grad_c_real * a_real + grad_c_imag * a_imag
+    dB_imag = grad_c_imag * a_real - grad_c_real * a_imag
+    return dA_real, dA_imag, dB_real, dB_imag
+
+
+def complex_gemm_backward(a_real, a_imag, b_real, b_imag, grad_c_real, grad_c_imag):
+    # dA = dC @ conj(B)^T = dC @ B^H
+    # For split real/imag:
+    #   (dCr + i dCi) @ (Br - i Bi)^T = (dCr Br^T + dCi Bi^T) + i (dCi Br^T - dCr Bi^T)
+    dA_real = grad_c_real @ b_real.transpose(-2, -1) + grad_c_imag @ b_imag.transpose(-2, -1)
+    dA_imag = grad_c_imag @ b_real.transpose(-2, -1) - grad_c_real @ b_imag.transpose(-2, -1)
+    # dB = conj(A)^T @ dC = A^H @ dC
+    #   (Ar^T - i Ai^T)(dCr + i dCi) = (Ar^T dCr + Ai^T dCi) + i (Ar^T dCi - Ai^T dCr)
+    dB_real = a_real.transpose(-2, -1) @ grad_c_real + a_imag.transpose(-2, -1) @ grad_c_imag
+    dB_imag = a_real.transpose(-2, -1) @ grad_c_imag - a_imag.transpose(-2, -1) @ grad_c_real
+    return dA_real, dA_imag, dB_real, dB_imag
+
+
+def complex_linear_backward(x_real, x_imag, w_real, w_imag, grad_y_real, grad_y_imag):
+    # Y = X @ W^T
+    # dX = dY @ conj(W)
+    #   = (dYr + i dYi) @ (Wr - i Wi)
+    dX_real = grad_y_real @ w_real + grad_y_imag @ w_imag
+    dX_imag = grad_y_imag @ w_real - grad_y_real @ w_imag
+    # dW = dY^T @ conj(X)
+    #   = (dYr^T + i dYi^T) @ (Xr - i Xi)
+    dW_real = grad_y_real.transpose(-2, -1) @ x_real + grad_y_imag.transpose(-2, -1) @ x_imag
+    dW_imag = grad_y_imag.transpose(-2, -1) @ x_real - grad_y_real.transpose(-2, -1) @ x_imag
+    return dX_real, dX_imag, dW_real, dW_imag
 
 
 # ---------------------------------------------------------------------------
@@ -50,30 +112,26 @@ class _ComplexMulFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, a_real, a_imag, b_real, b_imag):
-        from .dispatch import _complex_mul_kernel, _simulate_kernel, _to_xla, _use_simulator
+        from .dispatch import _complex_mul_kernel, _launch, _simulate_kernel, _use_simulator
 
         if _use_simulator():
             c_real, c_imag = _simulate_kernel(_complex_mul_kernel, a_real, a_imag, b_real, b_imag)
         else:
-            (ar, ai, br, bi), orig = _to_xla(a_real, a_imag, b_real, b_imag)
-            c_real, c_imag = _complex_mul_kernel(ar, ai, br, bi)
-            c_real, c_imag = c_real.to(orig), c_imag.to(orig)
+            c_real, c_imag = _launch(
+                _complex_mul_kernel, "complex_mul", a_real, a_imag, b_real, b_imag
+            )
         ctx.save_for_backward(a_real, a_imag, b_real, b_imag)
         return c_real, c_imag
 
     @staticmethod
     def backward(ctx, grad_c_real, grad_c_imag):
-        a_real, a_imag, b_real, b_imag = ctx.saved_tensors
-        # dA = dC * conj(B); dB = dC * conj(A)
-        dA_real = grad_c_real * b_real + grad_c_imag * b_imag
-        dA_imag = grad_c_imag * b_real - grad_c_real * b_imag
-        dB_real = grad_c_real * a_real + grad_c_imag * a_imag
-        dB_imag = grad_c_imag * a_real - grad_c_real * a_imag
-        return dA_real, dA_imag, dB_real, dB_imag
+        return complex_mul_backward(*ctx.saved_tensors, grad_c_real, grad_c_imag)
 
 
 def complex_mul_autograd(a_real, a_imag, b_real, b_imag):
     """Autograd-aware front to _complex_mul_kernel. Returns (c_real, c_imag)."""
+    if _native_op("complex_mul") is not None:
+        return _launch_native("_complex_mul_kernel", "complex_mul", a_real, a_imag, b_real, b_imag)
     return _ComplexMulFn.apply(a_real, a_imag, b_real, b_imag)
 
 
@@ -87,33 +145,27 @@ class _ComplexGEMMFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, a_real, a_imag, b_real, b_imag):
-        from .dispatch import _complex_gemm_kernel, _simulate_kernel, _to_xla, _use_simulator
+        from .dispatch import _complex_gemm_kernel, _launch, _simulate_kernel, _use_simulator
 
         if _use_simulator():
             c_real, c_imag = _simulate_kernel(_complex_gemm_kernel, a_real, a_imag, b_real, b_imag)
         else:
-            (ar, ai, br, bi), orig = _to_xla(a_real, a_imag, b_real, b_imag)
-            c_real, c_imag = _complex_gemm_kernel(ar, ai, br, bi)
-            c_real, c_imag = c_real.to(orig), c_imag.to(orig)
+            c_real, c_imag = _launch(
+                _complex_gemm_kernel, "complex_gemm", a_real, a_imag, b_real, b_imag
+            )
         ctx.save_for_backward(a_real, a_imag, b_real, b_imag)
         return c_real, c_imag
 
     @staticmethod
     def backward(ctx, grad_c_real, grad_c_imag):
-        a_real, a_imag, b_real, b_imag = ctx.saved_tensors
-        # dA = dC @ conj(B)^T = dC @ B^H
-        # For split real/imag:
-        #   (dCr + i dCi) @ (Br - i Bi)^T = (dCr Br^T + dCi Bi^T) + i (dCi Br^T - dCr Bi^T)
-        dA_real = grad_c_real @ b_real.transpose(-2, -1) + grad_c_imag @ b_imag.transpose(-2, -1)
-        dA_imag = grad_c_imag @ b_real.transpose(-2, -1) - grad_c_real @ b_imag.transpose(-2, -1)
-        # dB = conj(A)^T @ dC = A^H @ dC
-        #   (Ar^T - i Ai^T)(dCr + i dCi) = (Ar^T dCr + Ai^T dCi) + i (Ar^T dCi - Ai^T dCr)
-        dB_real = a_real.transpose(-2, -1) @ grad_c_real + a_imag.transpose(-2, -1) @ grad_c_imag
-        dB_imag = a_real.transpose(-2, -1) @ grad_c_imag - a_imag.transpose(-2, -1) @ grad_c_real
-        return dA_real, dA_imag, dB_real, dB_imag
+        return complex_gemm_backward(*ctx.saved_tensors, grad_c_real, grad_c_imag)
 
 
 def complex_gemm_autograd(a_real, a_imag, b_real, b_imag):
+    if _native_op("complex_gemm") is not None:
+        return _launch_native(
+            "_complex_gemm_kernel", "complex_gemm", a_real, a_imag, b_real, b_imag
+        )
     return _ComplexGEMMFn.apply(a_real, a_imag, b_real, b_imag)
 
 
@@ -127,35 +179,29 @@ class _ComplexLinearFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x_real, x_imag, w_real, w_imag):
-        from .dispatch import _complex_linear_kernel, _simulate_kernel, _to_xla, _use_simulator
+        from .dispatch import _complex_linear_kernel, _launch, _simulate_kernel, _use_simulator
 
         if _use_simulator():
             y_real, y_imag = _simulate_kernel(
                 _complex_linear_kernel, x_real, x_imag, w_real, w_imag
             )
         else:
-            (xr, xi, wr, wi), orig = _to_xla(x_real, x_imag, w_real, w_imag)
-            y_real, y_imag = _complex_linear_kernel(xr, xi, wr, wi)
-            y_real, y_imag = y_real.to(orig), y_imag.to(orig)
+            y_real, y_imag = _launch(
+                _complex_linear_kernel, "complex_linear", x_real, x_imag, w_real, w_imag
+            )
         ctx.save_for_backward(x_real, x_imag, w_real, w_imag)
         return y_real, y_imag
 
     @staticmethod
     def backward(ctx, grad_y_real, grad_y_imag):
-        x_real, x_imag, w_real, w_imag = ctx.saved_tensors
-        # Y = X @ W^T
-        # dX = dY @ conj(W)
-        #   = (dYr + i dYi) @ (Wr - i Wi)
-        dX_real = grad_y_real @ w_real + grad_y_imag @ w_imag
-        dX_imag = grad_y_imag @ w_real - grad_y_real @ w_imag
-        # dW = dY^T @ conj(X)
-        #   = (dYr^T + i dYi^T) @ (Xr - i Xi)
-        dW_real = grad_y_real.transpose(-2, -1) @ x_real + grad_y_imag.transpose(-2, -1) @ x_imag
-        dW_imag = grad_y_imag.transpose(-2, -1) @ x_real - grad_y_real.transpose(-2, -1) @ x_imag
-        return dX_real, dX_imag, dW_real, dW_imag
+        return complex_linear_backward(*ctx.saved_tensors, grad_y_real, grad_y_imag)
 
 
 def complex_linear_autograd(x_real, x_imag, w_real, w_imag):
+    if _native_op("complex_linear") is not None:
+        return _launch_native(
+            "_complex_linear_kernel", "complex_linear", x_real, x_imag, w_real, w_imag
+        )
     return _ComplexLinearFn.apply(x_real, x_imag, w_real, w_imag)
 
 
@@ -202,4 +248,10 @@ class _FFTFn(torch.autograd.Function):
 
 
 def fft_autograd(x_real, x_imag, inverse: bool, precision: str = "fast"):
+    # Native: the composite ``trnfft::fft`` op (register_autograd, same adjoint).
+    # Its stage kernels move operands to the device themselves, so the op runs
+    # on the caller's tensors as they are.
+    op = _native_op("fft")
+    if op is not None:
+        return op(x_real, x_imag, inverse, precision)
     return _FFTFn.apply(x_real, x_imag, inverse, precision)

@@ -198,13 +198,19 @@ def _plan_row_chunks(total_rows: int, max_rows: int) -> list[tuple[int, int]]:
     return [(start, min(start + cap, total_rows)) for start in range(0, total_rows, cap)]
 
 
-def _launch_stockham_stage(kernel, rows_re, rows_im, arg_c, arg_d, use_sim: bool, per_row_cd: bool):
+def _launch_stockham_stage(
+    kernel, rows_re, rows_im, arg_c, arg_d, use_sim: bool, per_row_cd: bool, op_name: str
+):
     """Run a Stockham stage kernel over ``(total_groups, r)`` operands.
 
     ``arg_c``/``arg_d`` are per-row twiddles (``per_row_cd=True``, sliced with
     the rows) or a shared matrix such as W_8 (passed whole to every launch).
-    Launches are split per :func:`_plan_row_chunks` (trnfft#83).
+    Launches are split per :func:`_plan_row_chunks` (trnfft#83). Each launch
+    goes through :func:`trnfft.nki.dispatch._launch` (``trnfft::<op_name>`` on
+    the native path, ``kernel`` on the XLA path); operands are already on the
+    kernel device, so nothing is copied.
     """
+    from .nki.dispatch import _launch
 
     def _run(a, b, c, d):
         if use_sim:
@@ -217,7 +223,7 @@ def _launch_stockham_stage(kernel, rows_re, rows_im, arg_c, arg_d, use_sim: bool
                 d.detach().cpu().numpy(),
             )
             return torch.from_numpy(np.asarray(o_re)), torch.from_numpy(np.asarray(o_im))
-        return kernel(a, b, c, d)
+        return _launch(kernel, op_name, a, b, c, d)
 
     chunks = _plan_row_chunks(rows_re.shape[0], _max_rows_per_launch())
     if len(chunks) == 1:
@@ -931,16 +937,13 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     tensor). XLA/Neuron slice ops on device tensors force new HLO programs and
     bust the NEFF cache; standalone per-stage tensors reuse the cached NEFF.
     """
-    from .nki.dispatch import _use_simulator
+    from .nki.dispatch import _kernel_device, _use_simulator
     from .nki.stockham import stockham_radix4_stage_kernel
 
     n = x.shape[-1]
     assert _is_power_of_four(n), f"Stockham radix-4 requires N=4^k; got N={n}"
 
     use_sim = _use_simulator()
-    if not use_sim:
-        import torch_xla
-
     orig_shape = x.real.shape
     flat_re = x.real.reshape(-1, n).contiguous()
     flat_im = x.imag.reshape(-1, n).contiguous()
@@ -968,7 +971,7 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         pad_im = torch.cat([flat_im, padding], dim=0)
 
     orig_device = x.real.device
-    device = None if use_sim else torch_xla.device()
+    device = None if use_sim else _kernel_device()
 
     log4n = int(math.log2(n)) // 2
     # total_groups = B_pad * L * M = B_pad * N/4 — constant across all stages.
@@ -1015,7 +1018,14 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         im_groups = im_4d.permute(0, 1, 3, 2).contiguous().reshape(total_groups, 4)
 
         out_re, out_im = _launch_stockham_stage(
-            stockham_radix4_stage_kernel, re_groups, im_groups, tw_r, tw_i, use_sim, per_row_cd=True
+            stockham_radix4_stage_kernel,
+            re_groups,
+            im_groups,
+            tw_r,
+            tw_i,
+            use_sim,
+            per_row_cd=True,
+            op_name="stockham_radix4_stage",
         )
 
         # Stockham output permutation: (B, L, M, 4) -> (B, 4, L, M) -> (B, N)
@@ -1066,16 +1076,13 @@ def _fft_via_stockham_nki_r8(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     radix-4).  Hardware bench will determine if the Tensor-engine W_8 win
     and lower stage count outweigh the scratch round-trip cost.
     """
-    from .nki.dispatch import _use_simulator
+    from .nki.dispatch import _kernel_device, _use_simulator
     from .nki.stockham import stockham_radix8_w8_kernel
 
     n = x.shape[-1]
     assert _is_power_of_eight(n), f"Radix-8 requires N=8^k; got N={n}"
 
     use_sim = _use_simulator()
-    if not use_sim:
-        import torch_xla
-
     orig_shape = x.real.shape
     flat_re = x.real.reshape(-1, n).contiguous()
     flat_im = x.imag.reshape(-1, n).contiguous()
@@ -1100,7 +1107,7 @@ def _fft_via_stockham_nki_r8(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         pad_im = torch.cat([flat_im, padding], dim=0)
 
     orig_device = x.real.device
-    device = None if use_sim else torch_xla.device()
+    device = None if use_sim else _kernel_device()
 
     log8n = int(math.log2(n)) // 3
     total_groups = B_pad * n // 8
@@ -1156,7 +1163,14 @@ def _fft_via_stockham_nki_r8(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         pre_im = re_groups * tw_i + im_groups * tw_r
 
         out_re, out_im = _launch_stockham_stage(
-            stockham_radix8_w8_kernel, pre_re, pre_im, w8_re, w8_im, use_sim, per_row_cd=False
+            stockham_radix8_w8_kernel,
+            pre_re,
+            pre_im,
+            w8_re,
+            w8_im,
+            use_sim,
+            per_row_cd=False,
+            op_name="stockham_radix8_w8",
         )
 
         # Stockham output permutation: (B, L, M, 8) → (B, 8, L, M) → (B, N)
@@ -1193,16 +1207,13 @@ def _fft_via_stockham_nki_mixed(x: ComplexTensor, inverse: bool) -> ComplexTenso
     the loop (same NEFF-cache-safe pattern as the pure radix drivers).
     W₈ is precomputed once and shared across all radix-8 stages.
     """
-    from .nki.dispatch import _use_simulator
+    from .nki.dispatch import _kernel_device, _use_simulator
     from .nki.stockham import stockham_radix4_stage_kernel, stockham_radix8_w8_kernel
 
     n = x.shape[-1]
     plan = _mixed_radix_plan(n)
 
     use_sim = _use_simulator()
-    if not use_sim:
-        import torch_xla
-
     orig_shape = x.real.shape
     flat_re = x.real.reshape(-1, n).contiguous()
     flat_im = x.imag.reshape(-1, n).contiguous()
@@ -1225,7 +1236,7 @@ def _fft_via_stockham_nki_mixed(x: ComplexTensor, inverse: bool) -> ComplexTenso
         pad_im = torch.cat([flat_im, padding], dim=0)
 
     orig_device = x.real.device
-    device = None if use_sim else torch_xla.device()
+    device = None if use_sim else _kernel_device()
 
     # Precompute W₈ (shared for all r=8 stages, if any).
     has_r8 = any(r == 8 for r in plan)
@@ -1277,7 +1288,14 @@ def _fft_via_stockham_nki_mixed(x: ComplexTensor, inverse: bool) -> ComplexTenso
             pre_re = re_groups * tw_r - im_groups * tw_i
             pre_im = re_groups * tw_i + im_groups * tw_r
             out_re, out_im = _launch_stockham_stage(
-                stockham_radix8_w8_kernel, pre_re, pre_im, w8_re, w8_im, use_sim, per_row_cd=False
+                stockham_radix8_w8_kernel,
+                pre_re,
+                pre_im,
+                w8_re,
+                w8_im,
+                use_sim,
+                per_row_cd=False,
+                op_name="stockham_radix8_w8",
             )
         else:
             out_re, out_im = _launch_stockham_stage(
@@ -1288,6 +1306,7 @@ def _fft_via_stockham_nki_mixed(x: ComplexTensor, inverse: bool) -> ComplexTenso
                 tw_i,
                 use_sim,
                 per_row_cd=True,
+                op_name="stockham_radix4_stage",
             )
 
         out_re_rd = out_re.reshape(B_pad, L, M, r)
@@ -1334,13 +1353,11 @@ def _cooley_tukey_nki_nograd(
     butterfly at any N.
     """
     from .nki.butterfly import butterfly_stage_kernel, butterfly_stage_kernel_kahan
-    from .nki.dispatch import _use_simulator
+    from .nki.dispatch import _kernel_device, _launch, _use_simulator
 
     kernel = butterfly_stage_kernel_kahan if precision == "kahan" else butterfly_stage_kernel
+    op_name = "butterfly_stage_kahan" if precision == "kahan" else "butterfly_stage"
     use_sim = _use_simulator()
-    if not use_sim:
-        import torch_xla
-
     n = x.shape[-1]
 
     # Bench-toggles: force a specific path ahead of all threshold checks.
@@ -1449,7 +1466,7 @@ def _cooley_tukey_nki_nograd(
     sign = 1.0 if inverse else -1.0
 
     orig_device = x.real.device
-    device = None if use_sim else torch_xla.device()
+    device = None if use_sim else _kernel_device()
 
     # Bit-reversal permutation along the last dim.
     indices = _bit_reverse_indices(n, log2n).to(pad_re.device)
@@ -1491,7 +1508,7 @@ def _cooley_tukey_nki_nograd(
         else:
             tw_re_bcast = tw_re_bcast.to(device)
             tw_im_bcast = tw_im_bcast.to(device)
-            re, im = kernel(re, im, tw_re_bcast, tw_im_bcast, n, s)
+            re, im = _launch(kernel, op_name, re, im, tw_re_bcast, tw_im_bcast, n, s)
 
     if not use_sim:
         re = re.to(orig_device)
