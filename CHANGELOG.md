@@ -7,7 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Tail tiles in every GEMM-family kernel (#100).** `_complex_gemm_kernel`,
+  its `load_transpose2d` twin, `_complex_gemm_kernel_bf16` and
+  `_complex_linear_kernel` ran `M // 128`, `K // 128` and `N // 512` tiles
+  with no tail. The last partial tile of each dimension was dropped
+  silently:
+  - rows past the last full 128-row tile were never written (B = 1000,
+    N = 64 with `precision="bf16"`: rows 896–999; B = 4097: row 4096);
+  - a K tail lost contraction terms, and an N tail left columns unwritten
+    (`complex_gemm` at 200 × 200 × 600: every row wrong).
+  This hit `precision="bf16"`, `"bf16_refined"`, `"ozaki"` and `"ozaki_hq"`
+  at any batch over 128 that is not a multiple of 128 (released versions up
+  to 0.24.0), `nn.ComplexLinear` with a batch, `in_features` or
+  `out_features` like that, and `complex_gemm` / `complex_gemm_bf16` called
+  directly. The FP32 FFT paths were already padded by their drivers (#99).
+  The kernels now trace the tail tile at its own static size after the full
+  tiles; shapes that are whole tiles trace exactly as before (same bits).
+- `_complex_mul_kernel` (`complex_mask_apply`, the unfused four-step
+  twiddle) raised for a (128, F) view with F over 512 and not a multiple of
+  512; it now does a tail tile too.
+- `_complex_gemm_tn_kernel` (six-step pass 1) now refuses shapes that are
+  not whole tiles instead of dropping the tail. Its only caller already
+  passes whole tiles.
+
 ### Changed
+
+- **The BF16 GEMM and the complex linear kernel no longer use
+  `nl.load_transpose2d` (#100, as #97 did for the FP32 DFT-GEMM).** They load
+  plainly and transpose on the Tensor engine, so a fresh activation tensor
+  no longer makes the runtime rebuild the kernel's IO DMA rings. Outputs are
+  bit-identical to the `load_transpose2d` kernels on Trn2 at every case
+  tested. `TRNFFT_PE_TRANSPOSE=0` selects the old kernels
+  (`_complex_gemm_bf16_t2d_kernel`, `_complex_linear_t2d_kernel`), and the
+  XLA path (Trn1) keeps them by default.
 
 - **The small-N DFT-GEMM and the radix-8 Stockham kernel no longer use
   `nl.load_transpose2d` (#97).** `_complex_gemm_kernel` (the default FFT for

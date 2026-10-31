@@ -390,3 +390,63 @@ class TestPETransposeSimulator:
         c_r, c_i = _simulate_kernel(stockham_radix8_w8_kernel, *args)
         w_r, w_i = _simulate_kernel(stockham_radix8_w8_t2d_kernel, *args)
         assert torch.equal(c_r, w_r) and torch.equal(c_i, w_i)
+
+
+def _tail_ref(a_r, a_i, b_r, b_i, b_nk=False):
+    """FP64 complex reference: A @ B, or A @ B^T when ``b_nk`` (complex linear)."""
+    a = torch.complex(a_r.double(), a_i.double())
+    b = torch.complex(b_r.double(), b_i.double())
+    return a @ (b.T if b_nk else b)
+
+
+def _row_err(c_r, c_i, ref):
+    got = torch.complex(c_r.double(), c_i.double())
+    return ((got - ref).abs().amax(dim=1) / ref.abs().amax(dim=1).clamp_min(1e-30)).max().item()
+
+
+# M, K, N with partial tail tiles in every dimension: M over 128 and not a
+# multiple of 128, K over 128 and not a multiple of 128, N over 512 and not a
+# multiple of 512, and small/odd sizes. (M, K, N) = (1000, 64, 64) is the
+# B = 1000, N = 64 DFT-GEMM that left rows 896-999 unwritten.
+_TAIL_SHAPES = [(129, 64, 64), (1000, 64, 64), (200, 200, 600), (7, 300, 5), (130, 136, 520)]
+
+
+class TestTailTilesSimulator:
+    """trnfft#100: the GEMM-family kernels at shapes that are not multiples of
+    their (128, 128, 512) tiles, against FP64, and the plain-load kernels
+    against their ``load_transpose2d`` versions (same bits)."""
+
+    @pytest.mark.parametrize("m,k,n", _TAIL_SHAPES)
+    @pytest.mark.parametrize(
+        "pe,t2d,bf16,b_nk",
+        [
+            ("_complex_gemm_kernel", "_complex_gemm_t2d_kernel", False, False),
+            ("_complex_gemm_kernel_bf16", "_complex_gemm_bf16_t2d_kernel", True, False),
+            ("_complex_linear_kernel", "_complex_linear_t2d_kernel", False, True),
+        ],
+    )
+    def test_matches_fp64_and_t2d(self, m, k, n, pe, t2d, bf16, b_nk):
+        from trnfft.nki import dispatch
+
+        gen = torch.Generator().manual_seed(m * 7 + k * 3 + n)
+        dt = torch.bfloat16 if bf16 else torch.float32
+        b_shape = (n, k) if b_nk else (k, n)
+        args = [torch.randn(m, k, generator=gen).to(dt) for _ in range(2)]
+        args += [torch.randn(*b_shape, generator=gen).to(dt) for _ in range(2)]
+        c_r, c_i = dispatch._simulate_kernel(getattr(dispatch, pe), *args)
+        assert c_r.shape == (m, n)
+        assert _row_err(c_r, c_i, _tail_ref(*args, b_nk=b_nk)) < 1e-5
+        w_r, w_i = dispatch._simulate_kernel(getattr(dispatch, t2d), *args)
+        assert torch.equal(c_r, w_r) and torch.equal(c_i, w_i)
+
+    @pytest.mark.parametrize("cols", [4, 600, 1536, 1100])
+    def test_complex_mul_free_tail(self, cols):
+        """Free dims over 512 that are not a multiple of 512 used to assert."""
+        from trnfft.nki.dispatch import _complex_mul_kernel, _simulate_kernel
+
+        gen = torch.Generator().manual_seed(cols)
+        a_r, a_i, b_r, b_i = (torch.randn(128, cols, generator=gen) for _ in range(4))
+        c_r, c_i = _simulate_kernel(_complex_mul_kernel, a_r, a_i, b_r, b_i)
+        want = torch.complex(a_r.double(), a_i.double()) * torch.complex(b_r.double(), b_i.double())
+        got = torch.complex(c_r.double(), c_i.double())
+        assert ((got - want).abs().max() / want.abs().max()).item() < 1e-6

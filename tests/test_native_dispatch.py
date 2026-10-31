@@ -32,9 +32,11 @@ _REAL_FIND_SPEC = importlib.util.find_spec
 EXPECTED_NKI_OPS = {
     "complex_gemm",
     "complex_gemm_bf16",
+    "complex_gemm_bf16_t2d",
     "complex_gemm_tn",
     "complex_gemm_t2d",
     "complex_linear",
+    "complex_linear_t2d",
     "complex_mul",
     "butterfly_stage",
     "butterfly_stage_kahan",
