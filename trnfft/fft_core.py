@@ -510,9 +510,16 @@ def _fft_via_four_step_fused(
     there are no transposes, no batch padding and no intermediate HBM tensors:
     one launch, one read and one write of the (B, N) batch. Batches above
     ``_FOUR_STEP_FUSED_MAX_ROWS`` rows are split into several launches.
+
+    On the native path a host batch is moved to the kernel device once, the
+    launches run on device-resident slices, and the result returns to the
+    host once (trnfft#94). Before, each launch's ``_launch`` copied its slice
+    in and its result out separately, and the slices were concatenated on the
+    host: B=16384, N=4096 from the host took 368 ms against 213 ms when moved
+    to the device by the caller.
     """
     from .nki import four_step as _fs
-    from .nki.dispatch import _launch, _simulate_kernel, _use_simulator
+    from .nki.dispatch import _is_native, _kernel_device, _launch, _simulate_kernel, _use_simulator
 
     # Looked up at call time: the kernel exists only when nki is importable
     # (the CPU dispatch tests install a stand-in).
@@ -521,8 +528,12 @@ def _fft_via_four_step_fused(
     n = x.shape[-1]
     n1, n2 = _four_step_split(n)
     orig_shape = x.real.shape
+    orig_device = x.real.device
     re = x.real.reshape(-1, n).contiguous()
     im = x.imag.reshape(-1, n).contiguous()
+    if not _use_simulator() and _is_native() and orig_device.type != "neuron":
+        dev = _kernel_device()
+        re, im = re.to(dev), im.to(dev)
 
     def _run(r, i):
         pack = _fs.four_step_pack_rows(n2, r.shape[0])
@@ -540,7 +551,10 @@ def _fft_via_four_step_fused(
         outs = [_run(re[s : s + cap], im[s : s + cap]) for s in range(0, rows, cap)]
         o_re = torch.cat([o[0] for o in outs], dim=0)
         o_im = torch.cat([o[1] for o in outs], dim=0)
-    return ComplexTensor(o_re.reshape(orig_shape), o_im.reshape(orig_shape))
+        del outs
+    o_re = o_re.reshape(orig_shape).to(orig_device)
+    o_im = o_im.reshape(orig_shape).to(orig_device)
+    return ComplexTensor(o_re, o_im)
 
 
 # Six-step (Bailey) FFT for N above the fused four-step range (trnfft#54).
@@ -549,20 +563,38 @@ def _fft_via_four_step_fused(
 # the device. Each row pass is one batched transform, so it runs on the
 # batch-fused four-step kernel (N2 <= 4096) or the single DFT-GEMM, instead
 # of the 8-13 row-chunked Stockham stages. Lengths above _FOUR_STEP_MAX
-# recurse. Opt-in: TRNFFT_SIX_STEP=1, read per call; the default dispatch is
-# unchanged. Trn2 (SDK 2.33), single transform, warm, ms: see CHANGELOG.
-_SIX_STEP_MIN = _FOUR_STEP_MAX * 2
+# recurse.
+#
+# Default for power-of-2 FP32 N >= _SIX_STEP_MIN (trnfft#94). On Trn2 (SDK
+# 2.33, one logical core) it beat the Stockham path at every N and batch
+# measured from 2^13 to 2^26, warm and on the first call, from device and
+# host input, with 10x lower error: see CHANGELOG. TRNFFT_SIX_STEP (read per
+# call): unset -> default, 0 -> never (the Stockham path), 1 -> every N above
+# _FOUR_STEP_MAX. TRNFFT_SIX_STEP_MIN moves the default threshold.
+_SIX_STEP_MIN = _env_int("TRNFFT_SIX_STEP_MIN", _FOUR_STEP_MAX * 2)
 
 
-def _six_step_enabled() -> bool:
-    return os.environ.get("TRNFFT_SIX_STEP", "0").strip().lower() in ("1", "true", "yes")
+def _six_step_mode() -> str:
+    """``"on"`` / ``"off"`` from ``TRNFFT_SIX_STEP``, else ``"auto"``."""
+    raw = os.environ.get("TRNFFT_SIX_STEP", "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return "on"
+    if raw in ("0", "false", "no", "off"):
+        return "off"
+    return "auto"
 
 
 def _use_six_step(x: ComplexTensor, n: int, precision: str = "fast") -> bool:
-    """Route ``n`` to :func:`_fft_via_six_step` (opt-in, FP32, power of 2, N > _FOUR_STEP_MAX)."""
+    """Route ``n`` to :func:`_fft_via_six_step` (FP32, power of 2, N > _FOUR_STEP_MAX).
+
+    On by default from ``_SIX_STEP_MIN``; ``TRNFFT_SIX_STEP=0`` turns it off
+    and ``=1`` turns it on for every N above ``_FOUR_STEP_MAX``.
+    """
+    mode = _six_step_mode()
+    if mode == "off" or (mode == "auto" and n < _SIX_STEP_MIN):
+        return False
     return (
-        _six_step_enabled()
-        and precision in ("fast", "kahan")
+        precision in ("fast", "kahan")
         and _DFT_GEMM_THRESHOLD > 0
         and n > _FOUR_STEP_MAX >= 4
         and _is_power_of_two(n)
@@ -1640,9 +1672,10 @@ def _cooley_tukey_nki_nograd(
     instead of the Vector engine (log2(N) butterfly stages); up to
     _FOUR_STEP_MAX the four-step two-GEMM path is used. Both apply to "kahan"
     as well, since they are more accurate than the Kahan butterfly on Trn2
-    (trnfft#82). Above _FOUR_STEP_MAX, "kahan" uses the compensated butterfly
-    and "fast" uses Stockham. Set _DFT_GEMM_THRESHOLD = 0 to force the Kahan
-    butterfly at any N.
+    (trnfft#82). Above _FOUR_STEP_MAX, power-of-2 FP32 "fast" and "kahan"
+    take the six-step (from _SIX_STEP_MIN, trnfft#94); with TRNFFT_SIX_STEP=0
+    "kahan" uses the compensated butterfly and "fast" uses Stockham. Set
+    _DFT_GEMM_THRESHOLD = 0 to force the Kahan butterfly at any N.
     """
     from .nki.butterfly import butterfly_stage_kernel, butterfly_stage_kernel_kahan
     from .nki.dispatch import _kernel_device, _launch, _use_simulator
@@ -1710,7 +1743,7 @@ def _cooley_tukey_nki_nograd(
     if _DFT_GEMM_THRESHOLD > 0 and n <= _FOUR_STEP_MAX and n >= 4 and _is_power_of_two(n):
         return _fft_via_four_step(x, inverse)
 
-    # Six-step (Bailey) large-N FFT (trnfft#54), opt-in: N = N1 * N2 as two
+    # Six-step (Bailey) large-N FFT (trnfft#54, default since #94): N = N1 * N2 as two
     # batched FFTs of length <= _FOUR_STEP_MAX on the fused four-step kernel,
     # with a twiddle and three transposes on the device.
     if _use_six_step(x, n, precision):
