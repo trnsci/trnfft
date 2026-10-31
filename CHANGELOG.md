@@ -9,6 +9,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The six-step's first pass at N = 2^13 reads x in place (#97).** It no
+  longer transposes x and runs the `load_transpose2d` DFT-GEMM. A new kernel,
+  `_complex_gemm_tn_kernel`, loads the (B, N2, N1) view of x with plain
+  `nl.load`s. Outputs are bit-identical.
+  - Cause of the 1024 × 2^13 anomaly in #96: on Trn2 (SDK 2.33) the runtime
+    rebuilds a transposed load's IO DMA rings whenever the input address
+    changes (`neuron-explorer` system trace: `kbl_exec_pre` 2–9 ms and
+    4.7 MB of ring descriptors per launch, against ~12 µs otherwise). Above
+    32768 rows the pass is split into launches on different row slices, so
+    every launch paid it. In four 1024 × 2^13 calls, 16 launches rebuilt
+    their rings before this change and none did after it.
+  - Device input, warm medians, ms (logical core 1, host threads on CPUs 3,9):
+
+    | B × 2^13 | before | after |
+    |---|---|---|
+    | 1 | 1.69 | 1.51 |
+    | 16 | 1.69 | 1.46 |
+    | 256 | 3.48 | 3.41 |
+    | 512 | 13.3 | 5.83 |
+    | 1024 | 18.5 | 10.6 |
+    | 2048 | 77.6 | 20.1 |
+    | 4096 | 156 | 40.4 |
+
+  - `TRNFFT_SIX_STEP_TN=0` restores the old pass. `_fft_via_gemm` (the
+    default for N < 512) still uses `load_transpose2d`, so it still pays
+    the rebuild once whenever its input is at a new address (#97).
+
+- **Large host results come from the caching host allocator**, as in
+  trnblas#64, trnrand#70 and trntensor#57. On the native TorchNeuron path,
+  a device-to-host copy into fresh pageable memory runs at about 4 GB/s. A
+  copy into `torch.empty(..., pin_memory=True)` runs at 13–14 GB/s. An FFT
+  result has two planes (real and imaginary), so it makes two such copies.
+  - Every host-output exit uses it: `_launch`, the fused four-step, the
+    six-step, the Stockham and butterfly drivers, the batch split across
+    cores (each shard now writes into its rows of one output) and the
+    host-staged multi-core six-step.
+  - Planes of 1 MiB and up are pinned, and only when
+    `torch.accelerator.current_accelerator().type == "neuron"`. A CUDA build
+    with no GPU raises on `pin_memory=True`.
+  - `TRNFFT_PINNED_OUTPUT=0` turns it off. Each call still returns a fresh
+    tensor. Cached blocks are rounded up to a power of two and stay cached
+    until `torch.accelerator.empty_host_cache()`.
+  - Host input and host output, warm medians in ms. Outputs are bitwise equal
+    to the pageable ones in every case, forward and inverse
+    (`scripts/bench_pinned_output.py`):
+
+    | B × N | pageable | pinned | device-resident |
+    |---|---|---|---|
+    | 16384 × 4096 | 190 | **88.0** | 10.6 |
+    | 16384 × 1024 | 48.2 | **23.4** | 3.54 |
+    | 4096 × 4096 | 48.7 | **22.3** | 2.39 |
+    | 1024 × 4096 | 13.3 | **6.05** | 0.82 |
+    | 1024 × 2^13 | 33.3 | **21.0** | 10.7 |
+    | 256 × 2^16 | 59.9 | **35.0** | 15.0 |
+    | 16 × 2^20 | 54.4 | **28.4** | 8.50 |
+    | 4 × 2^22 | 53.6 | **27.9** | 7.96 |
+    | 1 × 2^22 | 14.4 | **8.31** | 3.01 |
+    | 1 × 2^24 | 54.2 | **29.1** | 9.30 |
+    | 1 × 2^25 | 142 | **94.2** | 54.2 |
+    | 1 × 2^26 | 308 | **207** | 129 |
+
+    Results of 8 MiB per plane and less are unchanged within noise
+    (1 × 2^13 to 2^20, 16 × 2^13, 256 × 2^13, 64 × 2^14 and 16 × 2^16). The
+    inverse gains the same: 16384 × 4096 goes from 181 to 87.7 ms.
+
 - **The six-step FFT is the default for power-of-2 FP32 N >= 8192 (#94).**
   "fast" and "kahan" take it in place of the row-chunked Stockham (fast) and
   compensated butterfly (kahan) paths. That includes `ifft`, `rfft`/`irfft`,
@@ -51,8 +116,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     16 × 2^16, with errors of 1.6e-7 to 2.1e-7. The old path (the compensated
     butterfly) had not finished its first call at 2^16 after 19 min, so it was
     not run at the larger sizes.
-  - 1024 × 2^13 is 12× slower than 256 × 2^13 for 4× the data. It is still
-    20× faster than the old path. I have not profiled why.
+  - 1024 × 2^13 was 12× slower than 256 × 2^13 for 4× the data. #97 has
+    the cause and the fix (below).
   - The first calls here are longer than the 8–20 s reported in #93 (48–51 s
     at 2^25 and 2^26). That run reused compiled kernels across cases; these
     runs did not.

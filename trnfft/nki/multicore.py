@@ -257,6 +257,18 @@ def _batch_split_fft(x: ComplexTensor, inverse: bool, num_cores: int) -> Complex
     imag_shards = imag.chunk(actual_cores, dim=0)
 
     if HAS_TORCH_NEURONX:
+        from .dispatch import _host_empty, _is_native, _use_simulator
+
+        if real.device.type == "cpu" and _is_native() and not _use_simulator():
+            # Each shard's result is copied straight into its rows of one host
+            # output (from the caching host allocator when large),
+            # instead of into fresh pageable shards that are concatenated.
+            out_real = _host_empty(real.shape, real.dtype)
+            out_imag = _host_empty(imag.shape, imag.dtype)
+            _neuron_dp_dispatch(
+                real_shards, imag_shards, n, inverse, actual_cores, out=(out_real, out_imag)
+            )
+            return ComplexTensor(out_real, out_imag)
         results = _neuron_dp_dispatch(real_shards, imag_shards, n, inverse, actual_cores)
     else:
         # CPU sequential path: process each shard independently.
@@ -300,7 +312,8 @@ def _neuron_dp_dispatch(
     n: int,
     inverse: bool,
     num_cores: int,
-) -> list[ComplexTensor]:
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> list[ComplexTensor] | None:
     """Run host shard ``i`` on logical NeuronCore ``i`` (``neuron:i``), one host thread each.
 
     Native TorchNeuron path (trnfft#54). The shards are independent rows, so
@@ -315,10 +328,13 @@ def _neuron_dp_dispatch(
     time. H2D runs at about 12 GB/s whether 1 or 4 cores copy, so the split
     gains at most 1.6x over one core from host input, and no case beat
     ``torch.fft`` on the same 2 host CPUs.
+
+    With ``out=(real, imag)`` (host tensors of the whole batch), shard ``i``'s
+    result is copied into its rows of ``out`` and None is returned.
     """
     from ..complex import ComplexTensor
     from ..fft_core import fft_core
-    from .dispatch import _is_native, _use_simulator
+    from .dispatch import _is_native, _to_host, _use_simulator
 
     if _use_simulator() or not _is_native():
         return [
@@ -330,10 +346,18 @@ def _neuron_dp_dispatch(
     devices = _core_devices(src, num_cores)
     k = min(len(devices), len(real_shards))
 
-    def run(i: int) -> ComplexTensor:
+    starts = [0]
+    for r in real_shards[:k]:
+        starts.append(starts[-1] + r.shape[0])
+
+    def run(i: int) -> ComplexTensor | None:
         d = devices[i]
-        out = fft_core(ComplexTensor(real_shards[i].to(d), imag_shards[i].to(d)), inverse=inverse)
-        return ComplexTensor(out.real.to(src), out.imag.to(src))
+        y = fft_core(ComplexTensor(real_shards[i].to(d), imag_shards[i].to(d)), inverse=inverse)
+        if out is not None:
+            out[0][starts[i] : starts[i + 1]].copy_(y.real)
+            out[1][starts[i] : starts[i + 1]].copy_(y.imag)
+            return None
+        return ComplexTensor(_to_host(y.real, src), _to_host(y.imag, src))
 
     key = (n, inverse, tuple(r.shape[0] for r in real_shards[:k]), tuple(map(str, devices[:k])))
     if k == 1 or key not in _WARM:
@@ -341,7 +365,7 @@ def _neuron_dp_dispatch(
         _WARM.add(key)
     else:
         results = list(_pool(k).map(run, range(k)))
-    return results
+    return None if out is not None else results
 
 
 def _split_range(total: int, parts: int) -> list[tuple[int, int]]:
@@ -374,6 +398,7 @@ def _six_step_multicore(
     """
     from ..complex import ComplexTensor
     from ..fft_core import _four_step_twiddle_cached, _six_step_pass, _six_step_split
+    from .dispatch import _host_empty, _to_host
 
     n = x.shape[-1]
     n1, n2 = _six_step_split(n)
@@ -389,8 +414,8 @@ def _six_step_multicore(
     cols = _split_range(n1, len(devices))
     xr3, xi3 = re.reshape(B, n2, n1), im.reshape(B, n2, n1)
     blocks = [(xr3[:, :, s:e].contiguous(), xi3[:, :, s:e].contiguous()) for s, e in cols]
-    y_re = torch.empty(B, n1, n2, dtype=re.dtype)
-    y_im = torch.empty(B, n1, n2, dtype=re.dtype)
+    y_re = _host_empty((B, n1, n2), re.dtype)
+    y_im = _host_empty((B, n1, n2), re.dtype)
 
     def pass1(c: int) -> None:
         s, e = cols[c]
@@ -404,12 +429,12 @@ def _six_step_multicore(
         o_re, o_im = o_re.reshape(B, w, n2), o_im.reshape(B, w, n2)
         z_re = o_re * t_re - o_im * t_im
         z_im = o_re * t_im + o_im * t_re
-        y_re[:, s:e, :] = z_re.cpu()
-        y_im[:, s:e, :] = z_im.cpu()
+        y_re[:, s:e, :] = _to_host(z_re)
+        y_im[:, s:e, :] = _to_host(z_im)
 
     rows = _split_range(n2, len(devices))
-    out_re = torch.empty(B, n1, n2, dtype=re.dtype)
-    out_im = torch.empty(B, n1, n2, dtype=re.dtype)
+    out_re = _host_empty((B, n1, n2), re.dtype)
+    out_im = _host_empty((B, n1, n2), re.dtype)
 
     def pass2(c: int) -> None:
         s, e = rows[c]
@@ -418,8 +443,8 @@ def _six_step_multicore(
         b_re = y_re[:, :, s:e].contiguous().to(d).transpose(1, 2).contiguous().reshape(B * w, n1)
         b_im = y_im[:, :, s:e].contiguous().to(d).transpose(1, 2).contiguous().reshape(B * w, n1)
         o_re, o_im = _six_step_pass(b_re, b_im, inverse, prec)
-        out_re[:, :, s:e] = o_re.reshape(B, w, n1).transpose(1, 2).contiguous().cpu()
-        out_im[:, :, s:e] = o_im.reshape(B, w, n1).transpose(1, 2).contiguous().cpu()
+        out_re[:, :, s:e] = _to_host(o_re.reshape(B, w, n1).transpose(1, 2).contiguous())
+        out_im[:, :, s:e] = _to_host(o_im.reshape(B, w, n1).transpose(1, 2).contiguous())
 
     key = ("six", n, inverse, B, tuple(map(str, devices)))
     k = len(devices)

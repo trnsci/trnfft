@@ -334,3 +334,27 @@ class TestBF16GEMMSimulator:
             rtol=1e-1,
             err_msg="BF16 GEMM sim result diverges from FP32 reference beyond BF16 budget",
         )
+
+
+class TestComplexGemmTNSimulator:
+    """_complex_gemm_tn_kernel (trnfft#97) under nki.simulate: stacked blocks
+    given transposed give the same bits as _complex_gemm_kernel on the
+    stacked untransposed blocks."""
+
+    @pytest.mark.parametrize("g,k,m,n", [(3, 64, 128, 64), (2, 32, 64, 32), (1, 256, 256, 1024)])
+    def test_matches_gemm_kernel_bitwise(self, g, k, m, n):
+        from trnfft.nki.dispatch import (
+            _complex_gemm_kernel,
+            _complex_gemm_tn_kernel,
+            _simulate_kernel,
+        )
+
+        gen = torch.Generator().manual_seed(g * k + m)
+        at_r, at_i = torch.randn(g * k, m, generator=gen), torch.randn(g * k, m, generator=gen)
+        b_r, b_i = torch.randn(k, n, generator=gen), torch.randn(k, n, generator=gen)
+        c_r, c_i = _simulate_kernel(_complex_gemm_tn_kernel, at_r, at_i, b_r, b_i)
+        a_r = at_r.reshape(g, k, m).transpose(1, 2).reshape(g * m, k).contiguous()
+        a_i = at_i.reshape(g, k, m).transpose(1, 2).reshape(g * m, k).contiguous()
+        w_r, w_i = _simulate_kernel(_complex_gemm_kernel, a_r, a_i, b_r, b_i)
+        assert c_r.shape == (g * m, n)
+        assert torch.equal(c_r, w_r) and torch.equal(c_i, w_i)
