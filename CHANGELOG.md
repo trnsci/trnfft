@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Six-step FFT for large N, opt-in (`TRNFFT_SIX_STEP=1`, #54, #93).** Power-of-2
+  FP32 transforms above N=4096 can run as N = N1·N2: N1 row FFTs of length N2,
+  a twiddle multiply, then N2 row FFTs of length N1, with three transposes, all
+  on the device. Each row pass is one batched transform on the batch-fused
+  four-step kernel (#82). The default path runs 8–13 row-chunked Stockham stages
+  (#83).
+  - The split is balanced up to 2^24. Above that, N1 = 4096 and the N2 pass
+    recurses.
+  - Passes from length 128 up use the fused kernel. `TRNFFT_SIX_STEP_FUSED_MIN`
+    sets this length; the normal dispatch starts the fused kernel at 512.
+  - Passes below that length use the single DFT-GEMM, split into launches of at
+    most 2^15 rows (`TRNFFT_SIX_STEP_GEMM_MAX_ROWS`).
+  - A host input moves to the device once.
+  - Trn2, one logical core, warm medians in ms. Device-resident input unless
+    noted. The CPU column is `torch.fft` on 2 pinned threads:
+
+    | B × N | default | six-step | six-step, host in/out | CPU |
+    |---|---|---|---|---|
+    | 1 × 2^20 | 115 | 1.72 | 3.42 | 2.55 |
+    | 1 × 2^22 | 616 | 3.06 | 8.68 | 22.9 |
+    | 1 × 2^24 | 2006 | 9.15 | 57.1 | 100 |
+    | 1 × 2^25 | – | 98.6 | 213 | 208 |
+    | 1 × 2^26 | – | 130 | 355 | 447 |
+    | 16 × 2^20 | 1869 | 8.52 | 56.4 | 64.4 |
+    | 256 × 2^16 | 2105 | 15.2 | 64.3 | 46.9 |
+
+  - Relative L2 error against FP64 is 1.6e-7 to 2.3e-7 with the six-step,
+    against 2.1e-6 to 3.7e-6 on the default path. CPU measures 1.5e-7 to 2.5e-7.
+  - First calls took 8–20 s from 2^20 to 2^26. The default path's first call
+    took 203 s at 2^24 and 247 s at 2^26 (#83).
+  - The default dispatch is unchanged when the variable is unset.
+- `scripts/bench_multicore.py`: the measurements above and below. It covers the
+  default and six-step paths on one core, `torch.fft` on CPU, per-core resident
+  shards, the host batch split, process per core, and the six-step split across
+  cores.
+
+### Changed
+
+- **`set_multicore(True)` now runs host-batch shards on separate NeuronCores
+  (#54, #93).** On the native TorchNeuron path, shard *i* of a host batch goes
+  to `neuron:i` and gets its own host thread.
+  - The first call for a shard layout runs the shards in turn, because NKI
+    tracing is not thread-safe.
+  - Native launches are serialised behind a lock. A launch only enqueues work,
+    so the cores still run concurrently.
+  - A batch already on a NeuronCore is no longer split. Reaching the other
+    cores through the host cost 15–20× the single-core transform.
+  - Before this change, the shards ran in turn on one device.
+- Trn2 measurements (4 logical cores, 2 host CPUs). The host link sets the
+  time, not the cores:
+  - Host-to-device copies run at about 12 GB/s whether 1, 2 or 4 cores copy
+    at once.
+  - Device-to-host runs at 3.4 GB/s for 64 MB tensors and about 10 GB/s as
+    four 16 MB copies.
+  - The threaded host split is at most 1.5× faster than one core. It is
+    slower than `torch.fft` on the same 2 CPUs in every case measured.
+  - One process per core does better: 213 → 120 ms at B=16384, N=4096,
+    against 163 ms on CPU. It is not part of the library.
+  - Shards the caller places on `neuron:0..3`, with `trnfft.fft` called on
+    each from one thread, scale on compute alone: 10.9 → 6.3 → 4.9 ms at
+    B=16384, N=4096 on 1 / 2 / 4 cores. This already worked before this
+    change.
+- A six-step single transform with both passes split across cores
+  (`multicore._six_step_multicore`, host-staged) is slower than one core:
+  169 ms on 4 cores against 9.15 ms on one, at N=2^24. It is kept for the
+  benchmark and is not wired into dispatch.
+
 ## [0.24.0] - 2026-10-30
 
 Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.

@@ -1258,6 +1258,84 @@ class TestFourStepBatchFused(TestFourStepDispatch):
         assert calls["rows"] == [8, 8, 5]
 
 
+class TestSixStep(TestFourStepDispatch):
+    """Six-step large-N FFT (trnfft#54, opt-in ``TRNFFT_SIX_STEP=1``).
+
+    Each row pass of length <= _FOUR_STEP_MAX goes to the batch-fused
+    four-step stand-in (or the single GEMM at <= 256); Stockham must not run.
+    """
+
+    @pytest.mark.parametrize("n", [8192, 16384, 65536])
+    @pytest.mark.parametrize("batch", [1, 3])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_matches_numpy(self, monkeypatch, n, batch, inverse):
+        calls = self._install_fakes(monkeypatch, batch_fused=True)
+        monkeypatch.setenv("TRNFFT_SIX_STEP", "1")
+        g = torch.Generator().manual_seed(n + batch)
+        xr, xi = torch.randn(batch, n, generator=g), torch.randn(batch, n, generator=g)
+        y = (trnfft.ifft if inverse else trnfft.fft)(ComplexTensor(xr, xi))
+        xc = xr.double().numpy() + 1j * xi.double().numpy()
+        ref = np.fft.ifft(xc) if inverse else np.fft.fft(xc)
+        assert y.shape == (batch, n)
+        assert self._rel(y, ref) < 1e-5
+        # Two row passes; at N = 8192 the 64-point pass is a single GEMM.
+        assert calls["four_step"] + calls["gemm"] == 2
+
+    def test_recurses_above_four_step_max(self, monkeypatch):
+        from trnfft import fft_core as fc
+
+        calls = self._install_fakes(monkeypatch, batch_fused=True)
+        monkeypatch.setattr(fc, "_FOUR_STEP_MAX", 512)
+        monkeypatch.setenv("TRNFFT_SIX_STEP", "1")
+        # 2^20 > 512^2: 512 (fused) x 2048, and 2048 recurses as 64 x 32 GEMMs.
+        xr, xi = torch.randn(1, 1 << 20), torch.randn(1, 1 << 20)
+        y = trnfft.fft(ComplexTensor(xr, xi))
+        ref = np.fft.fft(xr.double().numpy() + 1j * xi.double().numpy())
+        assert self._rel(y, ref) < 1e-5
+        assert (calls["four_step"], calls["gemm"]) == (1, 2)
+
+    def test_gemm_pass_row_chunks(self, monkeypatch):
+        from trnfft import fft_core as fc
+
+        calls = self._install_fakes(monkeypatch, batch_fused=True)
+        monkeypatch.setattr(fc, "_SIX_STEP_GEMM_MAX_ROWS", 128)
+        monkeypatch.setenv("TRNFFT_SIX_STEP", "1")
+        xr, xi = torch.randn(3, 8192), torch.randn(3, 8192)
+        y = trnfft.fft(ComplexTensor(xr, xi))
+        ref = np.fft.fft(xr.double().numpy() + 1j * xi.double().numpy())
+        assert self._rel(y, ref) < 1e-5
+        # 8192 = 128 x 64: 384 rows of 64 on the GEMM (3 launches of 128 rows),
+        # 192 -> 256 rows of 128 on the fused kernel (from _SIX_STEP_FUSED_MIN).
+        assert (calls["gemm"], calls["four_step"]) == (3, 1)
+
+    def test_fused_rows_per_launch(self):
+        from trnfft import fft_core as fc
+
+        cap = fc._FOUR_STEP_FUSED_MAX_ROWS
+        assert fc._six_step_fused_rows(4096) == cap
+        assert fc._six_step_fused_rows(1024) == 4 * cap
+        assert fc._six_step_fused_rows(128) == 32 * cap
+
+    def test_off_by_default(self, monkeypatch):
+        from trnfft import fft_core as fc
+
+        monkeypatch.delenv("TRNFFT_SIX_STEP", raising=False)
+        x = ComplexTensor(torch.randn(1, 8192), torch.randn(1, 8192))
+        assert not fc._use_six_step(x, 8192)
+        monkeypatch.setenv("TRNFFT_SIX_STEP", "1")
+        assert fc._use_six_step(x, 8192)
+        assert not fc._use_six_step(x, 4096)  # fused four-step range
+        assert not fc._use_six_step(x, 8192, "double")
+        x64 = ComplexTensor(torch.randn(1, 8192).double(), torch.randn(1, 8192).double())
+        assert not fc._use_six_step(x64, 8192)
+
+    def test_default_routes_to_stockham(self, monkeypatch):
+        self._install_fakes(monkeypatch, batch_fused=True)
+        monkeypatch.delenv("TRNFFT_SIX_STEP", raising=False)
+        with pytest.raises(AssertionError, match="Stockham path reached"):
+            trnfft.fft(ComplexTensor(torch.randn(8192), torch.randn(8192)))
+
+
 class TestBluesteinChirpPrecision:
     """Chirp built in FP64 with k^2 mod 2N (trnfft#82 hardware finding).
 
@@ -1439,3 +1517,62 @@ class TestLargeFFTNeuron:
         chunked = trnfft.fft(x)
         assert torch.equal(chunked.real.cpu(), whole.real.cpu())
         assert torch.equal(chunked.imag.cpu(), whole.imag.cpu())
+
+
+@pytest.mark.neuron
+class TestSixStepNeuron:
+    """Six-step large-N FFT on device (trnfft#54, ``TRNFFT_SIX_STEP=1``)."""
+
+    @staticmethod
+    def _rel(y, ref):
+        got = torch.complex(y.real.double().cpu(), y.imag.double().cpu())
+        return (torch.linalg.vector_norm(got - ref) / torch.linalg.vector_norm(ref)).item()
+
+    @pytest.mark.parametrize("batch,log2n", [(1, 13), (1, 22), (4, 16), (1, 25)])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_vs_torch_fp64(self, nki_backend, monkeypatch, batch, log2n, inverse):
+        monkeypatch.setenv("TRNFFT_SIX_STEP", "1")
+        g = torch.Generator().manual_seed(54 + log2n)
+        xr = torch.randn(batch, 1 << log2n, generator=g)
+        xi = torch.randn(batch, 1 << log2n, generator=g)
+        dev = torch.device("neuron")
+        y = (trnfft.ifft if inverse else trnfft.fft)(ComplexTensor(xr.to(dev), xi.to(dev)))
+        assert y.real.device.type == "neuron"
+        x64 = torch.complex(xr.double(), xi.double())
+        ref = torch.fft.ifft(x64) if inverse else torch.fft.fft(x64)
+        assert self._rel(y, ref) < 1e-6
+
+    def test_host_input_returns_to_host(self, nki_backend, monkeypatch):
+        monkeypatch.setenv("TRNFFT_SIX_STEP", "1")
+        x = torch.randn(1 << 20)
+        y = trnfft.fft(x)
+        assert y.real.device.type == "cpu"
+        assert self._rel(y, torch.fft.fft(x.double())) < 1e-6
+
+
+@pytest.mark.neuron
+class TestMulticoreSplitNeuron:
+    """Host batch split across logical NeuronCores (trnfft#54)."""
+
+    def test_host_split_matches_single_core(self, nki_backend):
+        import torch_neuronx
+
+        from trnfft.nki.multicore import _batch_split_fft, _six_step_multicore
+
+        if torch_neuronx.device_count() < 2:
+            pytest.skip("needs >= 2 visible NeuronCores (NEURON_RT_VISIBLE_CORES)")
+        g = torch.Generator().manual_seed(93)
+        x = ComplexTensor(torch.randn(256, 1024, generator=g), torch.randn(256, 1024, generator=g))
+        one = trnfft.fft(x)
+        for _ in range(2):  # first call runs the shards in turn, then concurrently
+            y = _batch_split_fft(x, inverse=False, num_cores=2)
+            assert y.real.device.type == "cpu"
+            torch.testing.assert_close(y.real, one.real.cpu())
+            torch.testing.assert_close(y.imag, one.imag.cpu())
+        s = torch.randn(1 << 20, generator=g)
+        ref = torch.fft.fft(s.double())
+        for _ in range(2):
+            y = _six_step_multicore(ComplexTensor(s, torch.zeros_like(s)), False, 2)
+            got = torch.complex(y.real.double(), y.imag.double())
+            rel = (torch.linalg.vector_norm(got - ref) / torch.linalg.vector_norm(ref)).item()
+            assert rel < 1e-6

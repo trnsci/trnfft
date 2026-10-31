@@ -499,7 +499,9 @@ def _four_step_fused_consts(
     return tuple(t.contiguous().to(device) for t in out)
 
 
-def _fft_via_four_step_fused(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+def _fft_via_four_step_fused(
+    x: ComplexTensor, inverse: bool, max_rows: int | None = None
+) -> ComplexTensor:
     """Four-step FFT for the whole batch in one NKI launch (trnfft#82 follow-up).
 
     Same math and constants as :func:`_fft_via_four_step`, but
@@ -531,7 +533,7 @@ def _fft_via_four_step_fused(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         return _launch(kernel, "four_step_fft", r, i, *consts)
 
     rows = re.shape[0]
-    cap = max(1, _FOUR_STEP_FUSED_MAX_ROWS)
+    cap = max(1, _FOUR_STEP_FUSED_MAX_ROWS if max_rows is None else max_rows)
     if rows <= cap:
         o_re, o_im = _run(re, im)
     else:
@@ -539,6 +541,171 @@ def _fft_via_four_step_fused(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         o_re = torch.cat([o[0] for o in outs], dim=0)
         o_im = torch.cat([o[1] for o in outs], dim=0)
     return ComplexTensor(o_re.reshape(orig_shape), o_im.reshape(orig_shape))
+
+
+# Six-step (Bailey) FFT for N above the fused four-step range (trnfft#54).
+# N = N1 * N2 (balanced powers of 2) is computed as N1 row FFTs of length N2,
+# a twiddle multiply, and N2 row FFTs of length N1, with three transposes on
+# the device. Each row pass is one batched transform, so it runs on the
+# batch-fused four-step kernel (N2 <= 4096) or the single DFT-GEMM, instead
+# of the 8-13 row-chunked Stockham stages. Lengths above _FOUR_STEP_MAX
+# recurse. Opt-in: TRNFFT_SIX_STEP=1, read per call; the default dispatch is
+# unchanged. Trn2 (SDK 2.33), single transform, warm, ms: see CHANGELOG.
+_SIX_STEP_MIN = _FOUR_STEP_MAX * 2
+
+
+def _six_step_enabled() -> bool:
+    return os.environ.get("TRNFFT_SIX_STEP", "0").strip().lower() in ("1", "true", "yes")
+
+
+def _use_six_step(x: ComplexTensor, n: int, precision: str = "fast") -> bool:
+    """Route ``n`` to :func:`_fft_via_six_step` (opt-in, FP32, power of 2, N > _FOUR_STEP_MAX)."""
+    return (
+        _six_step_enabled()
+        and precision in ("fast", "kahan")
+        and _DFT_GEMM_THRESHOLD > 0
+        and n > _FOUR_STEP_MAX >= 4
+        and _is_power_of_two(n)
+        and x.real.dtype == torch.float32
+    )
+
+
+# Rows per launch for a six-step pass that lands on the single DFT-GEMM
+# (length <= _DFT_GEMM_THRESHOLD). That kernel unrolls its 128-row M tiles,
+# so a 2^19-row pass is one very large kernel to compile; passes are split
+# into launches of at most this many rows instead. The fused four-step
+# kernel already splits at _FOUR_STEP_FUSED_MAX_ROWS.
+_SIX_STEP_GEMM_MAX_ROWS = _env_int("TRNFFT_SIX_STEP_GEMM_MAX_ROWS", 1 << 15)
+
+# Six-step passes use the fused four-step kernel from this length up, below
+# the _FOUR_STEP_FUSED_MIN = 512 of the normal dispatch. On Trn2 the passes
+# have 10^4-10^5 rows, where the fused kernel beats the single DFT-GEMM:
+# B=256 N=2^16 (256-point passes) 47 -> 19 ms, N=2^26 (128-point passes)
+# 256 -> 151 ms, same accuracy. Env TRNFFT_SIX_STEP_FUSED_MIN.
+_SIX_STEP_FUSED_MIN = _env_int("TRNFFT_SIX_STEP_FUSED_MIN", 128)
+
+
+def _six_step_fused_rows(length: int) -> int:
+    """Rows per fused launch for a six-step pass of ``length``.
+
+    The fused kernel unrolls one loop body per group of P*Q rows (P rows per
+    stationary operand, Q packs per PSUM tile), which is 16 rows at N=4096
+    and up to 512 at N=128. Scaling _FOUR_STEP_FUSED_MAX_ROWS by P*Q/16 keeps
+    the unrolled body, and so the compile, the same size as at N=4096 while
+    small-N passes need far fewer launches.
+    """
+    from .nki.four_step import FOUR_STEP_FREE_MAX
+
+    n1, n2 = _four_step_split(length)
+    pq = max(1, 128 // n2) * max(1, FOUR_STEP_FREE_MAX // n1)
+    return max(_FOUR_STEP_FUSED_MAX_ROWS, _FOUR_STEP_FUSED_MAX_ROWS * pq // 16)
+
+
+def _six_step_split(n: int) -> tuple[int, int]:
+    """N = N1 * N2, powers of 2.
+
+    Up to _FOUR_STEP_MAX^2 (2^24) the split is balanced (N1 = N2 or 2 * N2),
+    so both passes are single-level. Above it N1 = _FOUR_STEP_MAX, one pass
+    on the fused kernel, and N2 = N / N1 recurses.
+    """
+    if n <= _FOUR_STEP_MAX * _FOUR_STEP_MAX:
+        return _four_step_split(n)
+    return _FOUR_STEP_MAX, n // _FOUR_STEP_MAX
+
+
+def _six_step_pass(re: torch.Tensor, im: torch.Tensor, inverse: bool, precision: str):
+    """Row FFTs of a (rows, L) pair on its device; L <= _FOUR_STEP_MAX or recursive."""
+    rows = re.shape[0]
+    if rows > 128 and rows % 128:
+        # The single DFT-GEMM tiles rows by 128 with no tail tile.
+        pad = torch.zeros(128 - rows % 128, re.shape[1], dtype=re.dtype, device=re.device)
+        re, im = torch.cat([re, pad]), torch.cat([im, pad])
+
+    def run(r, i):
+        x = ComplexTensor(r, i)
+        if _use_nki():
+            return _cooley_tukey_nki_nograd(x, inverse=inverse, precision=precision)
+        return fft_core(x, inverse=inverse, precision=precision)  # CPU reference (tests)
+
+    length = re.shape[1]
+    if (
+        _use_nki()
+        and _FOUR_STEP_BATCH_FUSED
+        and max(_SIX_STEP_FUSED_MIN, 4) <= length <= _FOUR_STEP_MAX
+        and _four_step_fused_fits(length)
+    ):
+        out = _fft_via_four_step_fused(ComplexTensor(re, im), inverse, _six_step_fused_rows(length))
+        return out.real[:rows], out.imag[:rows]
+    cap = max(128, _SIX_STEP_GEMM_MAX_ROWS // 128 * 128)
+    if length <= _DFT_GEMM_THRESHOLD and re.shape[0] > cap:
+        outs = [run(re[s : s + cap], im[s : s + cap]) for s in range(0, re.shape[0], cap)]
+        o_re = torch.cat([o.real for o in outs])
+        o_im = torch.cat([o.imag for o in outs])
+    else:
+        out = run(re, im)
+        o_re, o_im = out.real, out.imag
+    return o_re[:rows], o_im[:rows]
+
+
+def _fft_via_six_step(x: ComplexTensor, inverse: bool, precision: str = "fast") -> ComplexTensor:
+    """Six-step FFT: transpose, N1 row FFTs of length N2, twiddle, transpose,
+    N2 row FFTs of length N1, transpose (trnfft#54).
+
+    With input index ``j = j1 + N1*j2`` and output index ``k = k2 + N2*k1``::
+
+        X[k2 + N2*k1] = sum_j1 W_N1^(j1 k1) W_N^(j1 k2) sum_j2 x[j1 + N1 j2] W_N2^(j2 k2)
+
+    The (B, N2, N1) view of x is transposed to (B, N1, N2) so the inner sum
+    is a batch of B*N1 row FFTs; the twiddle ``W_N^(j1 k2)`` (built in FP64,
+    cast once, cached per device) multiplies the (N1, N2) result; a second
+    transpose gives B*N2 rows of length N1; the last transpose puts
+    ``k = k1*N2 + k2`` in natural order. The inverse uses the conjugate
+    twiddle and the inner transforms' 1/N1 and 1/N2, so 1/N overall.
+
+    A host input is moved to the kernel device once and the result returned
+    to the host, so the intermediates and transposes stay on the device.
+    """
+    from .nki.dispatch import _is_native, _kernel_device, _use_simulator
+
+    n = x.shape[-1]
+    n1, n2 = _six_step_split(n)
+    orig_shape = x.real.shape
+    orig_device = x.real.device
+    re = x.real.reshape(-1, n)
+    im = x.imag.reshape(-1, n)
+    if not _use_simulator() and _is_native() and orig_device.type != "neuron":
+        dev = _kernel_device()
+        re, im = re.to(dev), im.to(dev)
+    B = re.shape[0]
+    dtype, device = re.dtype, re.device
+
+    # x[b, j2, j1] -> rows (b, j1), length N2.
+    a_re = re.reshape(B, n2, n1).transpose(1, 2).contiguous().reshape(B * n1, n2)
+    a_im = im.reshape(B, n2, n1).transpose(1, 2).contiguous().reshape(B * n1, n2)
+    y_re, y_im = _six_step_pass(a_re, a_im, inverse, precision)
+    del a_re, a_im
+
+    # Twiddle W_N^(j1 k2), (N1, N2), broadcast over the batch.
+    t_re, t_im = _four_step_twiddle_cached(n2, n1, inverse, dtype, device)
+    y_re = y_re.reshape(B, n1, n2)
+    y_im = y_im.reshape(B, n1, n2)
+    z_re = y_re * t_re - y_im * t_im
+    z_im = y_re * t_im + y_im * t_re
+    del y_re, y_im
+
+    # (b, j1, k2) -> rows (b, k2), length N1.
+    b_re = z_re.transpose(1, 2).contiguous().reshape(B * n2, n1)
+    b_im = z_im.transpose(1, 2).contiguous().reshape(B * n2, n1)
+    del z_re, z_im
+    o_re, o_im = _six_step_pass(b_re, b_im, inverse, precision)
+    del b_re, b_im
+
+    # (b, k2, k1) -> (b, k1, k2): k = k1*N2 + k2.
+    X_re = o_re.reshape(B, n2, n1).transpose(1, 2).contiguous()
+    X_im = o_im.reshape(B, n2, n1).transpose(1, 2).contiguous()
+    X_re = X_re.reshape(orig_shape).to(orig_device)
+    X_im = X_im.reshape(orig_shape).to(orig_device)
+    return ComplexTensor(X_re, X_im)
 
 
 def _fft_via_four_step(x: ComplexTensor, inverse: bool) -> ComplexTensor:
@@ -1542,6 +1709,12 @@ def _cooley_tukey_nki_nograd(
     # it along with DFT-GEMM ("force butterfly/Stockham").
     if _DFT_GEMM_THRESHOLD > 0 and n <= _FOUR_STEP_MAX and n >= 4 and _is_power_of_two(n):
         return _fft_via_four_step(x, inverse)
+
+    # Six-step (Bailey) large-N FFT (trnfft#54), opt-in: N = N1 * N2 as two
+    # batched FFTs of length <= _FOUR_STEP_MAX on the fused four-step kernel,
+    # with a twiddle and three transposes on the device.
+    if _use_six_step(x, n, precision):
+        return _fft_via_six_step(x, inverse, precision)
 
     # Mixed-radix Stockham (v0.16): optimal [8^a, 4^b] plan for any power-of-2.
     # Only dispatched when mixed gives fewer stages than the best pure alternative.
