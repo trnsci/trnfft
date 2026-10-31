@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   case measured.
   - On Trn2 (SDK 2.33) the runtime rebuilds a `load_transpose2d` input's IO
     DMA rings whenever its address changes, so every call with a fresh
-    device tensor paid 1–4 ms of `kbl_exec_pre` (32768 × 64: 2.37 MB of
+    device tensor paid 1–4.4 ms of `kbl_exec_pre` (32768 × 64: 2.37 MB of
     ring descriptors per plane). Plain loads, and even element-strided DMA
     access patterns, do not (`scripts/repro_dma_ring_rebuild.py`).
   - For N < 128 the DFT-GEMM packs 128 / N rows into one GEMM row against a
