@@ -1,26 +1,30 @@
-"""Multi-NeuronCore parallelism for large FFT transforms.
+"""Multi-NeuronCore parallelism for FFT transforms.
 
 Partition strategies
 --------------------
 
-1. **Data parallelism (batch split)** — For input with batch dimension > 1,
-   distribute shards across NeuronCores. No inter-core communication. Speedup
-   scales linearly with core count up to min(batch, n_cores).
+1. **Data parallelism (batch split)**: for a host batch with more than one
+   row, shard ``i`` runs on logical NeuronCore ``neuron:i`` with its own host
+   thread (:func:`_batch_split_fft`). There is no inter-core communication.
+   A batch already on a NeuronCore is not split.
 
-2. **Stage parallelism (single-transform split)** — A single large FFT split
-   across cores by distributing butterfly stages. Requires inter-core all-reduce
-   after each stage boundary. Only pays for N > 2^17 on trn1. Not yet
-   implemented; single-transform input raises NotImplementedError.
+2. **Single-transform split**: a row-column (four-step) decomposition with
+   each phase run as a batch split (:func:`_stage_parallel_fft`), and a
+   six-step variant with both passes split across cores and the exchange
+   staged through the host (:func:`_six_step_multicore`, benchmark only).
 
-On Trainium hardware with torch_neuronx available, batch splits use
-torch_neuronx.DataParallel with a cached compiled model. On CPU (no
-torch_neuronx) each shard is processed sequentially — architecturally correct,
-no hardware parallelism.
+Measured on Trn2 (one chip, 4 logical cores, trnfft#54 / #93), the host link
+sets the time, not the cores:
 
-Size thresholds (trn1, 16 NeuronCores, 32 MB SBUF each)
----------------------------------------------------------
-Transforms up to N=2^16 fit in one core; stage parallelism is only beneficial
-for N > 2^17. These thresholds need measurement and are not enforced here.
+- Host-to-device copies run at about 12 GB/s whether 1 or 4 cores copy.
+- The threaded batch split gains at most 1.5x over one core.
+- The six-step split is far slower than the single-core six-step
+  (``TRNFFT_SIX_STEP=1``): 169 against 9.15 ms at N = 2^24.
+- Shards a caller keeps on ``neuron:0..3`` and transforms in place do scale:
+  2.2x on 4 cores at B = 16384, N = 4096.
+
+On CPU (no torch_neuronx) each shard is processed sequentially. That path is
+architecturally correct but gives no hardware parallelism.
 """
 
 from __future__ import annotations
@@ -70,7 +74,7 @@ def set_multicore(enabled: bool, num_cores: int = 0) -> None:
     Args:
         enabled: If True, `multi_core_fft` routes to the batch-split path.
         num_cores: Number of NeuronCores to target. 0 = use all available
-            (resolved via torch_neuronx.get_neuron_device_count() at dispatch
+            (resolved via torch_neuronx.device_count() at dispatch
             time, or falls back to min(batch, 2) on CPU).
     """
     global _use_multicore, _num_cores
@@ -123,8 +127,10 @@ def _resolve_num_cores(batch_size: int) -> int:
         try:
             import torch_neuronx
 
-            hw_cores = torch_neuronx.get_neuron_device_count()
-            return min(hw_cores, batch_size)
+            count = getattr(torch_neuronx, "device_count", None)
+            if count is None:
+                count = torch_neuronx.get_neuron_device_count
+            return min(count(), batch_size)
         except AttributeError:
             pass
     # CPU fallback: treat as 2-core (split in half for testing).
@@ -222,9 +228,13 @@ def _stage_parallel_fft(x: ComplexTensor, num_cores: int, inverse: bool) -> Comp
 def _batch_split_fft(x: ComplexTensor, inverse: bool, num_cores: int) -> ComplexTensor:
     """Data-parallel FFT: split batch across NeuronCores.
 
-    On Neuron hardware (torch_neuronx available): compiles an FFTModule once per
-    (n, inverse, num_cores) key and dispatches via torch_neuronx.DataParallel.
-    Subsequent calls on the same shape hit the model cache.
+    On the native TorchNeuron path a host-resident batch is split into
+    ``num_cores`` shards, shard ``i`` on ``neuron:i`` with its own host thread
+    (:func:`_neuron_dp_dispatch`). A batch already on a NeuronCore is not
+    split: the other cores could only be reached through the host, and on
+    Trn2 that staging cost 15-20x the single-core transform (trnfft#54). To
+    use several cores, place the shards on ``neuron:0..k-1`` yourself and call
+    ``trnfft.fft`` on each; launches stay on each shard's core.
 
     On CPU (no torch_neuronx): splits the batch into `num_cores` shards and
     processes them sequentially. Output is identical to single-core; this path
@@ -239,7 +249,7 @@ def _batch_split_fft(x: ComplexTensor, inverse: bool, num_cores: int) -> Complex
     batch = real.shape[0]
 
     actual_cores = min(num_cores, batch)
-    if actual_cores <= 1:
+    if actual_cores <= 1 or real.device.type == "neuron":
         return fft_core(x, inverse=inverse)
 
     # Split batch into shards.
@@ -260,6 +270,30 @@ def _batch_split_fft(x: ComplexTensor, inverse: bool, num_cores: int) -> Complex
     return ComplexTensor(out_real, out_imag)
 
 
+_POOL = None
+# (n, inverse, shard rows, devices) of the splits that have run once.
+_WARM: set = set()
+
+
+def _pool(workers: int):
+    global _POOL
+    if _POOL is None or _POOL._max_workers < workers:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _POOL = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="trnfft-core")
+    return _POOL
+
+
+def _core_devices(src: torch.device, num_cores: int) -> list[torch.device]:
+    """``num_cores`` logical NeuronCores, starting at ``src``'s core when it is one."""
+    import torch_neuronx
+
+    ndev = torch_neuronx.device_count()
+    k = max(1, min(num_cores, ndev))
+    first = (src.index or 0) if src.type == "neuron" else 0
+    return [torch.device("neuron", (first + i) % ndev) for i in range(k)]
+
+
 def _neuron_dp_dispatch(
     real_shards: tuple[torch.Tensor, ...],
     imag_shards: tuple[torch.Tensor, ...],
@@ -267,24 +301,133 @@ def _neuron_dp_dispatch(
     inverse: bool,
     num_cores: int,
 ) -> list[ComplexTensor]:
-    """Dispatch shards via NKI fft_core on Neuron hardware.
+    """Run host shard ``i`` on logical NeuronCore ``i`` (``neuron:i``), one host thread each.
 
-    SDK 2.29 (NKI 0.3.0): torch_neuronx.trace + DataParallel fails when
-    multiple shapes are compiled in the same process — the internal structure
-    flattener asserts layout equality across forward() calls, breaking when
-    different benchmark configs produce different shard sizes. Tracked for
-    re-evaluation on SDK 2.30+.
+    Native TorchNeuron path (trnfft#54). The shards are independent rows, so
+    the result equals the single-core one; each thread copies its shard in,
+    runs ``fft_core`` there and copies the result back to the host. The first
+    call for a shard layout runs the shards one after another, because NKI
+    tracing is not thread-safe (trnsolver#54); later calls run them
+    concurrently. Off the native path (XLA, simulator) the shards run in turn
+    through ``fft_core``.
 
-    Current approach: call fft_core per shard. fft_core routes through the
-    NKI dispatch layer (NEFF-compiled kernels, cached per shape). This gives
-    NKI kernel acceleration on each shard without the DataParallel layer.
-    True cross-core parallelism requires the NeuronLink collectives path
-    (HAS_COLLECTIVES, SDK ≥ 2.30).
+    Trn2 measurements (trnfft#54): the host link, not the cores, sets the
+    time. H2D runs at about 12 GB/s whether 1 or 4 cores copy, so the split
+    gains at most 1.6x over one core from host input, and no case beat
+    ``torch.fft`` on the same 2 host CPUs.
     """
     from ..complex import ComplexTensor
     from ..fft_core import fft_core
+    from .dispatch import _is_native, _use_simulator
 
-    results = []
-    for r_shard, i_shard in zip(real_shards, imag_shards, strict=True):
-        results.append(fft_core(ComplexTensor(r_shard, i_shard), inverse=inverse))
+    if _use_simulator() or not _is_native():
+        return [
+            fft_core(ComplexTensor(r, i), inverse=inverse)
+            for r, i in zip(real_shards, imag_shards, strict=True)
+        ]
+
+    src = real_shards[0].device
+    devices = _core_devices(src, num_cores)
+    k = min(len(devices), len(real_shards))
+
+    def run(i: int) -> ComplexTensor:
+        d = devices[i]
+        out = fft_core(ComplexTensor(real_shards[i].to(d), imag_shards[i].to(d)), inverse=inverse)
+        return ComplexTensor(out.real.to(src), out.imag.to(src))
+
+    key = (n, inverse, tuple(r.shape[0] for r in real_shards[:k]), tuple(map(str, devices[:k])))
+    if k == 1 or key not in _WARM:
+        results = [run(i) for i in range(k)]
+        _WARM.add(key)
+    else:
+        results = list(_pool(k).map(run, range(k)))
     return results
+
+
+def _split_range(total: int, parts: int) -> list[tuple[int, int]]:
+    """``[0, total)`` in at most ``parts`` near-equal ``[start, stop)`` pieces."""
+    parts = max(1, min(parts, total))
+    per = -(-total // parts)
+    return [(s, min(s + per, total)) for s in range(0, total, per)]
+
+
+def _six_step_multicore(
+    x: ComplexTensor, inverse: bool, num_cores: int, devices: list[torch.device] | None = None
+) -> ComplexTensor:
+    """Six-step FFT (``fft_core._fft_via_six_step``) with both row passes split
+    across logical NeuronCores, the exchange staged through the host (trnfft#54).
+
+    With ``N = N1 * N2`` and the (B, N2, N1) view of x:
+
+    1. Core c takes columns ``j1 in [s, e)``: the host copies the
+       ``(B, N2, e-s)`` block (contiguous runs of e-s), the core transposes
+       it, runs ``B*(e-s)`` row FFTs of length N2 and the twiddle
+       ``W_N^(j1 k2)`` for its rows, and returns ``(B, e-s, N2)``, which the
+       host writes into ``Y[:, s:e, :]``.
+    2. Core c takes ``k2 in [s, e)``: the host copies ``Y[:, :, s:e]``, the
+       core transposes, runs ``B*(e-s)`` row FFTs of length N1, transposes
+       back to ``(B, N1, e-s)``, and the host writes ``X[:, :, s:e]``.
+
+    All transposes run on the device; the host only does block copies. The
+    full array crosses the host link four times (two H2D, two D2H), which is
+    what this path costs over the single-core six-step (see CHANGELOG).
+    """
+    from ..complex import ComplexTensor
+    from ..fft_core import _four_step_twiddle_cached, _six_step_pass, _six_step_split
+
+    n = x.shape[-1]
+    n1, n2 = _six_step_split(n)
+    orig_shape = x.real.shape
+    src = x.real.device
+    re = x.real.reshape(-1, n).cpu()
+    im = x.imag.reshape(-1, n).cpu()
+    B = re.shape[0]
+    if devices is None:
+        devices = _core_devices(src, num_cores)
+    prec = "fast"
+
+    cols = _split_range(n1, len(devices))
+    xr3, xi3 = re.reshape(B, n2, n1), im.reshape(B, n2, n1)
+    blocks = [(xr3[:, :, s:e].contiguous(), xi3[:, :, s:e].contiguous()) for s, e in cols]
+    y_re = torch.empty(B, n1, n2, dtype=re.dtype)
+    y_im = torch.empty(B, n1, n2, dtype=re.dtype)
+
+    def pass1(c: int) -> None:
+        s, e = cols[c]
+        d = devices[c]
+        w = e - s
+        a_re = blocks[c][0].to(d).transpose(1, 2).contiguous().reshape(B * w, n2)
+        a_im = blocks[c][1].to(d).transpose(1, 2).contiguous().reshape(B * w, n2)
+        o_re, o_im = _six_step_pass(a_re, a_im, inverse, prec)
+        t_re, t_im = _four_step_twiddle_cached(n2, n1, inverse, re.dtype, d)
+        t_re, t_im = t_re[s:e], t_im[s:e]
+        o_re, o_im = o_re.reshape(B, w, n2), o_im.reshape(B, w, n2)
+        z_re = o_re * t_re - o_im * t_im
+        z_im = o_re * t_im + o_im * t_re
+        y_re[:, s:e, :] = z_re.cpu()
+        y_im[:, s:e, :] = z_im.cpu()
+
+    rows = _split_range(n2, len(devices))
+    out_re = torch.empty(B, n1, n2, dtype=re.dtype)
+    out_im = torch.empty(B, n1, n2, dtype=re.dtype)
+
+    def pass2(c: int) -> None:
+        s, e = rows[c]
+        d = devices[c]
+        w = e - s
+        b_re = y_re[:, :, s:e].contiguous().to(d).transpose(1, 2).contiguous().reshape(B * w, n1)
+        b_im = y_im[:, :, s:e].contiguous().to(d).transpose(1, 2).contiguous().reshape(B * w, n1)
+        o_re, o_im = _six_step_pass(b_re, b_im, inverse, prec)
+        out_re[:, :, s:e] = o_re.reshape(B, w, n1).transpose(1, 2).contiguous().cpu()
+        out_im[:, :, s:e] = o_im.reshape(B, w, n1).transpose(1, 2).contiguous().cpu()
+
+    key = ("six", n, inverse, B, tuple(map(str, devices)))
+    k = len(devices)
+    for fn, parts in ((pass1, len(cols)), (pass2, len(rows))):
+        if k == 1 or key not in _WARM:
+            for c in range(parts):
+                fn(c)
+        else:
+            list(_pool(parts).map(fn, range(parts)))
+    _WARM.add(key)
+    return ComplexTensor(out_re.reshape(orig_shape).to(src), out_im.reshape(orig_shape).to(src))

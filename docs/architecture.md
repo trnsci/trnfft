@@ -49,7 +49,7 @@ trnfft/
     ├── dispatch.py      # Backend dispatch + GEMM/mul kernels
     ├── butterfly.py     # NKI butterfly kernel (fast + Kahan variants)
     ├── autograd.py      # torch.autograd.Function wrappers for kernels
-    └── multicore.py     # Multi-NeuronCore (scaffold)
+    └── multicore.py     # Multi-NeuronCore batch split (host batches)
 ```
 
 ## Precision modes

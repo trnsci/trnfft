@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import threading
 import warnings
 
 try:
@@ -548,6 +549,9 @@ def _kernel_device() -> torch.device:
     return torch_xla.device()
 
 
+_LAUNCH_LOCK = threading.Lock()
+
+
 def _launch(kernel, op_name: str, *args):
     """Run one kernel launch on the Neuron device; results return to the caller's device.
 
@@ -562,7 +566,13 @@ def _launch(kernel, op_name: str, *args):
     if _is_native():
         orig = tensors[0].device
         op = _get_native_ops()[op_name]
-        out = op(*(a.to(_NEURON_DEVICE) if isinstance(a, torch.Tensor) else a for a in args))
+        # A tensor already on ``neuron:k`` stays there (``.to("neuron")`` is a
+        # no-op), so per-core shards launch on their own core (trnfft#54).
+        moved = [a.to(_NEURON_DEVICE) if isinstance(a, torch.Tensor) else a for a in args]
+        # NKI tracing on a dispatch-cache miss is not thread-safe (trnsolver#54);
+        # the call only enqueues work, so serialising it keeps cores concurrent.
+        with _LAUNCH_LOCK:
+            out = op(*moved)
     else:
         moved, orig = _to_xla(*tensors)
         it = iter(moved)

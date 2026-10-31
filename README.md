@@ -159,7 +159,9 @@ concrete workload and we'll add them.
 **Roadmap**
 - NKI `ComplexConv1d` / `ComplexModReLU` kernels (today both fall back to PyTorch on NKI)
 - BF16 / FP16 support across NKI kernels
-- Multi-NeuronCore parallelism (scaffold in `trnfft/nki/multicore.py`)
+- Multi-NeuronCore parallelism: `set_multicore` splits host batches across cores, but
+  on Trn2 the host link limits it (#93); large N runs best on one core with
+  `TRNFFT_SIX_STEP=1`
 - SBUF-resident dispatch to reduce small-op overhead
 
 ## Related projects in the trnsci suite

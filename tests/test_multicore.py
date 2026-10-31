@@ -293,3 +293,36 @@ class TestMultiCoreSingleTransform:
         ct = ComplexTensor(torch.randn(7), torch.zeros(7))
         with pytest.raises(NotImplementedError, match="prime"):
             multi_core_fft(ct)
+
+
+class TestSixStepMulticore:
+    """Host-staged six-step split across cores (trnfft#54); CPU devices stand in."""
+
+    @pytest.mark.parametrize("batch,n,cores", [(1, 256, 3), (2, 512, 2), (1, 8192, 4)])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_matches_numpy(self, batch, n, cores, inverse):
+        from trnfft.nki.multicore import _six_step_multicore
+
+        g = torch.Generator().manual_seed(n + cores)
+        xr, xi = torch.randn(batch, n, generator=g), torch.randn(batch, n, generator=g)
+        y = _six_step_multicore(
+            ComplexTensor(xr, xi), inverse, cores, [torch.device("cpu")] * cores
+        )
+        xc = xr.double().numpy() + 1j * xi.double().numpy()
+        ref = np.fft.ifft(xc) if inverse else np.fft.fft(xc)
+        got = y.real.double().numpy() + 1j * y.imag.double().numpy()
+        assert y.shape == (batch, n)
+        assert np.linalg.norm(got - ref) / np.linalg.norm(ref) < 1e-5
+
+    @pytest.mark.parametrize(
+        "total,parts,expected",
+        [
+            (8, 4, [(0, 2), (2, 4), (4, 6), (6, 8)]),
+            (3, 4, [(0, 1), (1, 2), (2, 3)]),
+            (5, 1, [(0, 5)]),
+        ],
+    )
+    def test_split_range(self, total, parts, expected):
+        from trnfft.nki.multicore import _split_range
+
+        assert _split_range(total, parts) == expected
