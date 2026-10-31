@@ -7,11 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The six-step FFT is the default for power-of-2 FP32 N >= 8192 (#94).**
+  "fast" and "kahan" take it in place of the row-chunked Stockham (fast) and
+  compensated butterfly (kahan) paths. That includes `ifft`, `rfft`/`irfft`,
+  `fft2`/`fftn` along a long axis, and Bluestein sizes that pad to 8192 or
+  more, since they all go through `fft_core`.
+  - `TRNFFT_SIX_STEP=0` restores the old path, and `=1` forces the six-step
+    for every N above 4096. `TRNFFT_SIX_STEP_MIN` moves the threshold.
+  - The six-step won every case measured from 2^13 up, on warm and first
+    calls, from device and host input. The smallest gain is 5× at 1 × 2^13
+    from the host; from device input it is 9.7×. Error is 11–17× lower.
+  - Trn2, one logical core, SDK 2.33. Times are warm medians in ms, and first
+    calls in s, each in a fresh process with an empty compile cache. "rel" is
+    relative L2 error against FP64 `torch.fft`
+    (`scripts/bench_six_step_crossover.py`):
+
+    | B × N | old, device | old, host | old, first call | old rel | six-step, device | six-step, host | six-step, first call | six-step rel |
+    |---|---|---|---|---|---|---|---|---|
+    | 1 × 2^13 | 12.9 | 11.7 | 9.5 | 1.7e-6 | **1.33** | 2.30 | 6.3 | 1.5e-7 |
+    | 1 × 2^14 | 12.9 | 13.2 | 9.5 | 2.1e-6 | **1.66** | 2.07 | 4.4 | 1.4e-7 |
+    | 1 × 2^15 | 14.7 | 14.6 | 8.9 | 2.4e-6 | **1.60** | 2.10 | 6.1 | 1.5e-7 |
+    | 1 × 2^16 | 16.6 | 16.2 | 12.6 | 2.1e-6 | **1.93** | 2.48 | 4.6 | 1.6e-7 |
+    | 1 × 2^18 | 47.9 | 50.7 | 11.1 | 2.9e-6 | **1.67** | 2.10 | 4.6 | 1.8e-7 |
+    | 1 × 2^20 | 121 | 112 | 82 | 2.9e-6 | **2.02** | 3.25 | 5.2 | 2.1e-7 |
+    | 1 × 2^22 | 698 | 663 | 272 | 2.9e-6 | **3.11** | 15.6 | 6.6 | 2.2e-7 |
+    | 1 × 2^24 | 1625 | 1977 | 163 | 3.7e-6 | **9.34** | 55.9 | 14.0 | 2.3e-7 |
+    | 1 × 2^25 | 5913 | 5770 | 610 | 3.3e-6 | **82.1** | 190 | 47.6 | 2.3e-7 |
+    | 1 × 2^26 | 9577 | 9843 | 627 | 3.7e-6 | **130** | 311 | 50.6 | 2.2e-7 |
+    | 16 × 2^13 | 24.4 | 29.9 | 13.8 | 1.7e-6 | **1.71** | 1.89 | 6.6 | 1.5e-7 |
+    | 256 × 2^13 | 264 | 244 | 135 | 1.7e-6 | **3.34** | 6.57 | 10.5 | 1.5e-7 |
+    | 1024 × 2^13 | 844 | 874 | 541 | 1.7e-6 | **41.7** | 66.9 | 18.4 | 1.5e-7 |
+    | 64 × 2^14 | 87.7 | 83.4 | 81.6 | 2.1e-6 | **2.47** | 4.58 | 5.8 | 1.4e-7 |
+    | 16 × 2^16 | 114 | 108 | 81.4 | 2.1e-6 | **2.08** | 3.55 | 5.7 | 1.6e-7 |
+    | 256 × 2^16 | 2304 | 2264 | 577 | 2.1e-6 | **15.3** | 69.0 | 26.6 | 1.6e-7 |
+    | 16 × 2^20 | 1887 | 1817 | 588 | 2.9e-6 | **8.50** | 57.2 | 17.6 | 2.1e-7 |
+    | 4 × 2^22 | 2800 | 2788 | 592 | 2.9e-6 | **8.28** | 55.2 | 12.9 | 2.2e-7 |
+
+  - The inverse matches: 1 × 2^14 / 2^20 / 2^24 take 11.4 / 104 / 1788 ms on
+    the old path and 1.85 / 2.04 / 9.28 ms on the six-step, at the same errors.
+  - "kahan" on the six-step: 1.67 ms at 2^16, 1.51 ms at 2^20 and 1.84 ms at
+    16 × 2^16, with errors of 1.6e-7 to 2.1e-7. The old path (the compensated
+    butterfly) had not finished its first call at 2^16 after 19 min, so it was
+    not run at the larger sizes.
+  - 1024 × 2^13 is 12× slower than 256 × 2^13 for 4× the data. It is still
+    20× faster than the old path. I have not profiled why.
+  - The first calls here are longer than the 8–20 s reported in #93 (48–51 s
+    at 2^25 and 2^26). That run reused compiled kernels across cases; these
+    runs did not.
+
+- **The fused four-step path moves a host batch to the device once (#94).**
+  `_fft_via_four_step_fused` launched on host slices of 4096 rows, so
+  `_launch` copied each slice in and each result out, and the results were
+  concatenated on the host. It now moves the batch in once, runs the launches
+  on device slices, and returns the result once, as the six-step does.
+  Outputs are bit-identical. Host in and out, warm ms:
+
+    | B × N | before | after | caller moves the batch (`.to` / `.cpu()`) | device-resident |
+    |---|---|---|---|---|
+    | 16384 × 4096 | 348 / 353 | **185 / 185** | 186–230 | 11.1 |
+    | 16384 × 1024 | 90 / 93 | **56 / 53** | 49–56 | 3.7 |
+    | 4096 × 4096 | 57 | **49** | 49–50 | 2.7 |
+    | 1024 × 4096 (one launch) | 13.5 | 13.5 | 13.8–14.0 | 0.8–1.1 |
+
+  - The per-slice copies were not the cost on their own. Four 64 MB
+    host-to-device copies took 43 ms against 40 ms for one 256 MB copy, and
+    device-to-host took 173 against 167 ms. Concatenating the slices on the
+    host took 136 ms on 2 CPUs. The copy back after each launch probably also
+    kept the launches from overlapping; that part is inferred, not profiled.
+
 ### Added
 
-- **Six-step FFT for large N, opt-in (`TRNFFT_SIX_STEP=1`, #54, #93).** Power-of-2
-  FP32 transforms above N=4096 can run as N = N1·N2: N1 row FFTs of length N2,
-  a twiddle multiply, then N2 row FFTs of length N1, with three transposes, all
+- **Six-step FFT for large N (`TRNFFT_SIX_STEP`, #54, #93; default since #94).**
+  Power-of-2 FP32 transforms above N=4096 can run as N = N1·N2: N1 row FFTs
+  of length N2, a twiddle multiply, then N2 row FFTs of length N1, with three transposes, all
   on the device. Each row pass is one batched transform on the batch-fused
   four-step kernel (#82). The default path runs 8–13 row-chunked Stockham stages
   (#83).
@@ -39,7 +109,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     against 2.1e-6 to 3.7e-6 on the default path. CPU measures 1.5e-7 to 2.5e-7.
   - First calls took 8–20 s from 2^20 to 2^26. The default path's first call
     took 203 s at 2^24 and 247 s at 2^26 (#83).
-  - The default dispatch is unchanged when the variable is unset.
+  - The default dispatch was unchanged when the variable was unset. It is
+    now the default from N=8192 (#94, above).
 - `scripts/bench_multicore.py`: the measurements above and below. It covers the
   default and six-step paths on one core, `torch.fft` on CPU, per-core resident
   shards, the host batch split, process per core, and the six-step split across

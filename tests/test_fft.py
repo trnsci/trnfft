@@ -1259,7 +1259,7 @@ class TestFourStepBatchFused(TestFourStepDispatch):
 
 
 class TestSixStep(TestFourStepDispatch):
-    """Six-step large-N FFT (trnfft#54, opt-in ``TRNFFT_SIX_STEP=1``).
+    """Six-step large-N FFT (trnfft#54; default from N=8192 since #94).
 
     Each row pass of length <= _FOUR_STEP_MAX goes to the batch-fused
     four-step stand-in (or the single GEMM at <= 256); Stockham must not run.
@@ -1316,22 +1316,34 @@ class TestSixStep(TestFourStepDispatch):
         assert fc._six_step_fused_rows(1024) == 4 * cap
         assert fc._six_step_fused_rows(128) == 32 * cap
 
-    def test_off_by_default(self, monkeypatch):
+    def test_default_above_threshold(self, monkeypatch):
         from trnfft import fft_core as fc
 
         monkeypatch.delenv("TRNFFT_SIX_STEP", raising=False)
         x = ComplexTensor(torch.randn(1, 8192), torch.randn(1, 8192))
-        assert not fc._use_six_step(x, 8192)
-        monkeypatch.setenv("TRNFFT_SIX_STEP", "1")
+        assert fc._SIX_STEP_MIN == 8192
         assert fc._use_six_step(x, 8192)
         assert not fc._use_six_step(x, 4096)  # fused four-step range
         assert not fc._use_six_step(x, 8192, "double")
         x64 = ComplexTensor(torch.randn(1, 8192).double(), torch.randn(1, 8192).double())
         assert not fc._use_six_step(x64, 8192)
+        monkeypatch.setattr(fc, "_SIX_STEP_MIN", 1 << 20)
+        assert not fc._use_six_step(x, 8192)
+        monkeypatch.setenv("TRNFFT_SIX_STEP", "1")  # forces it below the threshold
+        assert fc._use_six_step(x, 8192)
+        monkeypatch.setenv("TRNFFT_SIX_STEP", "0")
+        assert not fc._use_six_step(x, 1 << 21)
 
-    def test_default_routes_to_stockham(self, monkeypatch):
-        self._install_fakes(monkeypatch, batch_fused=True)
+    def test_default_routes_to_six_step(self, monkeypatch):
+        calls = self._install_fakes(monkeypatch, batch_fused=True)
         monkeypatch.delenv("TRNFFT_SIX_STEP", raising=False)
+        y = trnfft.fft(ComplexTensor(torch.randn(8192), torch.randn(8192)))
+        assert y.shape == (8192,)
+        assert calls["four_step"] + calls["gemm"] == 2
+
+    def test_env_zero_routes_to_stockham(self, monkeypatch):
+        self._install_fakes(monkeypatch, batch_fused=True)
+        monkeypatch.setenv("TRNFFT_SIX_STEP", "0")
         with pytest.raises(AssertionError, match="Stockham path reached"):
             trnfft.fft(ComplexTensor(torch.randn(8192), torch.randn(8192)))
 
@@ -1492,7 +1504,13 @@ class TestStockhamRowChunking:
 class TestLargeFFTNeuron:
     """N = 2^25 on device (trnfft#83): stage launches are row-chunked."""
 
-    def test_fft_2_25_vs_torch(self, nki_backend):
+    @pytest.mark.parametrize("six_step", [None, "0"])
+    def test_fft_2_25_vs_torch(self, nki_backend, monkeypatch, six_step):
+        """Default dispatch (six-step since #94) and ``TRNFFT_SIX_STEP=0`` (Stockham)."""
+        if six_step is None:
+            monkeypatch.delenv("TRNFFT_SIX_STEP", raising=False)
+        else:
+            monkeypatch.setenv("TRNFFT_SIX_STEP", six_step)
         n = 1 << 25
         g = torch.Generator().manual_seed(83)
         x = torch.randn(n, generator=g)
@@ -1509,6 +1527,7 @@ class TestLargeFFTNeuron:
 
         n = 1 << 22
         cap = os.environ.get("TRNFFT_BITID_CAP", str(1 << 17))
+        monkeypatch.setenv("TRNFFT_SIX_STEP", "0")  # Stockham row chunking under test
         g = torch.Generator().manual_seed(84)
         x = torch.randn(n, generator=g)
         monkeypatch.setenv("TRNFFT_MAX_ROWS_PER_LAUNCH", str(1 << 30))
@@ -1520,8 +1539,28 @@ class TestLargeFFTNeuron:
 
 
 @pytest.mark.neuron
+class TestFourStepFusedHostNeuron:
+    """Host input on the fused four-step path moves to the device once (trnfft#94)."""
+
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_host_matches_device_bitwise(self, nki_backend, inverse):
+        # 9000 rows: three launches of <= 4096 rows, the last one partial.
+        g = torch.Generator().manual_seed(94)
+        xr, xi = torch.randn(9000, 2048, generator=g), torch.randn(9000, 2048, generator=g)
+        f = trnfft.ifft if inverse else trnfft.fft
+        host = f(ComplexTensor(xr, xi))
+        assert host.real.device.type == "cpu"
+        dev = torch.device("neuron")
+        on_dev = f(ComplexTensor(xr.to(dev), xi.to(dev)))
+        assert on_dev.real.device.type == "neuron"
+        assert torch.equal(host.real, on_dev.real.cpu())
+        assert torch.equal(host.imag, on_dev.imag.cpu())
+
+
+@pytest.mark.neuron
 class TestSixStepNeuron:
-    """Six-step large-N FFT on device (trnfft#54, ``TRNFFT_SIX_STEP=1``)."""
+    """Six-step large-N FFT on device (trnfft#54; ``TRNFFT_SIX_STEP=1`` forces it,
+    and it is the default from N=8192 since #94)."""
 
     @staticmethod
     def _rel(y, ref):
@@ -1541,6 +1580,34 @@ class TestSixStepNeuron:
         x64 = torch.complex(xr.double(), xi.double())
         ref = torch.fft.ifft(x64) if inverse else torch.fft.fft(x64)
         assert self._rel(y, ref) < 1e-6
+
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_default_dispatch_is_six_step(self, nki_backend, monkeypatch, inverse):
+        """With TRNFFT_SIX_STEP unset, N=2^20 takes the six-step (#94). Its error
+        (~2e-7) is ~10x below the Stockham path's (~3e-6), so 1e-6 tells them apart."""
+        monkeypatch.delenv("TRNFFT_SIX_STEP", raising=False)
+        g = torch.Generator().manual_seed(9420)
+        xr, xi = torch.randn(1 << 20, generator=g), torch.randn(1 << 20, generator=g)
+        dev = torch.device("neuron")
+        y = (trnfft.ifft if inverse else trnfft.fft)(ComplexTensor(xr.to(dev), xi.to(dev)))
+        x64 = torch.complex(xr.double(), xi.double())
+        ref = torch.fft.ifft(x64) if inverse else torch.fft.fft(x64)
+        assert self._rel(y, ref) < 1e-6
+
+    def test_default_rfft_irfft_fft2_bluestein(self, nki_backend, monkeypatch):
+        """rfft / irfft, fft2 and Bluestein reach the six-step through fft_core."""
+        monkeypatch.delenv("TRNFFT_SIX_STEP", raising=False)
+        g = torch.Generator().manual_seed(9421)
+        x = torch.randn(1 << 18, generator=g)
+        X = trnfft.rfft(x)
+        ref = torch.fft.rfft(x.double())
+        assert self._rel(X, ref) < 1e-6
+        back = trnfft.irfft(X, n=x.shape[-1])
+        assert (torch.linalg.vector_norm(back.double().cpu() - x.double()) / x.norm()).item() < 1e-6
+        a = torch.randn(8, 1 << 14, generator=g)
+        assert self._rel(trnfft.fft2(a), torch.fft.fft2(a.double())) < 1e-6
+        b = torch.randn(5000, generator=g)  # Bluestein, padded to 16384
+        assert self._rel(trnfft.fft(b), torch.fft.fft(b.double())) < 1e-5
 
     def test_host_input_returns_to_host(self, nki_backend, monkeypatch):
         monkeypatch.setenv("TRNFFT_SIX_STEP", "1")
