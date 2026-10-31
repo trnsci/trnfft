@@ -13,6 +13,7 @@ Backend selection:
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import sys
 import threading
@@ -200,6 +201,74 @@ if HAS_NKI:
                     ci_sbuf = nl.cast(ci_sbuf, dtype=a_real.dtype)
                 nl.store(c_real[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=cr_sbuf)
                 nl.store(c_imag[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=ci_sbuf)
+
+        return c_real, c_imag
+
+    @nki.jit
+    def _complex_gemm_tn_kernel(at_real, at_imag, b_real, b_imag):
+        """Stacked complex GEMMs with the left operand given transposed (trnfft#97).
+
+        ``at`` is (G*K, M): rows ``g*K .. g*K+K`` hold ``A_g^T`` (K, M).
+        ``b`` is (K, N). Returns ``c`` (G*M, N) with rows ``g*M .. g*M+M``
+        equal to ``A_g @ B``, as two FP32 planes.
+
+        Same tiles, PSUM accumulation order and casts as
+        ``_complex_gemm_kernel`` on the (G*M, K) matrix of the stacked
+        ``A_g``, so the result is bit-identical to it. The difference is the
+        load: the stationary tile is already K-major in HBM, so it is a plain
+        ``nl.load`` of contiguous rows instead of ``nl.load_transpose2d``.
+        On Trn2 (SDK 2.33) the runtime rebuilds a transposed load's IO DMA
+        rings whenever the input address changes (``kbl_exec_pre``: ~4.7 MB of
+        descriptors copied in, 2-9 ms for an 8 MiB plane); a plain load's
+        rings are small. The six-step's first pass at N = 2^13 reads the
+        (B, N2, N1) view of x directly in this layout, which also drops the
+        transpose before it.
+        """
+        GK, M = at_real.shape
+        K, N = b_real.shape
+        G = GK // K
+        assert G * K == GK, f"rows {GK} not a multiple of K={K}"
+
+        TILE_M = min(M, 128)
+        TILE_K = min(K, 128)
+        TILE_N = min(N, 512)
+
+        c_real = nl.ndarray((G * M, N), dtype=at_real.dtype, buffer=nl.shared_hbm)
+        c_imag = nl.ndarray((G * M, N), dtype=at_real.dtype, buffer=nl.shared_hbm)
+
+        for g in nl.affine_range(G):
+            for m in nl.affine_range(M // TILE_M):
+                for n in nl.affine_range(N // TILE_N):
+                    m_off = m * TILE_M
+                    n_off = n * TILE_N
+                    c_off = g * M + m_off
+
+                    psum_cr = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                    psum_ci = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+
+                    for k in nl.affine_range(K // TILE_K):
+                        r_off = g * K + k * TILE_K
+                        k_off = k * TILE_K
+                        # (TILE_K, TILE_M), partition dim = K: no transpose.
+                        ar_t = nl.load(at_real[r_off : r_off + TILE_K, m_off : m_off + TILE_M])
+                        ai_t = nl.load(at_imag[r_off : r_off + TILE_K, m_off : m_off + TILE_M])
+                        br = nl.load(b_real[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                        bi = nl.load(b_imag[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                        neg_bi = nl.negative(bi)
+                        nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=br, accumulate=True)
+                        nisa.nc_matmul(dst=psum_cr, stationary=ai_t, moving=neg_bi, accumulate=True)
+                        nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=bi, accumulate=True)
+                        nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=br, accumulate=True)
+
+                    cr_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+                    ci_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=cr_sbuf, src=psum_cr)
+                    nisa.tensor_copy(dst=ci_sbuf, src=psum_ci)
+                    if at_real.dtype != nl.float32:
+                        cr_sbuf = nl.cast(cr_sbuf, dtype=at_real.dtype)
+                        ci_sbuf = nl.cast(ci_sbuf, dtype=at_real.dtype)
+                    nl.store(c_real[c_off : c_off + TILE_M, n_off : n_off + TILE_N], value=cr_sbuf)
+                    nl.store(c_imag[c_off : c_off + TILE_M, n_off : n_off + TILE_N], value=ci_sbuf)
 
         return c_real, c_imag
 
@@ -549,6 +618,74 @@ def _kernel_device() -> torch.device:
     return torch_xla.device()
 
 
+# ── Host results through the caching host allocator ─────────────────────────
+#
+# Same fix as trnblas#61/#64 and trnrand#70. On Trn2 (SDK 2.33, native
+# TorchNeuron), a device->host copy into fresh pageable memory (`.cpu()`,
+# `torch.empty` + `copy_`) runs at ~4 GB/s, because the host page-faults every
+# page it touches. A copy into memory that is already faulted in runs at the
+# link rate, 13-14 GB/s. `torch.empty(..., pin_memory=True)` comes from the
+# accelerator's caching host allocator: each call still returns a fresh tensor
+# (a block is recycled only after the tensor that owned it is freed, so results
+# never alias), and recycled blocks come back already faulted in. An FFT
+# result is a real and an imaginary plane, so each result is two such copies.
+#
+# Costs: blocks are rounded up to a power of two, and freed blocks stay cached
+# until `torch.accelerator.empty_host_cache()`. TRNFFT_PINNED_OUTPUT=0 (read
+# per call) turns this off (plain pageable memory). Planes under
+# `_PINNED_OUTPUT_MIN_BYTES` always use pageable memory. The XLA path, the
+# simulator and torch.compile tracing are unchanged. The values are the same
+# bits either way.
+_PINNED_OUTPUT_MIN_BYTES = 1 << 20
+
+
+def _pinned_output_enabled() -> bool:
+    value = os.environ.get("TRNFFT_PINNED_OUTPUT", "1").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
+def _neuron_host_allocator() -> bool:
+    """True when `pin_memory=True` would come from the Neuron accelerator's
+    caching host allocator. On a CUDA build with no GPU, pinning raises, so
+    the cache is used only when the current accelerator is Neuron."""
+    acc = getattr(torch, "accelerator", None)
+    if acc is None or not acc.is_available():
+        return False
+    return acc.current_accelerator().type == "neuron"
+
+
+def _use_host_cache(device, nbytes: int) -> bool:
+    """True when a CPU result of `nbytes` should come from the caching host
+    allocator: native eager path, CPU destination, large enough, not disabled."""
+    return (
+        torch.device(device).type == "cpu"
+        and nbytes >= _PINNED_OUTPUT_MIN_BYTES
+        and _pinned_output_enabled()
+        and not _use_simulator()
+        and _is_native()
+        and not torch.compiler.is_compiling()
+        and _neuron_host_allocator()
+    )
+
+
+def _host_empty(shape, dtype: torch.dtype, device="cpu") -> torch.Tensor:
+    """`torch.empty(shape, dtype=dtype, device=device)`; a large CPU tensor on the
+    native path comes from the caching host allocator (fresh, already faulted in)."""
+    shape = tuple(shape)
+    nbytes = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+    if _use_host_cache(device, nbytes):
+        return torch.empty(shape, dtype=dtype, pin_memory=True)
+    return torch.empty(shape, dtype=dtype, device=device)
+
+
+def _to_host(t: torch.Tensor, device="cpu") -> torch.Tensor:
+    """`t.to(device)`. A large device -> CPU copy lands in a fresh tensor from
+    the caching host allocator, about 3x faster than `.cpu()` (trnblas#61)."""
+    if t.device.type == "cpu" or not _use_host_cache(device, t.numel() * t.element_size()):
+        return t.to(device)
+    return _host_empty(t.shape, t.dtype, device).copy_(t)
+
+
 _LAUNCH_LOCK = threading.Lock()
 
 
@@ -578,8 +715,8 @@ def _launch(kernel, op_name: str, *args):
         it = iter(moved)
         out = kernel(*(next(it) if isinstance(a, torch.Tensor) else a for a in args))
     if isinstance(out, tuple | list):
-        return tuple(o.to(orig) for o in out)
-    return out.to(orig)
+        return tuple(_to_host(o, orig) for o in out)
+    return _to_host(out, orig)
 
 
 def _simulate_kernel(kernel, *tensors):

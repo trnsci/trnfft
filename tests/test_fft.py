@@ -906,7 +906,18 @@ class TestFourStepDispatch:
         fake_bfly.butterfly_stage_kernel_kahan = None
         monkeypatch.setitem(sys.modules, "trnfft.nki.butterfly", fake_bfly)
 
-        calls = {"gemm": 0, "mul": 0, "four_step": 0}
+        calls = {"gemm": 0, "gemm_tn": 0, "mul": 0, "four_step": 0}
+
+        def fake_gemm_tn(at_re, at_im, b_re, b_im):
+            # Mirrors _complex_gemm_tn_kernel: at is (G*K, M), block g = A_g^T.
+            calls["gemm_tn"] += 1
+            calls.setdefault("tn_rows", []).append(at_re.shape[0])
+            k, n = b_re.shape
+            gk, m = at_re.shape
+            assert gk % k == 0 and (m <= 128 or m % 128 == 0) and (k <= 128 or k % 128 == 0)
+            a_re = at_re.reshape(gk // k, k, m).transpose(1, 2).reshape(-1, k)
+            a_im = at_im.reshape(gk // k, k, m).transpose(1, 2).reshape(-1, k)
+            return a_re @ b_re - a_im @ b_im, a_re @ b_im + a_im @ b_re
 
         def fake_gemm(a_re, a_im, b_re, b_im):
             calls["gemm"] += 1
@@ -948,6 +959,7 @@ class TestFourStepDispatch:
 
         monkeypatch.setattr(dispatch, "HAS_NKI", True)
         monkeypatch.setattr(dispatch, "_complex_gemm_kernel", fake_gemm, raising=False)
+        monkeypatch.setattr(dispatch, "_complex_gemm_tn_kernel", fake_gemm_tn, raising=False)
         monkeypatch.setattr(dispatch, "_complex_mul_kernel", fake_mul, raising=False)
         monkeypatch.setattr(four_step, "four_step_fft_kernel", fake_four_step, raising=False)
         monkeypatch.setattr(fc, "_FOUR_STEP_BATCH_FUSED", batch_fused)
@@ -1000,7 +1012,7 @@ class TestFourStepDispatch:
         y = trnfft.fft(ComplexTensor(xr, xi))
         ref = np.fft.fft(xr.double().numpy() + 1j * xi.double().numpy())
         assert self._rel(y, ref) < 1e-5
-        assert calls == {"gemm": 2, "mul": 1, "four_step": 0}
+        assert calls == {"gemm": 2, "gemm_tn": 0, "mul": 1, "four_step": 0}
 
     def test_four_step_max_zero_restores_stockham(self, monkeypatch):
         from trnfft import fft_core as fc
@@ -1278,8 +1290,10 @@ class TestSixStep(TestFourStepDispatch):
         ref = np.fft.ifft(xc) if inverse else np.fft.fft(xc)
         assert y.shape == (batch, n)
         assert self._rel(y, ref) < 1e-5
-        # Two row passes; at N = 8192 the 64-point pass is a single GEMM.
-        assert calls["four_step"] + calls["gemm"] == 2
+        # Two row passes; at N = 8192 the 64-point pass is a single GEMM, read
+        # straight from x's (B, N2, N1) view (trnfft#97).
+        assert calls["four_step"] + calls["gemm"] + calls["gemm_tn"] == 2
+        assert calls["gemm"] == 0 and calls["gemm_tn"] == (1 if n == 8192 else 0)
 
     def test_recurses_above_four_step_max(self, monkeypatch):
         from trnfft import fft_core as fc
@@ -1292,7 +1306,8 @@ class TestSixStep(TestFourStepDispatch):
         y = trnfft.fft(ComplexTensor(xr, xi))
         ref = np.fft.fft(xr.double().numpy() + 1j * xi.double().numpy())
         assert self._rel(y, ref) < 1e-5
-        assert (calls["four_step"], calls["gemm"]) == (1, 2)
+        # The 2048-point pass's own first pass (32-point rows) reads x's view.
+        assert (calls["four_step"], calls["gemm_tn"], calls["gemm"]) == (1, 1, 1)
 
     def test_gemm_pass_row_chunks(self, monkeypatch):
         from trnfft import fft_core as fc
@@ -1304,9 +1319,43 @@ class TestSixStep(TestFourStepDispatch):
         y = trnfft.fft(ComplexTensor(xr, xi))
         ref = np.fft.fft(xr.double().numpy() + 1j * xi.double().numpy())
         assert self._rel(y, ref) < 1e-5
-        # 8192 = 128 x 64: 384 rows of 64 on the GEMM (3 launches of 128 rows),
-        # 192 -> 256 rows of 128 on the fused kernel (from _SIX_STEP_FUSED_MIN).
-        assert (calls["gemm"], calls["four_step"]) == (3, 1)
+        # 8192 = 128 x 64: 384 rows of 64 on the GEMM (3 launches of 128 rows,
+        # one batch row of x each), 192 -> 256 rows of 128 on the fused kernel
+        # (from _SIX_STEP_FUSED_MIN).
+        assert (calls["gemm_tn"], calls["gemm"], calls["four_step"]) == (3, 0, 1)
+        assert calls["tn_rows"] == [64] * 3
+        # TRNFFT_SIX_STEP_TN=0: the transpose and the load_transpose2d GEMM.
+        monkeypatch.setenv("TRNFFT_SIX_STEP_TN", "0")
+        y0 = trnfft.fft(ComplexTensor(xr, xi))
+        assert (calls["gemm_tn"], calls["gemm"], calls["four_step"]) == (3, 3, 2)
+        torch.testing.assert_close(y0.real, y.real, rtol=1e-5, atol=1e-4)
+        torch.testing.assert_close(y0.imag, y.imag, rtol=1e-5, atol=1e-4)
+
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_pass1_tn_matches_transposed_pass(self, monkeypatch, inverse):
+        from trnfft import fft_core as fc
+
+        self._install_fakes(monkeypatch, batch_fused=True)
+        g = torch.Generator().manual_seed(97)
+        B, n1, n2 = 5, 128, 64
+        re, im = torch.randn(B, n2 * n1, generator=g), torch.randn(B, n2 * n1, generator=g)
+        got = fc._six_step_pass1_tn(re, im, B, n1, n2, inverse)
+        a_re = re.reshape(B, n2, n1).transpose(1, 2).reshape(B * n1, n2)
+        a_im = im.reshape(B, n2, n1).transpose(1, 2).reshape(B * n1, n2)
+        xc = a_re.double().numpy() + 1j * a_im.double().numpy()
+        ref = np.fft.ifft(xc) if inverse else np.fft.fft(xc)
+        np.testing.assert_allclose(got[0].double().numpy(), ref.real, atol=2e-5)
+        np.testing.assert_allclose(got[1].double().numpy(), ref.imag, atol=2e-5)
+
+    def test_pass1_tn_gate(self, monkeypatch):
+        from trnfft import fft_core as fc
+
+        self._install_fakes(monkeypatch, batch_fused=True)
+        assert fc._six_step_pass1_tn_ok(128, 64)  # N = 2^13
+        assert not fc._six_step_pass1_tn_ok(128, 128)  # fused range
+        assert not fc._six_step_pass1_tn_ok(192, 64)  # M not tileable
+        monkeypatch.setenv("TRNFFT_SIX_STEP_TN", "0")
+        assert not fc._six_step_pass1_tn_ok(128, 64)
 
     def test_fused_rows_per_launch(self):
         from trnfft import fft_core as fc
@@ -1339,7 +1388,7 @@ class TestSixStep(TestFourStepDispatch):
         monkeypatch.delenv("TRNFFT_SIX_STEP", raising=False)
         y = trnfft.fft(ComplexTensor(torch.randn(8192), torch.randn(8192)))
         assert y.shape == (8192,)
-        assert calls["four_step"] + calls["gemm"] == 2
+        assert calls["four_step"] + calls["gemm_tn"] == 2
 
     def test_env_zero_routes_to_stockham(self, monkeypatch):
         self._install_fakes(monkeypatch, batch_fused=True)
@@ -1643,3 +1692,56 @@ class TestMulticoreSplitNeuron:
             got = torch.complex(y.real.double(), y.imag.double())
             rel = (torch.linalg.vector_norm(got - ref) / torch.linalg.vector_norm(ref)).item()
             assert rel < 1e-6
+
+
+def _same_bits(a, b):
+    return torch.equal(a.contiguous().view(torch.int32), b.contiguous().view(torch.int32))
+
+
+@pytest.mark.neuron
+class TestPinnedOutputNeuron:
+    """Large host results come from the caching host allocator (trnfft#94
+    follow-up, as trnblas#64): the same bits as pageable memory."""
+
+    @pytest.mark.parametrize(
+        "batch,n",
+        [(256, 4096), (64, 1 << 14), (4096, 256), (300, 1 << 13), (1, 1 << 20)],
+        ids=["fused-4096", "six-step-2^14", "gemm-256", "six-step-2^13", "six-step-2^20"],
+    )
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_pinned_and_bit_identical(self, nki_backend, monkeypatch, batch, n, inverse):
+        g = torch.Generator().manual_seed(n + batch)
+        x = ComplexTensor(torch.randn(batch, n, generator=g), torch.randn(batch, n, generator=g))
+        f = trnfft.ifft if inverse else trnfft.fft
+        monkeypatch.setenv("TRNFFT_PINNED_OUTPUT", "0")
+        off = f(x)
+        monkeypatch.delenv("TRNFFT_PINNED_OUTPUT")
+        on = f(x)
+        assert on.real.device.type == "cpu" and on.real.is_pinned() and on.imag.is_pinned()
+        assert not off.real.is_pinned()
+        assert _same_bits(on.real, off.real) and _same_bits(on.imag, off.imag)
+
+    def test_small_results_stay_pageable(self, nki_backend):
+        x = ComplexTensor(torch.randn(8, 4096), torch.randn(8, 4096))  # 128 KiB per plane
+        assert not trnfft.fft(x).real.is_pinned()
+
+
+@pytest.mark.neuron
+class TestSixStepPass1TNNeuron:
+    """N = 2^13 pass 1 reads x's (B, N2, N1) view on _complex_gemm_tn_kernel
+    (trnfft#97): bit-identical to the transpose + load_transpose2d GEMM."""
+
+    @pytest.mark.parametrize("batch", [3, 300])  # 300: two launches (256 + 44 rows of x)
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_bit_identical_to_transposed_pass(self, nki_backend, monkeypatch, batch, inverse):
+        g = torch.Generator().manual_seed(97 + batch)
+        xr, xi = torch.randn(batch, 8192, generator=g), torch.randn(batch, 8192, generator=g)
+        dev = torch.device("neuron")
+        x = ComplexTensor(xr.to(dev), xi.to(dev))
+        f = trnfft.ifft if inverse else trnfft.fft
+        monkeypatch.setenv("TRNFFT_SIX_STEP_TN", "0")
+        old = f(x)
+        monkeypatch.delenv("TRNFFT_SIX_STEP_TN")
+        new = f(x)
+        assert _same_bits(new.real.cpu(), old.real.cpu())
+        assert _same_bits(new.imag.cpu(), old.imag.cpu())

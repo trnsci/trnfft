@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from .complex import ComplexTensor
-from .nki.dispatch import _use_nki
+from .nki.dispatch import _to_host, _use_nki
 from .plan import FFTAlgorithm, FFTPlan, create_plan
 
 
@@ -552,8 +552,8 @@ def _fft_via_four_step_fused(
         o_re = torch.cat([o[0] for o in outs], dim=0)
         o_im = torch.cat([o[1] for o in outs], dim=0)
         del outs
-    o_re = o_re.reshape(orig_shape).to(orig_device)
-    o_im = o_im.reshape(orig_shape).to(orig_device)
+    o_re = _to_host(o_re.reshape(orig_shape), orig_device)
+    o_im = _to_host(o_im.reshape(orig_shape), orig_device)
     return ComplexTensor(o_re, o_im)
 
 
@@ -679,6 +679,59 @@ def _six_step_pass(re: torch.Tensor, im: torch.Tensor, inverse: bool, precision:
     return o_re[:rows], o_im[:rows]
 
 
+def _six_step_pass1_tn_ok(n1: int, n2: int) -> bool:
+    """Pass 1 (rows of length N2) runs on ``_complex_gemm_tn_kernel`` (trnfft#97).
+
+    That is where ``_six_step_pass`` would take the single DFT-GEMM: NKI on,
+    N2 below the fused range and within the GEMM threshold. The kernel's
+    tiles need N1 <= 128 or a multiple of 128, and N2 <= 128 or a multiple
+    of 128. ``TRNFFT_SIX_STEP_TN=0`` (read per call) keeps the transpose and
+    the ``load_transpose2d`` GEMM.
+    """
+    if os.environ.get("TRNFFT_SIX_STEP_TN", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    fused = _FOUR_STEP_BATCH_FUSED and max(_SIX_STEP_FUSED_MIN, 4) <= n2 <= _FOUR_STEP_MAX
+    return (
+        _use_nki()
+        and not (fused and _four_step_fused_fits(n2))
+        and n2 <= _DFT_GEMM_THRESHOLD
+        and (n1 <= 128 or n1 % 128 == 0)
+        and (n2 <= 128 or n2 % 128 == 0)
+    )
+
+
+def _six_step_pass1_tn(re, im, B: int, n1: int, n2: int, inverse: bool):
+    """Pass 1 straight from the (B, N2, N1) view: rows (b, j1) of length N2.
+
+    Block b of ``re.reshape(B*N2, N1)`` is ``x[b]`` with j2 on rows, which is
+    the K-major left operand ``_complex_gemm_tn_kernel`` takes, so neither
+    the transpose to (B, N1, N2) nor a transposed load is needed. Bit-identical
+    to transposing and running ``_fft_via_gemm`` (same W, tiles and PSUM
+    order). Launches hold at most ``_SIX_STEP_GEMM_MAX_ROWS`` output rows.
+    """
+    from .nki import dispatch as _d
+    from .nki.dispatch import _launch, _simulate_kernel, _use_simulator
+
+    # Looked up at call time: the kernel exists only when nki is importable.
+    kernel = getattr(_d, "_complex_gemm_tn_kernel", None)
+    fold = inverse  # N2 is a power of 2: the 1/N2 folds into W exactly
+    W = _dft_matrix_cached(n2, inverse, re.dtype, re.device, (1.0 / n2) if fold else 1.0)
+    at_re = re.reshape(B * n2, n1)
+    at_im = im.reshape(B * n2, n1)
+    per = max(1, _SIX_STEP_GEMM_MAX_ROWS // n1)
+
+    def run(s, e):
+        a_r, a_i = at_re[s * n2 : e * n2], at_im[s * n2 : e * n2]
+        if _use_simulator():
+            return _simulate_kernel(kernel, a_r, a_i, W.real, W.imag)
+        return _launch(kernel, "complex_gemm_tn", a_r, a_i, W.real, W.imag)
+
+    outs = [run(s, min(s + per, B)) for s in range(0, B, per)]
+    if len(outs) == 1:
+        return outs[0]
+    return torch.cat([o[0] for o in outs]), torch.cat([o[1] for o in outs])
+
+
 def _fft_via_six_step(x: ComplexTensor, inverse: bool, precision: str = "fast") -> ComplexTensor:
     """Six-step FFT: transpose, N1 row FFTs of length N2, twiddle, transpose,
     N2 row FFTs of length N1, transpose (trnfft#54).
@@ -712,10 +765,13 @@ def _fft_via_six_step(x: ComplexTensor, inverse: bool, precision: str = "fast") 
     dtype, device = re.dtype, re.device
 
     # x[b, j2, j1] -> rows (b, j1), length N2.
-    a_re = re.reshape(B, n2, n1).transpose(1, 2).contiguous().reshape(B * n1, n2)
-    a_im = im.reshape(B, n2, n1).transpose(1, 2).contiguous().reshape(B * n1, n2)
-    y_re, y_im = _six_step_pass(a_re, a_im, inverse, precision)
-    del a_re, a_im
+    if _six_step_pass1_tn_ok(n1, n2):
+        y_re, y_im = _six_step_pass1_tn(re.contiguous(), im.contiguous(), B, n1, n2, inverse)
+    else:
+        a_re = re.reshape(B, n2, n1).transpose(1, 2).contiguous().reshape(B * n1, n2)
+        a_im = im.reshape(B, n2, n1).transpose(1, 2).contiguous().reshape(B * n1, n2)
+        y_re, y_im = _six_step_pass(a_re, a_im, inverse, precision)
+        del a_re, a_im
 
     # Twiddle W_N^(j1 k2), (N1, N2), broadcast over the batch.
     t_re, t_im = _four_step_twiddle_cached(n2, n1, inverse, dtype, device)
@@ -735,8 +791,8 @@ def _fft_via_six_step(x: ComplexTensor, inverse: bool, precision: str = "fast") 
     # (b, k2, k1) -> (b, k1, k2): k = k1*N2 + k2.
     X_re = o_re.reshape(B, n2, n1).transpose(1, 2).contiguous()
     X_im = o_im.reshape(B, n2, n1).transpose(1, 2).contiguous()
-    X_re = X_re.reshape(orig_shape).to(orig_device)
-    X_im = X_im.reshape(orig_shape).to(orig_device)
+    X_re = _to_host(X_re.reshape(orig_shape), orig_device)
+    X_im = _to_host(X_im.reshape(orig_shape), orig_device)
     return ComplexTensor(X_re, X_im)
 
 
@@ -1359,8 +1415,8 @@ def _fft_via_stockham_nki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         im = out_im_4d.permute(0, 3, 1, 2).contiguous().reshape(B_pad, n)
 
     if not use_sim:
-        re = re.to(orig_device)
-        im = im.to(orig_device)
+        re = _to_host(re, orig_device)
+        im = _to_host(im, orig_device)
     re = re[:B].reshape(orig_shape)
     im = im[:B].reshape(orig_shape)
 
@@ -1504,8 +1560,8 @@ def _fft_via_stockham_nki_r8(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         im = out_im_8d.permute(0, 3, 1, 2).contiguous().reshape(B_pad, n)
 
     if not use_sim:
-        re = re.to(orig_device)
-        im = im.to(orig_device)
+        re = _to_host(re, orig_device)
+        im = _to_host(im, orig_device)
     re = re[:B].reshape(orig_shape)
     im = im[:B].reshape(orig_shape)
 
@@ -1640,8 +1696,8 @@ def _fft_via_stockham_nki_mixed(x: ComplexTensor, inverse: bool) -> ComplexTenso
         L *= r
 
     if not use_sim:
-        re = re.to(orig_device)
-        im = im.to(orig_device)
+        re = _to_host(re, orig_device)
+        im = _to_host(im, orig_device)
     re = re[:B].reshape(orig_shape)
     im = im[:B].reshape(orig_shape)
 
@@ -1848,8 +1904,8 @@ def _cooley_tukey_nki_nograd(
             re, im = _launch(kernel, op_name, re, im, tw_re_bcast, tw_im_bcast, n, s)
 
     if not use_sim:
-        re = re.to(orig_device)
-        im = im.to(orig_device)
+        re = _to_host(re, orig_device)
+        im = _to_host(im, orig_device)
     re = re[:B_orig].reshape(orig_shape)
     im = im[:B_orig].reshape(orig_shape)
     result = ComplexTensor(re, im)

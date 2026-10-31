@@ -32,6 +32,7 @@ _REAL_FIND_SPEC = importlib.util.find_spec
 EXPECTED_NKI_OPS = {
     "complex_gemm",
     "complex_gemm_bf16",
+    "complex_gemm_tn",
     "complex_linear",
     "complex_mul",
     "butterfly_stage",
@@ -459,6 +460,9 @@ class TestLazyRegistration:
         a16, b16 = meta(128, 64, dtype=torch.bfloat16), meta(64, 256, dtype=torch.bfloat16)
         cr, _ = fake("complex_gemm_bf16")(a16, a16, b16, b16)
         assert cr.shape == (128, 256) and cr.dtype == torch.float32  # FP32 PSUM output
+        at, w = meta(3 * 64, 128), meta(64, 64)  # 3 stacked (K=64, M=128) blocks
+        cr, ci = fake("complex_gemm_tn")(at, at, w, w)
+        assert cr.shape == ci.shape == (3 * 128, 64) and cr.dtype == torch.float32
         x, w = meta(128, 64), meta(32, 64)
         assert fake("complex_linear")(x, x, w, w)[0].shape == (128, 32)
         assert fake("complex_mul")(a, a, a, a)[1].shape == (128, 64)

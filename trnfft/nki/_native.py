@@ -87,6 +87,21 @@ def complex_gemm(
 
 
 @nki_op(
+    "trnfft::complex_gemm_tn",
+    mutates_args={},
+    fake_fn=lambda at_real, at_imag, b_real, b_imag: _fake_pair(
+        (at_real.shape[0] // b_real.shape[0] * at_real.shape[1], b_real.shape[1]),
+        at_real.dtype,
+        at_real,
+    ),
+)
+def complex_gemm_tn(
+    at_real: torch.Tensor, at_imag: torch.Tensor, b_real: torch.Tensor, b_imag: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _d._complex_gemm_tn_kernel(at_real, at_imag, b_real, b_imag)
+
+
+@nki_op(
     "trnfft::complex_gemm_bf16",
     mutates_args={},
     fake_fn=lambda a_real, a_imag, b_real, b_imag: _fake_pair(
@@ -251,6 +266,7 @@ fft.register_autograd(_fft_backward, setup_context=_fft_setup_context)
 OPS = {
     "complex_gemm": complex_gemm,
     "complex_gemm_bf16": complex_gemm_bf16,
+    "complex_gemm_tn": complex_gemm_tn,
     "complex_linear": complex_linear,
     "complex_mul": complex_mul,
     "butterfly_stage": butterfly_stage,

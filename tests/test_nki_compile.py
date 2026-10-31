@@ -116,6 +116,16 @@ _CASES = {
         "_complex_gemm_kernel",
         lambda: ((_f32(128, 128), _f32(128, 128), _f32(128, 128), _f32(128, 128)), {}),
     ),
+    "complex-gemm-tn-2^13": (
+        "dispatch",
+        "_complex_gemm_tn_kernel",
+        lambda: ((_f32(3 * 64, 128), _f32(3 * 64, 128), _f32(64, 64), _f32(64, 64)), {}),
+    ),
+    "complex-gemm-tn-multitile": (
+        "dispatch",
+        "_complex_gemm_tn_kernel",
+        lambda: ((_f32(2 * 256, 256), _f32(2 * 256, 256), _f32(256, 1024), _f32(256, 1024)), {}),
+    ),
     "complex-gemm-bf16": (
         "dispatch",
         "_complex_gemm_kernel_bf16",
