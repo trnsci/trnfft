@@ -510,9 +510,16 @@ def _fft_via_four_step_fused(
     there are no transposes, no batch padding and no intermediate HBM tensors:
     one launch, one read and one write of the (B, N) batch. Batches above
     ``_FOUR_STEP_FUSED_MAX_ROWS`` rows are split into several launches.
+
+    On the native path a host batch is moved to the kernel device once, the
+    launches run on device-resident slices, and the result returns to the
+    host once (trnfft#94). Before, each launch's ``_launch`` copied its slice
+    in and its result out separately, and the slices were concatenated on the
+    host: B=16384, N=4096 from the host took 368 ms against 213 ms when moved
+    to the device by the caller.
     """
     from .nki import four_step as _fs
-    from .nki.dispatch import _launch, _simulate_kernel, _use_simulator
+    from .nki.dispatch import _is_native, _kernel_device, _launch, _simulate_kernel, _use_simulator
 
     # Looked up at call time: the kernel exists only when nki is importable
     # (the CPU dispatch tests install a stand-in).
@@ -521,8 +528,12 @@ def _fft_via_four_step_fused(
     n = x.shape[-1]
     n1, n2 = _four_step_split(n)
     orig_shape = x.real.shape
+    orig_device = x.real.device
     re = x.real.reshape(-1, n).contiguous()
     im = x.imag.reshape(-1, n).contiguous()
+    if not _use_simulator() and _is_native() and orig_device.type != "neuron":
+        dev = _kernel_device()
+        re, im = re.to(dev), im.to(dev)
 
     def _run(r, i):
         pack = _fs.four_step_pack_rows(n2, r.shape[0])
@@ -540,7 +551,10 @@ def _fft_via_four_step_fused(
         outs = [_run(re[s : s + cap], im[s : s + cap]) for s in range(0, rows, cap)]
         o_re = torch.cat([o[0] for o in outs], dim=0)
         o_im = torch.cat([o[1] for o in outs], dim=0)
-    return ComplexTensor(o_re.reshape(orig_shape), o_im.reshape(orig_shape))
+        del outs
+    o_re = o_re.reshape(orig_shape).to(orig_device)
+    o_im = o_im.reshape(orig_shape).to(orig_device)
+    return ComplexTensor(o_re, o_im)
 
 
 # Six-step (Bailey) FFT for N above the fused four-step range (trnfft#54).
