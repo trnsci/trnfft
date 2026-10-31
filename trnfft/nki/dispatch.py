@@ -118,6 +118,36 @@ def complex_mask_apply(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTenso
     return mask * spec
 
 
+# Tensor-engine transposes instead of ``nl.load_transpose2d`` (trnfft#97).
+# On Trn2 (SDK 2.33, native TorchNeuron) the runtime rebuilds a kernel's IO
+# DMA rings for a ``load_transpose2d`` input every time that input's address
+# changes, which is every call with a fresh input tensor. The DFT-GEMM
+# (``_complex_gemm_kernel``, the default FFT for N < 512) and the radix-8
+# Stockham W_8 kernel now load plainly and transpose on the Tensor engine:
+# same bits. The default is on for the native path (Trn2/Trn3, where this was
+# measured; Tensor-engine transposes are bit-exact from NeuronCore-v3 on) and
+# in the simulator, off on the XLA path (Trn1: NeuronCore-v2 transposes are
+# not bit-exact for NaN/Inf, and the rebuild was not measured there).
+# ``TRNFFT_PE_TRANSPOSE=0``/``1`` (read per call) forces either kernel.
+def _pe_transpose_enabled() -> bool:
+    value = os.environ.get("TRNFFT_PE_TRANSPOSE", "").strip().lower()
+    if value in ("0", "false", "no", "off"):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if _use_simulator() or _get_dispatch_path() != "xla":
+        return True
+    # XLA path: the load_transpose2d kernels, when nki defines them.
+    return "_complex_gemm_t2d_kernel" not in globals()
+
+
+def _gemm_kernel_names() -> tuple[str, str]:
+    """(kernel attribute, op name) of the FP32 complex GEMM to launch."""
+    if _pe_transpose_enabled():
+        return "_complex_gemm_kernel", "complex_gemm"
+    return "_complex_gemm_t2d_kernel", "complex_gemm_t2d"
+
+
 # --- NKI kernels ---
 # Ported from neuron-complex-ops/kernels.py (Apache 2.0)
 
@@ -126,6 +156,105 @@ if HAS_NKI:
     @nki.jit
     def _complex_gemm_kernel(a_real, a_imag, b_real, b_imag):
         """Complex GEMM: C = A @ B where A, B, C are complex.
+
+        Uses 4 real matmuls accumulated into 2 PSUM tiles:
+            C_real = A_real @ B_real - A_imag @ B_imag
+            C_imag = A_real @ B_imag + A_imag @ B_real
+
+        ``nisa.nc_matmul`` contracts over the partition dim, so the stationary
+        A tile must be K-major, (TILE_K, TILE_M). A is (M, K) row-major in HBM.
+        Each (TILE_M, TILE_K) tile is read with a plain ``nl.load`` and
+        transposed on the Tensor engine (``nisa.nc_transpose`` into PSUM, then
+        copied to SBUF). Until trnfft#97 this was ``nl.load_transpose2d``: on
+        Trn2 (SDK 2.33) the runtime rebuilds a transposed load's IO DMA rings
+        whenever the input address changes (``kbl_exec_pre`` 2-9 ms, ~4.7 MB
+        of descriptors for an 8 MiB plane), so every call with a fresh input
+        tensor paid it. Tensor-engine transposes are bit-exact from
+        NeuronCore-v3 on, and the tiles, PSUM accumulation order and casts are
+        unchanged, so the result has the same bits as the
+        ``load_transpose2d`` kernel (``_complex_gemm_t2d_kernel``, kept
+        behind ``TRNFFT_PE_TRANSPOSE=0``).
+
+        Tile shapes:
+            A tile (loaded):                     (TILE_M, TILE_K)
+            stationary (A tile, transposed):     (TILE_K, TILE_M)
+            moving (B col-tile):                 (TILE_K, TILE_N)
+            result (PSUM):                       (TILE_M, TILE_N)
+        """
+        M, K = a_real.shape
+        _, N = b_real.shape
+
+        TILE_M = min(M, 128)
+        TILE_K = min(K, 128)
+        TILE_N = min(N, 512)
+
+        c_real = nl.ndarray((M, N), dtype=a_real.dtype, buffer=nl.shared_hbm)
+        c_imag = nl.ndarray((M, N), dtype=a_real.dtype, buffer=nl.shared_hbm)
+
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(N // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
+
+                psum_cr = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                psum_ci = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+
+                for k in nl.affine_range(K // TILE_K):
+                    k_off = k * TILE_K
+
+                    # Plain load of the A row-tile (partition dim = M), then a
+                    # Tensor-engine transpose so the partition dim is K.
+                    ar = nl.load(a_real[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    ai = nl.load(a_imag[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    pt_r = nl.ndarray((TILE_K, TILE_M), dtype=a_real.dtype, buffer=nl.psum)
+                    pt_i = nl.ndarray((TILE_K, TILE_M), dtype=a_real.dtype, buffer=nl.psum)
+                    nisa.nc_transpose(dst=pt_r, data=ar, engine=nisa.engine.tensor)
+                    nisa.nc_transpose(dst=pt_i, data=ai, engine=nisa.engine.tensor)
+                    ar_t = nl.ndarray((TILE_K, TILE_M), dtype=a_real.dtype, buffer=nl.sbuf)
+                    ai_t = nl.ndarray((TILE_K, TILE_M), dtype=a_real.dtype, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=ar_t, src=pt_r)
+                    nisa.tensor_copy(dst=ai_t, src=pt_i)
+
+                    # Load B col-tile with partition dim = K (already K-major).
+                    br = nl.load(b_real[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+                    bi = nl.load(b_imag[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+
+                    # NKI 2.24 doesn't support `psum -=` inside affine_range;
+                    # use Vector Engine to negate B_imag, then accumulate with +=.
+                    neg_bi = nl.negative(bi)
+
+                    # C_real += A_real @ B_real  +  A_imag @ (-B_imag)
+                    nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=br, accumulate=True)
+                    nisa.nc_matmul(dst=psum_cr, stationary=ai_t, moving=neg_bi, accumulate=True)
+
+                    # C_imag += A_real @ B_imag  +  A_imag @ B_real
+                    nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=bi, accumulate=True)
+                    nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=br, accumulate=True)
+
+                # NKI 0.3.0: nl.copy returns a view; PSUM->SBUF must go through
+                # nisa.tensor_copy(dst=, src=) into a pre-allocated SBUF tile.
+                # If the destination dtype differs from PSUM's fp32, cast after.
+                cr_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+                ci_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=cr_sbuf, src=psum_cr)
+                nisa.tensor_copy(dst=ci_sbuf, src=psum_ci)
+                if a_real.dtype != nl.float32:
+                    cr_sbuf = nl.cast(cr_sbuf, dtype=a_real.dtype)
+                    ci_sbuf = nl.cast(ci_sbuf, dtype=a_real.dtype)
+                nl.store(c_real[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=cr_sbuf)
+                nl.store(c_imag[m_off : m_off + TILE_M, n_off : n_off + TILE_N], value=ci_sbuf)
+
+        return c_real, c_imag
+
+    @nki.jit
+    def _complex_gemm_t2d_kernel(a_real, a_imag, b_real, b_imag):
+        """Complex GEMM reading A with ``nl.load_transpose2d`` (pre-trnfft#97 kernel).
+
+        Kept behind ``TRNFFT_PE_TRANSPOSE=0``. ``_complex_gemm_kernel`` is the
+        default: same tiles and PSUM order, A loaded plainly and transposed on
+        the Tensor engine, so the two give the same bits.
+
+        Complex GEMM: C = A @ B where A, B, C are complex.
 
         Uses 4 real matmuls accumulated into 2 PSUM tiles:
             C_real = A_real @ B_real - A_imag @ B_imag
