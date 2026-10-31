@@ -14,8 +14,11 @@ path is the single DFT-GEMM) for each ``B:N`` case in four input modes:
 under ``TRNFFT_PE_TRANSPOSE=0`` (``load_transpose2d`` kernels) and ``=1``
 (plain load + Tensor-engine transpose), in rounds 0,1,1,0 in one process.
 ``--op bf16`` times ``precision="bf16"`` (the BF16 DFT-GEMM) instead, and
-``--op linear`` an ``nn.ComplexLinear(N, N)`` on (B, N) activations
-(trnfft#100).
+``--op linear`` an ``nn.ComplexLinear(N, N)`` on (B, N) activations, and
+``--op gemm_bf16`` ``complex_gemm_bf16`` of (B, N) BF16 inputs against a
+fixed (N, N) BF16 matrix (trnfft#100). The ``bf16`` FFT casts its input to
+BF16 on every call, so its input address is the allocator's choice in every
+mode; ``gemm_bf16`` controls it.
 Each call is synchronised and timed on its own; the figure is the median
 call. Prints one line per case and mode:
 
@@ -44,7 +47,7 @@ def main():
     ap.add_argument("--inverse", action="store_true")
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--knobs", default="0,1,1,0", help="TRNFFT_PE_TRANSPOSE per round")
-    ap.add_argument("--op", default="fft", choices=["fft", "bf16", "linear"])
+    ap.add_argument("--op", default="fft", choices=["fft", "bf16", "linear", "gemm_bf16"])
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
 
@@ -76,6 +79,18 @@ def main():
                 with torch.no_grad():
                     return layer(x)
 
+        elif args.op == "gemm_bf16":
+            from trnfft.nki.dispatch import complex_gemm_bf16
+
+            gw = torch.Generator().manual_seed(N)
+            w = ComplexTensor(
+                torch.randn(N, N, generator=gw).bfloat16().to(dev),
+                torch.randn(N, N, generator=gw).bfloat16().to(dev),
+            )
+
+            def op(x, w=w):
+                return complex_gemm_bf16(x, w)
+
         else:
             prec = "bf16" if args.op == "bf16" else None
 
@@ -88,6 +103,8 @@ def main():
         ]
         if B == 1:
             host = [(r[0], i[0]) for r, i in host]
+        if args.op == "gemm_bf16":
+            host = [(r.bfloat16(), i.bfloat16()) for r, i in host]
         devs = [ComplexTensor(r.to(dev), i.to(dev)) for r, i in host]
         hosts = [ComplexTensor(r, i) for r, i in host]
         sync()

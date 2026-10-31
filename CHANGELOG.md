@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_complex_linear_kernel` ran `M // 128`, `K // 128` and `N // 512` tiles
   with no tail. The last partial tile of each dimension was dropped
   silently:
-  - rows past the last full 128-row tile were never written (B = 1000,
-    N = 64 with `precision="bf16"`: rows 896–999; B = 4097: row 4096);
+  - rows past the last full 128-row tile were never written
+    (`complex_gemm_bf16` on 1000 × 64: rows 896–999; on 4097 rows: row
+    4096);
   - a K tail lost contraction terms, and an N tail left columns unwritten
     (`complex_gemm` at 200 × 200 × 600: every row wrong).
   This hit `precision="bf16"`, `"bf16_refined"`, `"ozaki"` and `"ozaki_hq"`
@@ -39,7 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plainly and transpose on the Tensor engine, so a fresh activation tensor
   no longer makes the runtime rebuild the kernel's IO DMA rings. Outputs are
   bit-identical to the `load_transpose2d` kernels on Trn2 at every case
-  tested. `TRNFFT_PE_TRANSPOSE=0` selects the old kernels
+  tested.
+  - Trn2, fresh device input per call, medians in ms: `complex_gemm_bf16`
+    8192 × 64 goes from 1.20 to 0.38 and 32768 × 64 from 3.04 to 0.94;
+    `ComplexLinear(256, 256)` on 8192 rows from 10.4 to 1.22.
+  - With one tensor reused they are slower (the Tensor-engine transposes):
+    `complex_gemm_bf16` 32768 × 64 0.62 → 0.94, `ComplexLinear(256, 256)`
+    0.96 → 1.20. The BF16 FFT has no row packing yet.
+  - `TRNFFT_PE_TRANSPOSE=0` selects the old kernels
   (`_complex_gemm_bf16_t2d_kernel`, `_complex_linear_t2d_kernel`), and the
   XLA path (Trn1) keeps them by default.
 

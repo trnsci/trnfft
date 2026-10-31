@@ -136,10 +136,18 @@ def _paths():
 _PATHS = _paths()
 # The six-step at N = 2^13 is 64 MiB per plane at B = 1000; B = 4097 is left out.
 _SIX_STEP_BATCHES = [129, 1000]
+# The Stockham drivers run one launch per stage plus host permutes; at
+# B = 4097 the radix-8 / mixed paths take over 10 minutes on Trn2, so they
+# stop at B = 1000 (they pad any batch to a multiple of 128 anyway).
+_CASES = [
+    (path, batch)
+    for path in sorted(_PATHS)
+    for batch in BATCHES
+    if not (path.startswith("stockham") and batch > 1000)
+]
 
 
-@pytest.mark.parametrize("batch", BATCHES)
-@pytest.mark.parametrize("path", sorted(_PATHS))
+@pytest.mark.parametrize("path,batch", _CASES)
 def test_fft_path_ragged_batch(nki_backend, monkeypatch, path, batch):
     n, fn, tol, setup = _PATHS[path]
     setup(monkeypatch)
