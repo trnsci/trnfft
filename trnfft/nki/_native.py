@@ -87,6 +87,20 @@ def complex_gemm(
 
 
 @nki_op(
+    "trnfft::complex_gemm_t2d",
+    mutates_args={},
+    fake_fn=lambda a_real, a_imag, b_real, b_imag: _fake_pair(
+        (a_real.shape[0], b_real.shape[1]), a_real.dtype, a_real
+    ),
+)
+def complex_gemm_t2d(
+    a_real: torch.Tensor, a_imag: torch.Tensor, b_real: torch.Tensor, b_imag: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # TRNFFT_PE_TRANSPOSE=0: the load_transpose2d GEMM (trnfft#97).
+    return _d._complex_gemm_t2d_kernel(a_real, a_imag, b_real, b_imag)
+
+
+@nki_op(
     "trnfft::complex_gemm_tn",
     mutates_args={},
     fake_fn=lambda at_real, at_imag, b_real, b_imag: _fake_pair(
@@ -139,6 +153,7 @@ def complex_mul(
 
 
 _register_backward(complex_gemm, _ag.complex_gemm_backward)
+_register_backward(complex_gemm_t2d, _ag.complex_gemm_backward)
 _register_backward(complex_linear, _ag.complex_linear_backward)
 _register_backward(complex_mul, _ag.complex_mul_backward)
 
@@ -198,6 +213,18 @@ def stockham_radix8_w8(
     a_re: torch.Tensor, a_im: torch.Tensor, w8_re: torch.Tensor, w8_im: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _st.stockham_radix8_w8_kernel(a_re, a_im, w8_re, w8_im)
+
+
+@nki_op(
+    "trnfft::stockham_radix8_w8_t2d",
+    mutates_args={},
+    fake_fn=lambda a_re, a_im, w8_re, w8_im: _fake_like(a_re),
+)
+def stockham_radix8_w8_t2d(
+    a_re: torch.Tensor, a_im: torch.Tensor, w8_re: torch.Tensor, w8_im: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # TRNFFT_PE_TRANSPOSE=0: the load_transpose2d W_8 kernel (trnfft#97).
+    return _st.stockham_radix8_w8_t2d_kernel(a_re, a_im, w8_re, w8_im)
 
 
 @nki_op(
@@ -267,12 +294,14 @@ OPS = {
     "complex_gemm": complex_gemm,
     "complex_gemm_bf16": complex_gemm_bf16,
     "complex_gemm_tn": complex_gemm_tn,
+    "complex_gemm_t2d": complex_gemm_t2d,
     "complex_linear": complex_linear,
     "complex_mul": complex_mul,
     "butterfly_stage": butterfly_stage,
     "butterfly_stage_kahan": butterfly_stage_kahan,
     "stockham_radix4_stage": stockham_radix4_stage,
     "stockham_radix8_w8": stockham_radix8_w8,
+    "stockham_radix8_w8_t2d": stockham_radix8_w8_t2d,
     "four_step_fft": four_step_fft,
     "fft": fft,
 }

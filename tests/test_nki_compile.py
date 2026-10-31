@@ -103,6 +103,16 @@ _CASES = {
         "stockham_radix8_w8_kernel",
         lambda: ((_f32(64, 8), _f32(64, 8), _f32(8, 8), _f32(8, 8)), {}),
     ),
+    "stockham-r8-multitile": (
+        "stockham",
+        "stockham_radix8_w8_kernel",
+        lambda: ((_f32(256, 8), _f32(256, 8), _f32(8, 8), _f32(8, 8)), {}),
+    ),
+    "stockham-r8-t2d": (
+        "stockham",
+        "stockham_radix8_w8_t2d_kernel",
+        lambda: ((_f32(64, 8), _f32(64, 8), _f32(8, 8), _f32(8, 8)), {}),
+    ),
     "four-step-4096-tail": (
         "four_step",
         "four_step_fft_kernel",
@@ -114,6 +124,26 @@ _CASES = {
     "complex-gemm": (
         "dispatch",
         "_complex_gemm_kernel",
+        lambda: ((_f32(128, 128), _f32(128, 128), _f32(128, 128), _f32(128, 128)), {}),
+    ),
+    "complex-gemm-small": (
+        "dispatch",
+        "_complex_gemm_kernel",
+        lambda: ((_f32(1, 8), _f32(1, 8), _f32(8, 8), _f32(8, 8)), {}),
+    ),
+    "complex-gemm-dft256": (
+        "dispatch",
+        "_complex_gemm_kernel",
+        lambda: ((_f32(512, 256), _f32(512, 256), _f32(256, 256), _f32(256, 256)), {}),
+    ),
+    "complex-gemm-multitile": (
+        "dispatch",
+        "_complex_gemm_kernel",
+        lambda: ((_f32(256, 256), _f32(256, 256), _f32(256, 1024), _f32(256, 1024)), {}),
+    ),
+    "complex-gemm-t2d": (
+        "dispatch",
+        "_complex_gemm_t2d_kernel",
         lambda: ((_f32(128, 128), _f32(128, 128), _f32(128, 128), _f32(128, 128)), {}),
     ),
     "complex-gemm-tn-2^13": (
@@ -152,9 +182,9 @@ def _frontend_available():
         pytest.skip("nki.compiler.frontend.source_to_mlir not available in this nki")
 
 
-@pytest.mark.parametrize("target", ["trn1", "trn2"])
+@pytest.mark.parametrize("target,lnc", [("trn1", 1), ("trn2", 1), ("trn2", 2)])
 @pytest.mark.parametrize("case", sorted(_CASES))
-def test_kernel_mlir_verifies(case, target):
+def test_kernel_mlir_verifies(case, target, lnc):
     import importlib
 
     module_name, kernel_name, make_inputs = _CASES[case]
@@ -162,5 +192,7 @@ def test_kernel_mlir_verifies(case, target):
     kernel = getattr(module, kernel_name)
     assert kernel is not None, f"{module_name}.{kernel_name} is not defined"
     args, kwargs = make_inputs()
-    result = source_to_mlir(kernel, *args, **kwargs, target=target, frontend=FrontendKind.TRACER)
+    result = source_to_mlir(
+        kernel, *args, **kwargs, target=target, lnc=lnc, frontend=FrontendKind.TRACER
+    )
     result.verify()

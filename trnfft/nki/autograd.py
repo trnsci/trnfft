@@ -145,14 +145,15 @@ class _ComplexGEMMFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, a_real, a_imag, b_real, b_imag):
-        from .dispatch import _complex_gemm_kernel, _launch, _simulate_kernel, _use_simulator
+        from . import dispatch
+        from .dispatch import _launch, _simulate_kernel, _use_simulator
 
+        kernel_name, op_name = dispatch._gemm_kernel_names()
+        kernel = getattr(dispatch, kernel_name)
         if _use_simulator():
-            c_real, c_imag = _simulate_kernel(_complex_gemm_kernel, a_real, a_imag, b_real, b_imag)
+            c_real, c_imag = _simulate_kernel(kernel, a_real, a_imag, b_real, b_imag)
         else:
-            c_real, c_imag = _launch(
-                _complex_gemm_kernel, "complex_gemm", a_real, a_imag, b_real, b_imag
-            )
+            c_real, c_imag = _launch(kernel, op_name, a_real, a_imag, b_real, b_imag)
         ctx.save_for_backward(a_real, a_imag, b_real, b_imag)
         return c_real, c_imag
 
@@ -162,10 +163,11 @@ class _ComplexGEMMFn(torch.autograd.Function):
 
 
 def complex_gemm_autograd(a_real, a_imag, b_real, b_imag):
-    if _native_op("complex_gemm") is not None:
-        return _launch_native(
-            "_complex_gemm_kernel", "complex_gemm", a_real, a_imag, b_real, b_imag
-        )
+    from .dispatch import _gemm_kernel_names
+
+    kernel_name, op_name = _gemm_kernel_names()
+    if _native_op(op_name) is not None:
+        return _launch_native(kernel_name, op_name, a_real, a_imag, b_real, b_imag)
     return _ComplexGEMMFn.apply(a_real, a_imag, b_real, b_imag)
 
 

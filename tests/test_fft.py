@@ -1745,3 +1745,116 @@ class TestSixStepPass1TNNeuron:
         new = f(x)
         assert _same_bits(new.real.cpu(), old.real.cpu())
         assert _same_bits(new.imag.cpu(), old.imag.cpu())
+
+
+@pytest.mark.neuron
+class TestPETransposeNeuron:
+    """trnfft#97: the plain-load kernels (``TRNFFT_PE_TRANSPOSE`` default) give
+    the same bits as the ``load_transpose2d`` kernels (``=0``) on device."""
+
+    @staticmethod
+    def _bits(t):
+        return t.contiguous().cpu().view(torch.int32)
+
+    def _both(self, monkeypatch, f, x):
+        monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "0")
+        old = f(x)
+        monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "1")
+        new = f(x)
+        return old, new
+
+    @pytest.mark.parametrize("batch,n", [(1, 8), (16, 64), (1024, 8), (8192, 32), (512, 128)])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_dft_gemm_bitwise(self, nki_backend, monkeypatch, batch, n, inverse):
+        g = torch.Generator().manual_seed(97 * n + batch)
+        dev = torch.device("neuron")
+        xr, xi = torch.randn(batch, n, generator=g), torch.randn(batch, n, generator=g)
+        x = ComplexTensor(xr.to(dev), xi.to(dev))
+        f = trnfft.ifft if inverse else trnfft.fft
+        old, new = self._both(monkeypatch, f, x)
+        assert torch.equal(self._bits(old.real), self._bits(new.real))
+        assert torch.equal(self._bits(old.imag), self._bits(new.imag))
+        ref = torch.fft.ifft if inverse else torch.fft.fft
+        want = ref(torch.complex(xr, xi).to(torch.complex128))
+        got = torch.complex(new.real.double().cpu(), new.imag.double().cpu())
+        assert (torch.linalg.vector_norm(got - want) / torch.linalg.vector_norm(want)) < 1e-6
+
+    @pytest.mark.parametrize("batch,n", [(1000, 64), (200, 8), (130, 256)])
+    def test_dft_gemm_ragged_batch(self, nki_backend, batch, n):
+        """Batches over 128 rows that are not a multiple of 128 (every row was
+        wrong past the last full 128-row tile before trnfft#97)."""
+        g = torch.Generator().manual_seed(batch + n)
+        xr, xi = torch.randn(batch, n, generator=g), torch.randn(batch, n, generator=g)
+        y = trnfft.fft(ComplexTensor(xr, xi))
+        want = torch.fft.fft(torch.complex(xr, xi).to(torch.complex128))
+        got = torch.complex(y.real.double().cpu(), y.imag.double().cpu())
+        err = (got - want).abs().amax(dim=1) / want.abs().amax(dim=1)
+        assert err.max() < 1e-5, (err > 1e-5).nonzero().flatten()[:4]
+
+    @pytest.mark.parametrize("batch", [1, 64])
+    def test_stockham_radix8_bitwise(self, nki_backend, monkeypatch, batch):
+        from trnfft import fft_core as fc
+
+        g = torch.Generator().manual_seed(98 + batch)
+        x = ComplexTensor(
+            torch.randn(batch, 512, generator=g), torch.randn(batch, 512, generator=g)
+        )
+        old, new = self._both(monkeypatch, lambda v: fc._fft_via_stockham_nki_r8(v, False), x)
+        assert torch.equal(self._bits(old.real), self._bits(new.real))
+        assert torch.equal(self._bits(old.imag), self._bits(new.imag))
+
+
+class TestPETransposeSelection:
+    """trnfft#97 knobs: ``TRNFFT_PE_TRANSPOSE`` picks the GEMM kernel and
+    ``_dft_gemm_pack`` the row packing of the small-N DFT-GEMM (CPU only)."""
+
+    def test_env_forces_kernel(self, monkeypatch):
+        from trnfft.nki import dispatch
+
+        monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "0")
+        assert dispatch._gemm_kernel_names() == ("_complex_gemm_t2d_kernel", "complex_gemm_t2d")
+        monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "1")
+        assert dispatch._gemm_kernel_names() == ("_complex_gemm_kernel", "complex_gemm")
+
+    @pytest.mark.parametrize(
+        "rows,n,g",
+        [(1, 8, 1), (16, 8, 16), (32768, 8, 16), (1024, 64, 2), (8192, 32, 4), (1000, 64, 1)]
+        + [(24, 8, 8), (4096, 128, 1), (64, 100, 1), (384, 16, 8), (640, 16, 8), (1280, 16, 2)],
+    )
+    def test_pack_factor(self, monkeypatch, rows, n, g):
+        from trnfft import fft_core as fc
+
+        monkeypatch.setattr(fc, "_use_nki", lambda: True)
+        monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "1")
+        assert fc._dft_gemm_pack(rows, n) == g
+        monkeypatch.setenv("TRNFFT_GEMM_PACK", "0")
+        assert fc._dft_gemm_pack(rows, n) == 1
+        monkeypatch.delenv("TRNFFT_GEMM_PACK")
+        monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "0")
+        assert fc._dft_gemm_pack(rows, n) == 1
+
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_packed_gemm_matches_numpy(self, monkeypatch, inverse):
+        """The packed (rows/g, g*n) x block-diagonal W GEMM, run with a CPU
+        stand-in for ``complex_gemm``, is the row-wise DFT."""
+        from trnfft import fft_core as fc
+        from trnfft.nki import dispatch
+
+        seen = []
+
+        def fake_gemm(a, b):
+            seen.append((tuple(a.real.shape), tuple(b.real.shape)))
+            return ComplexTensor(
+                a.real @ b.real - a.imag @ b.imag, a.real @ b.imag + a.imag @ b.real
+            )
+
+        monkeypatch.setattr(fc, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "complex_gemm", fake_gemm)
+        monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "1")
+        g = torch.Generator().manual_seed(97)
+        x = torch.complex(torch.randn(256, 16, generator=g), torch.randn(256, 16, generator=g))
+        y = fc._fft_via_gemm(ComplexTensor(x.real.contiguous(), x.imag.contiguous()), inverse)
+        assert seen == [((32, 128), (128, 128))]
+        ref = (torch.fft.ifft if inverse else torch.fft.fft)(x.to(torch.complex128))
+        got = torch.complex(y.real.double(), y.imag.double())
+        assert (torch.linalg.vector_norm(got - ref) / torch.linalg.vector_norm(ref)) < 1e-6

@@ -33,12 +33,14 @@ EXPECTED_NKI_OPS = {
     "complex_gemm",
     "complex_gemm_bf16",
     "complex_gemm_tn",
+    "complex_gemm_t2d",
     "complex_linear",
     "complex_mul",
     "butterfly_stage",
     "butterfly_stage_kahan",
     "stockham_radix4_stage",
     "stockham_radix8_w8",
+    "stockham_radix8_w8_t2d",
     "four_step_fft",
 }
 # Plus the composite FFT op (torch.library.custom_op) that carries the adjoint.

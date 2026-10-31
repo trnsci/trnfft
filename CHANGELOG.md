@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The small-N DFT-GEMM and the radix-8 Stockham kernel no longer use
+  `nl.load_transpose2d` (#97).** `_complex_gemm_kernel` (the default FFT for
+  N < 512, and every `complex_gemm`) and `stockham_radix8_w8_kernel` load
+  their input with a plain `nl.load` and transpose each tile on the Tensor
+  engine (`nisa.nc_transpose`). Outputs are bit-identical on Trn2 at every
+  case measured.
+  - On Trn2 (SDK 2.33) the runtime rebuilds a `load_transpose2d` input's IO
+    DMA rings whenever its address changes, so every call with a fresh
+    device tensor paid 1–4.4 ms of `kbl_exec_pre` (32768 × 64: 2.37 MB of
+    ring descriptors per plane). Plain loads, and even element-strided DMA
+    access patterns, do not (`scripts/repro_dma_ring_rebuild.py`).
+  - For N < 128 the DFT-GEMM packs 128 / N rows into one GEMM row against a
+    block-diagonal W, so it does fewer, fuller tiles. With it the
+    Tensor-engine transposes cost nothing measurable for N < 128.
+  - Device input, two tensors alternating, medians in ms: 32768 × 64 goes
+    from 9.75 to 0.85, 8192 × 256 from 4.36 to 0.66 and 1024 × 64 from 0.96
+    to 0.33. Bluestein (its sub-FFT inputs are fresh tensors on every call)
+    gets faster even with the same input: 8192 × 100 goes from 14.8 to 6.4.
+    With the same tensor reused, N = 128 and 256 at 8192 rows or more are
+    0.06–0.54 ms slower (the transposes, no packing at K = 128). Host-in,
+    host-out calls do not change much: the allocator usually hands back
+    the same device address.
+  - `TRNFFT_PE_TRANSPOSE=0` (read per call) restores the `load_transpose2d`
+    kernels; `TRNFFT_GEMM_PACK=0` turns off the row packing alone. The XLA
+    path (Trn1) keeps the `load_transpose2d` kernels by default.
+- **Fixed: the DFT-GEMM returned wrong rows for batches over 128 rows that
+  are not a multiple of 128 (#97).** The kernel tiles rows by 128 with no tail
+  tile, so for B = 1000, N = 64 rows 896–999 were never written. Such batches
+  are now zero-padded to a multiple of 128.
+
 - **The six-step's first pass at N = 2^13 reads x in place (#97).** It no
   longer transposes x and runs the `load_transpose2d` DFT-GEMM. A new kernel,
   `_complex_gemm_tn_kernel`, loads the (B, N2, N1) view of x with plain

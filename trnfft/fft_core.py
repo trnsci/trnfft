@@ -214,7 +214,13 @@ def _launch_stockham_stage(
     the native path, ``kernel`` on the XLA path); operands are already on the
     kernel device, so nothing is copied.
     """
-    from .nki.dispatch import _launch
+    from .nki.dispatch import _launch, _pe_transpose_enabled
+
+    if op_name == "stockham_radix8_w8" and not _pe_transpose_enabled():
+        # TRNFFT_PE_TRANSPOSE=0: the load_transpose2d W_8 kernel (trnfft#97).
+        from .nki.stockham import stockham_radix8_w8_t2d_kernel
+
+        kernel, op_name = stockham_radix8_w8_t2d_kernel, "stockham_radix8_w8_t2d"
 
     def _run(a, b, c, d):
         if use_sim:
@@ -867,6 +873,49 @@ def _fft_via_four_step(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     return ComplexTensor(X_re.reshape(orig_shape), X_im.reshape(orig_shape))
 
 
+@functools.lru_cache(maxsize=64)
+def _dft_matrix_blockdiag_cached(
+    n: int, g: int, inverse: bool, dtype: torch.dtype, device: torch.device, scale: float = 1.0
+) -> ComplexTensor:
+    """``g`` copies of ``_dft_matrix_cached(n, ...)`` on the diagonal, (g*n, g*n)."""
+    W = _dft_matrix_cached(n, inverse, dtype, torch.device("cpu"), scale)
+    W_r = torch.block_diag(*[W.real] * g)
+    W_i = torch.block_diag(*[W.imag] * g)
+    return ComplexTensor(W_r.to(device), W_i.to(device))
+
+
+def _dft_gemm_pack(rows: int, n: int) -> int:
+    """Rows of length ``n`` packed side by side into one GEMM row (trnfft#97).
+
+    ``_complex_gemm_kernel`` transposes each (128, K) tile of its left operand
+    on the Tensor engine. With K = n < 128 most of each transpose and matmul
+    is idle, and at 32768 x 8 the per-tile work made the kernel 1.5x slower
+    than the ``load_transpose2d`` one. Viewing x as (rows/g, g*n) with a
+    block-diagonal (g*n, g*n) W does g row FFTs per GEMM row: g times fewer
+    tiles, loads, transposes and matmuls. The extra terms are exact zero
+    products, so each output is the same sum as without packing.
+
+    g is the largest power of two with g*n <= 128 that divides ``rows`` and
+    keeps rows/g <= 128 or a multiple of 128 (the kernel's M tiling). 1 when
+    the packing does not apply: n >= 128, NKI off, or ``TRNFFT_PE_TRANSPOSE=0``
+    (which keeps the unpacked ``load_transpose2d`` GEMM). ``TRNFFT_GEMM_PACK=0``
+    (read per call) turns off the packing alone.
+    """
+    from .nki.dispatch import _pe_transpose_enabled
+
+    if n >= 128 or not _use_nki() or not _pe_transpose_enabled():
+        return 1
+    if os.environ.get("TRNFFT_GEMM_PACK", "1").strip().lower() in ("0", "false", "no", "off"):
+        return 1
+    g = 128 // n if _is_power_of_two(n) else 1
+    while g > 1:
+        r = rows // g
+        if rows % g == 0 and (r <= 128 or r % 128 == 0):
+            return g
+        g //= 2
+    return 1
+
+
 def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """Compute FFT as a single complex matmul: X = W @ x (FP32, NKI path).
 
@@ -889,11 +938,28 @@ def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     # or host->device copy. For power-of-2 N the inverse 1/N is folded into W
     # (exact), saving the two scaling ops after the GEMM.
     fold = inverse and _is_power_of_two(n)
-    W = _dft_matrix_cached(n, inverse, x_re.dtype, x_re.device, (1.0 / n) if fold else 1.0)
-
-    X_2d = complex_gemm(ComplexTensor(x_re, x_im), W)
-    X_re = X_2d.real.reshape(orig_shape)
-    X_im = X_2d.imag.reshape(orig_shape)
+    scale = (1.0 / n) if fold else 1.0
+    rows_in = x_re.shape[0]
+    if _use_nki() and rows_in > 128 and rows_in % 128:
+        # The kernel tiles M by 128 with no tail tile: rows past the last
+        # full tile were never written (B=1000, N=64: rows 896-999 wrong).
+        pad = torch.zeros(128 - rows_in % 128, n, dtype=x_re.dtype, device=x_re.device)
+        x_re, x_im = torch.cat([x_re, pad]), torch.cat([x_im, pad])
+    rows = x_re.shape[0]
+    g = _dft_gemm_pack(rows, n)
+    if g > 1:
+        # (rows, n) -> (rows/g, g*n) is a free view; W becomes g copies of W
+        # on the diagonal, so each packed row's g segments transform alone.
+        W = _dft_matrix_blockdiag_cached(n, g, inverse, x_re.dtype, x_re.device, scale)
+        X_p = complex_gemm(
+            ComplexTensor(x_re.reshape(rows // g, g * n), x_im.reshape(rows // g, g * n)), W
+        )
+        X_2d = ComplexTensor(X_p.real.reshape(rows, n), X_p.imag.reshape(rows, n))
+    else:
+        W = _dft_matrix_cached(n, inverse, x_re.dtype, x_re.device, scale)
+        X_2d = complex_gemm(ComplexTensor(x_re, x_im), W)
+    X_re = X_2d.real[:rows_in].reshape(orig_shape)
+    X_im = X_2d.imag[:rows_in].reshape(orig_shape)
     result = ComplexTensor(X_re, X_im)
     if inverse and not fold:
         result = result * (1.0 / n)

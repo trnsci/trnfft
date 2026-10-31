@@ -358,3 +358,35 @@ class TestComplexGemmTNSimulator:
         w_r, w_i = _simulate_kernel(_complex_gemm_kernel, a_r, a_i, b_r, b_i)
         assert c_r.shape == (g * m, n)
         assert torch.equal(c_r, w_r) and torch.equal(c_i, w_i)
+
+
+class TestPETransposeSimulator:
+    """trnfft#97: the plain-load + Tensor-engine-transpose kernels give the same
+    bits as the ``load_transpose2d`` kernels they replace."""
+
+    @pytest.mark.parametrize("m,k,n", [(1, 8, 8), (16, 64, 64), (256, 128, 128), (256, 256, 1024)])
+    def test_gemm_matches_t2d_bitwise(self, m, k, n):
+        from trnfft.nki.dispatch import (
+            _complex_gemm_kernel,
+            _complex_gemm_t2d_kernel,
+            _simulate_kernel,
+        )
+
+        gen = torch.Generator().manual_seed(m * k + n)
+        args = [torch.randn(m, k, generator=gen), torch.randn(m, k, generator=gen)]
+        args += [torch.randn(k, n, generator=gen), torch.randn(k, n, generator=gen)]
+        c_r, c_i = _simulate_kernel(_complex_gemm_kernel, *args)
+        w_r, w_i = _simulate_kernel(_complex_gemm_t2d_kernel, *args)
+        assert torch.equal(c_r, w_r) and torch.equal(c_i, w_i)
+
+    @pytest.mark.parametrize("groups", [64, 256])
+    def test_radix8_matches_t2d_bitwise(self, groups):
+        from trnfft.nki.dispatch import _simulate_kernel
+        from trnfft.nki.stockham import stockham_radix8_w8_kernel, stockham_radix8_w8_t2d_kernel
+
+        gen = torch.Generator().manual_seed(groups)
+        args = [torch.randn(groups, 8, generator=gen), torch.randn(groups, 8, generator=gen)]
+        args += [torch.randn(8, 8, generator=gen), torch.randn(8, 8, generator=gen)]
+        c_r, c_i = _simulate_kernel(stockham_radix8_w8_kernel, *args)
+        w_r, w_i = _simulate_kernel(stockham_radix8_w8_t2d_kernel, *args)
+        assert torch.equal(c_r, w_r) and torch.equal(c_i, w_i)

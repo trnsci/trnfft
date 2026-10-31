@@ -181,6 +181,82 @@ if HAS_NKI:
         twiddle multiply is done by the driver before this call.  ``w8_re,
         w8_im`` are the ``(8, 8)`` W_8 DFT matrix (shared across all groups).
 
+        Each ``(groups_chunk, 8)`` input tile is read with a plain ``nl.load``
+        and transposed to ``(8, groups_chunk)`` on the Tensor engine
+        (``nisa.nc_transpose``, bit-exact from NeuronCore-v3 on). The
+        ``nl.load_transpose2d`` version (``stockham_radix8_w8_t2d_kernel``,
+        ``TRNFFT_PE_TRANSPOSE=0``) makes the runtime rebuild the kernel's IO
+        DMA rings whenever the input address changes (trnfft#97). Same bits.
+        """
+        total_groups, _ = a_re.shape
+
+        out_re = nl.ndarray((total_groups, 8), dtype=a_re.dtype, buffer=nl.shared_hbm)
+        out_im = nl.ndarray((total_groups, 8), dtype=a_im.dtype, buffer=nl.shared_hbm)
+
+        groups_chunk = total_groups if total_groups <= PMAX else PMAX
+        assert total_groups % groups_chunk == 0, (
+            f"total_groups={total_groups} not divisible by chunk size {groups_chunk}"
+        )
+        n_partition_tiles = total_groups // groups_chunk
+
+        TILE_K = 8
+        TILE_N = 8
+
+        # W_8 is shared across all groups; load once outside the tile loop.
+        w8_r = nl.load(w8_re[:TILE_K, :TILE_N])  # (8, 8)
+        w8_i = nl.load(w8_im[:TILE_K, :TILE_N])
+        neg_w8_i = nl.negative(w8_i)
+
+        for m in nl.affine_range(n_partition_tiles):
+            m_off = m * groups_chunk
+
+            psum_cr = nl.zeros((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            psum_ci = nl.zeros((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.psum)
+
+            # (groups_chunk, 8) plain load, then (8, groups_chunk) on the PE.
+            a_r = nl.load(a_re[m_off : m_off + groups_chunk, :TILE_K])
+            a_i = nl.load(a_im[m_off : m_off + groups_chunk, :TILE_K])
+            pt_r = nl.ndarray((TILE_K, groups_chunk), dtype=a_re.dtype, buffer=nl.psum)
+            pt_i = nl.ndarray((TILE_K, groups_chunk), dtype=a_re.dtype, buffer=nl.psum)
+            nisa.nc_transpose(dst=pt_r, data=a_r, engine=nisa.engine.tensor)
+            nisa.nc_transpose(dst=pt_i, data=a_i, engine=nisa.engine.tensor)
+            ar_t = nl.ndarray((TILE_K, groups_chunk), dtype=a_re.dtype, buffer=nl.sbuf)
+            ai_t = nl.ndarray((TILE_K, groups_chunk), dtype=a_re.dtype, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=ar_t, src=pt_r)
+            nisa.tensor_copy(dst=ai_t, src=pt_i)
+
+            # C_real = A_real @ W_8_real - A_imag @ W_8_imag
+            nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=w8_r, accumulate=True)
+            nisa.nc_matmul(dst=psum_cr, stationary=ai_t, moving=neg_w8_i, accumulate=True)
+
+            # C_imag = A_real @ W_8_imag + A_imag @ W_8_real
+            nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=w8_i, accumulate=True)
+            nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=w8_r, accumulate=True)
+
+            cr_sbuf = nl.ndarray((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+            ci_sbuf = nl.ndarray((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=cr_sbuf, src=psum_cr)
+            nisa.tensor_copy(dst=ci_sbuf, src=psum_ci)
+            if a_re.dtype != nl.float32:
+                cr_sbuf = nl.cast(cr_sbuf, dtype=a_re.dtype)
+                ci_sbuf = nl.cast(ci_sbuf, dtype=a_re.dtype)
+            nl.store(out_re[m_off : m_off + groups_chunk, :], value=cr_sbuf)
+            nl.store(out_im[m_off : m_off + groups_chunk, :], value=ci_sbuf)
+
+        return out_re, out_im
+
+    @nki.jit
+    def stockham_radix8_w8_t2d_kernel(a_re, a_im, w8_re, w8_im):
+        """``stockham_radix8_w8_kernel`` reading its input with ``nl.load_transpose2d``.
+
+        The pre-trnfft#97 kernel, kept behind ``TRNFFT_PE_TRANSPOSE=0``.
+
+        W_8 DFT matmul via Tensor-engine nc_matmul.
+
+        Input ``a_re, a_im`` are ``(total_groups, 8)`` pre-twiddled tensors;
+        twiddle multiply is done by the driver before this call.  ``w8_re,
+        w8_im`` are the ``(8, 8)`` W_8 DFT matrix (shared across all groups).
+
         Uses nl.load_transpose2d on function-argument HBM tensors (a_re/a_im)
         — NKI 0.3.0 supports this; kernel-local scratch HBM does not work.
         """
@@ -241,3 +317,5 @@ else:
     stockham_radix4_stage_kernel = None  # type: ignore[assignment]
     stockham_radix4_fused_kernel = None  # type: ignore[assignment]
     stockham_radix8_stage_kernel = None  # type: ignore[assignment]
+    stockham_radix8_w8_kernel = None  # type: ignore[assignment]
+    stockham_radix8_w8_t2d_kernel = None  # type: ignore[assignment]
