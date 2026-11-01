@@ -51,18 +51,27 @@ def irfft(input: ComplexTensor, n: int | None = None) -> torch.Tensor:
     if n is None:
         n = 2 * (input.shape[-1] - 1)
 
+    # An n-point real signal has n//2 + 1 independent bins: use that many,
+    # truncating a longer input or zero-padding a shorter one (as torch.fft /
+    # NumPy do). Using the input length instead gave wrong values or a shape
+    # error whenever n != 2 * (len - 1) and n != 2 * len - 1 (#104).
+    half = n // 2 + 1
+    re, im = input.real[..., :half], input.imag[..., :half]
+    if re.shape[-1] < half:
+        pad = (0, half - re.shape[-1])
+        re, im = torch.nn.functional.pad(re, pad), torch.nn.functional.pad(im, pad)
+
     # Reconstruct full spectrum via Hermitian symmetry
     full_re = torch.zeros(*input.shape[:-1], n, dtype=input.dtype, device=input.device)
     full_im = torch.zeros(*input.shape[:-1], n, dtype=input.dtype, device=input.device)
-    half = input.shape[-1]
-    full_re[..., :half] = input.real
-    full_im[..., :half] = input.imag
+    full_re[..., :half] = re
+    full_im[..., :half] = im
     # X[n-k] = conj(X[k]) for k=1..n-half
     if n > 1:
         # Indices n-1, n-2, ..., half correspond to conj of indices 1, 2, ..., n-half
         num_neg = n - half
-        full_re[..., half:] = torch.flip(input.real[..., 1 : 1 + num_neg], dims=[-1])
-        full_im[..., half:] = -torch.flip(input.imag[..., 1 : 1 + num_neg], dims=[-1])
+        full_re[..., half:] = torch.flip(re[..., 1 : 1 + num_neg], dims=[-1])
+        full_im[..., half:] = -torch.flip(im[..., 1 : 1 + num_neg], dims=[-1])
 
     result = fft_core(ComplexTensor(full_re, full_im), inverse=True)
     return result.real
