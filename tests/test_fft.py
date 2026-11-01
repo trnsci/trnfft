@@ -1833,6 +1833,44 @@ class TestPETransposeSelection:
         monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "0")
         assert fc._dft_gemm_pack(rows, n) == 1
 
+    @pytest.mark.parametrize("precision", ["bf16", "bf16_refined", "ozaki", "ozaki_hq"])
+    @pytest.mark.parametrize(
+        "rows,n,shape", [(1000, 8, (1000, 8)), (256, 16, (32, 128)), (1024, 64, (512, 128))]
+    )
+    def test_packed_bf16_gemm_same_bits(self, monkeypatch, precision, rows, n, shape):
+        """The BF16 DFT-GEMMs pack rows for n < 128 (trnfft#101 follow-up).
+        With an FP64 stand-in for ``complex_gemm_bf16`` (exact BF16 products,
+        like the FP32 PSUM) packed and unpacked give the same bits."""
+        from trnfft import fft_core as fc
+        from trnfft.nki import dispatch
+
+        seen = []
+
+        def fake_gemm(a, b):
+            seen.append((tuple(a.real.shape), tuple(b.real.shape)))
+            ar, ai, br, bi = (t.double() for t in (a.real, a.imag, b.real, b.imag))
+            return ComplexTensor((ar @ br - ai @ bi).float(), (ar @ bi + ai @ br).float())
+
+        monkeypatch.setattr(fc, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "complex_gemm_bf16", fake_gemm)
+        monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "1")
+        g = torch.Generator().manual_seed(rows + n)
+        x = ComplexTensor(torch.randn(rows, n, generator=g), torch.randn(rows, n, generator=g))
+        drivers = {
+            "bf16": fc._fft_via_gemm_bf16,
+            "bf16_refined": fc._fft_iterative_refinement,
+            "ozaki": fc._fft_via_ozaki,
+            "ozaki_hq": fc._fft_via_ozaki_hq,
+        }
+        packed = drivers[precision](x, False)
+        assert seen and all(s == (shape, (shape[1], shape[1])) for s in seen)
+        monkeypatch.setenv("TRNFFT_GEMM_PACK", "0")
+        seen.clear()
+        plain = drivers[precision](x, False)
+        assert seen and all(s == ((rows, n), (n, n)) for s in seen)
+        assert torch.equal(packed.real.view(torch.int32), plain.real.view(torch.int32))
+        assert torch.equal(packed.imag.view(torch.int32), plain.imag.view(torch.int32))
+
     @pytest.mark.parametrize("inverse", [False, True])
     def test_packed_gemm_matches_numpy(self, monkeypatch, inverse):
         """The packed (rows/g, g*n) x block-diagonal W GEMM, run with a CPU
