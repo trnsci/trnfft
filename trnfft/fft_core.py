@@ -979,6 +979,43 @@ def _fft_host_fp64(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     return ComplexTensor(y.real.to(dtype=dt, device=dev), y.imag.to(dtype=dt, device=dev))
 
 
+def _dft_gemm_bf16(xr, xi, wr, wi, packed_w=None) -> ComplexTensor:
+    """``complex_gemm_bf16(x, W)`` for x (rows, n) and an (n, n) DFT-matrix
+    term W, with #99's row packing for n < 128 (trnfft#101 follow-up).
+
+    Every BF16 DFT-GEMM (``precision="bf16"``, ``"bf16_refined"``,
+    ``"ozaki"``, ``"ozaki_hq"``) goes through here. ``_complex_gemm_kernel_bf16``
+    transposes each (128, n) tile of x on the Tensor engine, so at n < 128 it
+    paid the per-tile cost #99 measured for the FP32 kernel. Packed, x is the
+    free view (rows/g, g*n) against g copies of W on the diagonal: g times
+    fewer tiles. BF16 products are exact in the FP32 PSUM and the extra terms
+    are exact zero products, so finite inputs give the same bits as unpacked.
+    (A non-finite input contaminates the other g-1 rows of its packed row, as
+    in the FP32 packing.) ``TRNFFT_GEMM_PACK=0`` or ``TRNFFT_PE_TRANSPOSE=0``
+    give the unpacked GEMM. ``packed_w(g)``, when given, returns the
+    block-diagonal W (e.g. a cached device copy); otherwise it is built here.
+    """
+    from .nki.dispatch import complex_gemm_bf16
+
+    rows, n = xr.shape
+    # Only batches that are a multiple of 128 rows are packed (this path does
+    # not pad). Packing other batches was slower than not packing on Trn2
+    # (BF16, same tensor, kernel only): (1000, 64) -> (500, 128) 0.47 ms
+    # against 0.26, (1000, 8) -> (125, 64) 0.45 against 0.26, (200, 16) ->
+    # (25, 128) 0.35 against 0.24; (1024, 8) -> (64, 128) was not.
+    g = _dft_gemm_pack(rows, n) if rows % 128 == 0 else 1
+    if g == 1:
+        return complex_gemm_bf16(ComplexTensor(xr, xi), ComplexTensor(wr, wi))
+    if packed_w is not None:
+        W = packed_w(g)
+    else:
+        W = ComplexTensor(torch.block_diag(*[wr] * g), torch.block_diag(*[wi] * g))
+    X = complex_gemm_bf16(
+        ComplexTensor(xr.reshape(rows // g, g * n), xi.reshape(rows // g, g * n)), W
+    )
+    return ComplexTensor(X.real.reshape(rows, n), X.imag.reshape(rows, n))
+
+
 def _fft_via_gemm_double(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     """FP64 DFT-GEMM: W @ x computed on CPU in float64.
 
@@ -1040,8 +1077,6 @@ def _fft_via_gemm_bf16(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     On CPU (no NKI): falls back to ``complex_matmul`` with BF16 inputs — same
     dtype semantics, no throughput benefit but identical correctness test path.
     """
-    from .nki.dispatch import complex_gemm_bf16
-
     n = x.shape[-1]
     orig_shape = x.real.shape
 
@@ -1052,12 +1087,20 @@ def _fft_via_gemm_bf16(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     x_re = x.real.reshape(-1, n).to(torch.bfloat16).contiguous()
     x_im = x.imag.reshape(-1, n).to(torch.bfloat16).contiguous()
 
-    # Quantize W to BF16 — this is the BF16 DFT-matrix approximation.
-    W_r, W_i = _dft_matrix_fp64(n, inverse)
-    W = ComplexTensor(W_r.bfloat16(), W_i.bfloat16())
+    # Quantize W to BF16 — this is the BF16 DFT-matrix approximation. Cached
+    # on x's device, as the FP32 path does (trnfft#82): the same values as
+    # rounding the FP64 matrix on every call, without the rebuild and copy.
+    dev = x_re.device
+    W = _dft_matrix_cached(n, inverse, torch.bfloat16, dev)
 
     # complex_gemm_bf16 returns FP32 (PSUM not rounded to BF16).
-    X_2d = complex_gemm_bf16(ComplexTensor(x_re, x_im), W)
+    X_2d = _dft_gemm_bf16(
+        x_re,
+        x_im,
+        W.real,
+        W.imag,
+        lambda g: _dft_matrix_blockdiag_cached(n, g, inverse, torch.bfloat16, dev),
+    )
     X_re = X_2d.real.reshape(orig_shape)
     X_im = X_2d.imag.reshape(orig_shape)
     result = ComplexTensor(X_re, X_im)
@@ -1182,9 +1225,7 @@ def _fft_via_ozaki(x: ComplexTensor, inverse: bool) -> ComplexTensor:
         # Build a fake ComplexTensor carrying BF16 split parts, then call
         # _fft_via_gemm_bf16's kernel directly.  We replicate just the matmul
         # portion (no angle recomputation) via complex_gemm_bf16.
-        from .nki.dispatch import complex_gemm_bf16
-
-        return complex_gemm_bf16(ComplexTensor(xr, xi), ComplexTensor(wr, wi))
+        return _dft_gemm_bf16(xr, xi, wr, wi)
 
     # Three cross-terms: hh + hl + lh  (ll is O(u_bf16^4), omitted).
     # Data-dependency trick: add 0 * hh.mean() to the next term's inputs.
@@ -1261,9 +1302,7 @@ def _fft_via_ozaki_hq(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     x_i_h1, x_i_h2, x_i_h3 = _ozaki_split_3way_bf16(x_im_fp32)
 
     def _term(xr, xi, wr, wi) -> ComplexTensor:
-        from .nki.dispatch import complex_gemm_bf16
-
-        return complex_gemm_bf16(ComplexTensor(xr, xi), ComplexTensor(wr, wi))
+        return _dft_gemm_bf16(xr, xi, wr, wi)
 
     # Six terms with sequential data-dependencies to force XLA graph execution.
     # Triangular term set: keep W_a@x_b for level(a) + level(b) <= 2 (0-based).
@@ -1841,7 +1880,8 @@ def _cooley_tukey_nki_nograd(
     # Float64 past the FP64 GEMM check: every kernel below is FP32-only, and
     # float64 operands came back non-finite on Trn2 (#108), at every measured N
     # for a float64 caller (the DFT-GEMM path at N = 256 included) and for every
-    # "double" Bluestein (which promotes to float64) at N > 512. "double" is the accuracy-first mode, so it computes
+    # "double" Bluestein (which promotes to float64) at N > 512. "double" is the accuracy-
+    # first mode, so it computes
     # these on the host in FP64. Other modes run the kernels in FP32 and return
     # float64, as the FP32 GEMM paths already do for float64 input.
     if x.real.dtype == torch.float64:

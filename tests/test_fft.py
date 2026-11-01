@@ -1837,6 +1837,73 @@ class TestPETransposeSelection:
         monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "0")
         assert fc._dft_gemm_pack(rows, n) == 1
 
+    # (rows, n, BF16 GEMM shape when packing is on). 1000 rows is not a multiple
+    # of 128, so the BF16 GEMMs stay unpacked there (the routing rule); the
+    # FP32 GEMM of bf16_refined pads to 1024 rows and does pack.
+    @pytest.mark.parametrize("precision", ["bf16", "bf16_refined", "ozaki", "ozaki_hq"])
+    @pytest.mark.parametrize(
+        "rows,n,shape", [(1000, 8, (1000, 8)), (256, 16, (32, 128)), (1024, 64, (512, 128))]
+    )
+    def test_packed_bf16_gemm_routing(self, monkeypatch, precision, rows, n, shape):
+        """The BF16 DFT-GEMMs pack rows for n < 128 (trnfft#101 follow-up).
+
+        Checks the GEMM shapes each driver launches with packing on and off,
+        and that both results agree to FP32 rounding and match FP64. The
+        GEMMs are CPU stand-ins (FP64 matmul, FP32 out) whose BLAS rounding
+        depends on the call shape (AVX2 OpenBLAS, see trnfft#101), so packed
+        and unpacked are not bit-identical here by construction. The bitwise
+        check is on device: ``test_tail_tiles.py::test_bf16_packed_same_bits``.
+        """
+        from trnfft import fft_core as fc
+        from trnfft.nki import dispatch
+
+        seen = []
+
+        def stand_in(kind):
+            def gemm(a, b):
+                seen.append((kind, tuple(a.real.shape), tuple(b.real.shape)))
+                ar, ai, br, bi = (t.double() for t in (a.real, a.imag, b.real, b.imag))
+                return ComplexTensor((ar @ br - ai @ bi).float(), (ar @ bi + ai @ br).float())
+
+            return gemm
+
+        monkeypatch.setattr(fc, "_use_nki", lambda: True)
+        monkeypatch.setattr(dispatch, "complex_gemm_bf16", stand_in("bf16"))
+        monkeypatch.setattr(dispatch, "complex_gemm", stand_in("fp32"))
+        monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "1")
+        g = torch.Generator().manual_seed(rows + n)
+        x = ComplexTensor(torch.randn(rows, n, generator=g), torch.randn(rows, n, generator=g))
+        drivers = {
+            "bf16": fc._fft_via_gemm_bf16,
+            "bf16_refined": fc._fft_iterative_refinement,
+            "ozaki": fc._fft_via_ozaki,
+            "ozaki_hq": fc._fft_via_ozaki_hq,
+        }
+
+        def bf16_shapes():
+            return [(a, b) for kind, a, b in seen if kind == "bf16"]
+
+        packed = drivers[precision](x, False)
+        assert bf16_shapes() and all(s == (shape, (shape[1], shape[1])) for s in bf16_shapes())
+        monkeypatch.setenv("TRNFFT_GEMM_PACK", "0")
+        seen.clear()
+        plain = drivers[precision](x, False)
+        assert bf16_shapes() and all(s == ((rows, n), (n, n)) for s in bf16_shapes())
+
+        def c128(t):
+            return torch.complex(t.real.double(), t.imag.double())
+
+        def rel(a, b):
+            return (torch.linalg.vector_norm(a - b) / torch.linalg.vector_norm(b)).item()
+
+        ref = torch.fft.fft(c128(x))
+        # Same sums in a different BLAS order: FP32 output rounding only.
+        assert rel(c128(packed), c128(plain)) < 1e-6
+        # Stated accuracy of each mode (fft_core docstrings), with margin.
+        tol = {"bf16": 3e-3, "bf16_refined": 1e-5, "ozaki": 1e-5, "ozaki_hq": 1e-6}[precision]
+        assert rel(c128(packed), ref) < tol
+        assert rel(c128(plain), ref) < tol
+
     @pytest.mark.parametrize("inverse", [False, True])
     def test_packed_gemm_matches_numpy(self, monkeypatch, inverse):
         """The packed (rows/g, g*n) x block-diagonal W GEMM, run with a CPU
@@ -1909,3 +1976,32 @@ class TestFloat64OnKernelPath:
         else:
             assert fake_kernels == [torch.float32]
             assert err < 1e-5
+
+
+class TestIrfftLength:
+    """irfft/hfft use the first n//2 + 1 bins, zero-padded when shorter, like
+    torch.fft (#104). Only n = 2(L-1) and n = 2L-1 were right before."""
+
+    @pytest.mark.parametrize("n", [None, 1, 2, 20, 31, 32, 33, 62, 63, 64, 65, 100])
+    @pytest.mark.parametrize("name", ["irfft", "hfft"])
+    def test_matches_torch(self, name, n):
+        g = torch.Generator().manual_seed(0)
+        X = torch.complex(torch.randn(3, 33, generator=g), torch.randn(3, 33, generator=g))
+        got = getattr(trnfft, name)(ComplexTensor(X.real, X.imag), n=n)
+        want = getattr(torch.fft, name)(X, n=n)
+        assert got.shape == want.shape
+        np.testing.assert_allclose(
+            got.numpy(), want.numpy(), atol=2e-4 * max(1.0, want.abs().max().item())
+        )
+
+    @pytest.mark.parametrize(
+        "s,dim", [((6,), (0,)), ((16,), (-1,)), ((8, 4), None), ((20, 10), None)]
+    )
+    def test_irfftn_s(self, s, dim):
+        g = torch.Generator().manual_seed(1)
+        shape = (3, 16, 5) if dim != (0,) else (2, 16, 8)
+        X = torch.complex(torch.randn(*shape, generator=g), torch.randn(*shape, generator=g))
+        got = trnfft.irfftn(ComplexTensor(X.real, X.imag), s=s, dim=dim if dim else (-2, -1))
+        want = torch.fft.irfftn(X, s=s, dim=dim if dim else (-2, -1))
+        assert got.shape == want.shape
+        np.testing.assert_allclose(got.numpy(), want.numpy(), atol=1e-4)

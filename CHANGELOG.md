@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`irfft` / `hfft` / `irfft2` / `irfftn` gave wrong values for most `n`**
+  (silent). Affects **every release through 0.25.0**, on every backend. The
+  inverse used all input bins instead of the first `n // 2 + 1` (truncated or
+  zero-padded, as `torch.fft` does), so only `n = 2(L-1)` (the default) and
+  `n = 2L-1` were right: e.g. `L = 33, n = 62/63` was 3–6 % off, `n = 33`
+  78 %, and `n = 20, 32, 100` raised. Also the last axis of `irfft2` /
+  `irfftn` with `s=` (#104).
 - **Float64 FFTs on the NKI path returned non-finite values** (silent).
   Measured on **0.25.0** on Trn2 (earlier releases not measured), with
   `set_backend("nki")` or `"auto"` on Neuron hardware, for host and device
