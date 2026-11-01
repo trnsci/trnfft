@@ -318,10 +318,13 @@ def stft(
 
     if center:
         pad_amount = n_fft // 2
-        # torch.nn.functional.pad with reflect needs 2D+ input
-        input = input.unsqueeze(0) if input.dim() == 1 else input
+        # torch.nn.functional.pad with reflect needs 2D+ input. Squeeze only
+        # the dim added here: a caller's (1, L) batch must stay (1, F, T),
+        # as torch.stft returns (#114).
+        was_1d = input.dim() == 1
+        input = input.unsqueeze(0) if was_1d else input
         input = torch.nn.functional.pad(input, (pad_amount, pad_amount), mode=pad_mode)
-        input = input.squeeze(0) if input.dim() == 2 and input.shape[0] == 1 else input
+        input = input.squeeze(0) if was_1d else input
 
     # Frame the signal. torch.Tensor.unfold is a view op that is not
     # implemented on the XLA backend (torch-xla 2.9 / torch-neuronx), so we

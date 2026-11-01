@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`stft` dropped the batch dim of a `(1, L)` input** (silent shape
+  change). Affects **every release (0.1.0–0.26.0)**, on every backend, with
+  `center=True` (the default). The reflect-pad path squeezed any leading
+  size-1 dim, so `(1, L)` gave `(F, T)` instead of `(1, F, T)` as
+  `torch.stft` returns, and `istft` of it gave `(L,)`. 1-D, batch > 1 and
+  `center=False` callers are unchanged (#114).
+
 ## [0.26.0] - 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
