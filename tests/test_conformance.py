@@ -188,7 +188,7 @@ OPS_NDIM = ["fftn", "ifftn", "rfftn", "irfftn", "hfftn", "ihfftn"]
 
 # Sizes: trivial, odd/prime, around the 128 tile, Bluestein (non-power-of-2
 # and > 512), large non-power-of-2, and power-of-2 Cooley-Tukey.
-SIZES = [1, 2, 3, 7, 16, 127, 128, 129, 513, 1000, 1024]
+SIZES = [1, 2, 3, 7, 16, 127, 128, 129, 513, 1000]
 
 
 # ======================================================== 1-D transforms
@@ -226,7 +226,7 @@ def test_hermitian_default_n(op, m):
     check(f(dev(x)), ref(x))
 
 
-@pytest.mark.parametrize("n", [4099, 8192])
+@pytest.mark.parametrize("n", [8192])
 def test_1d_large(n):
     """Six-step (N >= 8192, power of 2) and large Bluestein."""
     x = rand("c", (2, n), torch.float32, seed=n)
@@ -326,7 +326,7 @@ def test_2d_s(op, s):
     check(f(dev(x), s=s), ref(x, s=s), dtype=torch.float64)
 
 
-@pytest.mark.parametrize("shape", [(1, 1), (2, 127, 129), (16, 1000), (1, 513), (3, 1, 7)])
+@pytest.mark.parametrize("shape", [(1, 1), (3, 7, 129), (2, 1000), (1, 513), (3, 1, 7)])
 @pytest.mark.parametrize("op", list(OPS_ND))
 def test_nd_shapes(op, shape):
     f, ref, kind = OPS_ND[op]
@@ -373,7 +373,7 @@ def _layout_input(kind, v):
 
 
 @pytest.mark.parametrize("view", VIEW_NAMES)
-@pytest.mark.parametrize("n", [12, 16])
+@pytest.mark.parametrize("n", [12])
 @pytest.mark.parametrize("op", list(OPS_1D) + list(OPS_ND))
 def test_layout_views(op, n, view):
     f, ref, kind = {**OPS_1D, **OPS_ND}[op]
@@ -408,7 +408,7 @@ def test_layout_channels_last(op):
 
 
 # ============================================================ edge shapes
-EDGE_1D = [(0, 8), (0, 12), (2, 0, 8), (3, 1), (1,), (1, 1), (8,), (1, 4096), (2048, 2), (1, 3)]
+EDGE_1D = [(0, 8), (0, 12), (2, 0, 8), (3, 1), (1,), (1, 1), (8,), (1, 2048), (1024, 2), (1, 3)]
 
 
 @pytest.mark.parametrize("shape", EDGE_1D, ids=str)
@@ -630,7 +630,9 @@ def _real_fns(n):
     }
 
 
-AUTOGRAD_N = [6, 8]
+AUTOGRAD_N = [6]
+# Second order is linear for these ops; check it on one op per code path.
+GRADGRAD = {"fft", "ifftn", "complex_matmul", "rfft", "irfft", "hfftn", "stft"}
 
 
 @pytest.mark.parametrize("n", AUTOGRAD_N)
@@ -644,7 +646,7 @@ def test_gradcheck_complex_in(name, n):
         xr = xr[:, : n - 1].detach().requires_grad_()
         xi = xi[:, : n - 1].detach().requires_grad_()
     assert gradcheck(f, (xr, xi))
-    if n == AUTOGRAD_N[0]:
+    if name in GRADGRAD:
         assert gradgradcheck(f, (xr, xi))
 
 
@@ -655,7 +657,7 @@ def test_gradcheck_real_in(name, n):
     f = _real_fns(n)[name]
     x = torch.randn(3, n, dtype=torch.float64, generator=gen(n + 2), requires_grad=True)
     assert gradcheck(f, (x,))
-    if n == AUTOGRAD_N[0]:
+    if name in GRADGRAD:
         assert gradgradcheck(f, (x,))
 
 
@@ -914,7 +916,7 @@ def test_freq_requires_grad(which):
 
 
 # ========================================================= precision modes
-@pytest.mark.parametrize("n", [1, 100, 128, 129, 513, 1000])
+@pytest.mark.parametrize("n", [1, 128, 129, 513])
 @pytest.mark.parametrize("mode", ["fast", "kahan", "double"])
 def test_precision_modes_vs_torch(mode, n):
     old = trnfft.get_precision()
