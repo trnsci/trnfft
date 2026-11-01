@@ -54,4 +54,12 @@ jobs:
       - name: Run simulator-backed kernel tests
         env:
           TRNFFT_USE_SIMULATOR: "1"
-        run: pytest tests/ -v -m nki_simulator --tb=short
+        run: pytest tests/ -v -m nki_simulator --tb=short --cov=trnfft --cov-report=xml
+      # The NKI kernel bodies only run here (they trace under nki.simulate),
+      # so report this job's coverage too; Codecov merges the uploads.
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: trnsci/trnfft
+          flags: nki-simulator

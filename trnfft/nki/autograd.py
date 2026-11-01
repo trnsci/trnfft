@@ -181,16 +181,15 @@ class _ComplexLinearFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x_real, x_imag, w_real, w_imag):
-        from .dispatch import _complex_linear_kernel, _launch, _simulate_kernel, _use_simulator
+        from . import dispatch
+        from .dispatch import _launch, _simulate_kernel, _use_simulator
 
+        kernel_name, op_name = dispatch._linear_kernel_names()
+        kernel = getattr(dispatch, kernel_name)
         if _use_simulator():
-            y_real, y_imag = _simulate_kernel(
-                _complex_linear_kernel, x_real, x_imag, w_real, w_imag
-            )
+            y_real, y_imag = _simulate_kernel(kernel, x_real, x_imag, w_real, w_imag)
         else:
-            y_real, y_imag = _launch(
-                _complex_linear_kernel, "complex_linear", x_real, x_imag, w_real, w_imag
-            )
+            y_real, y_imag = _launch(kernel, op_name, x_real, x_imag, w_real, w_imag)
         ctx.save_for_backward(x_real, x_imag, w_real, w_imag)
         return y_real, y_imag
 
@@ -200,10 +199,11 @@ class _ComplexLinearFn(torch.autograd.Function):
 
 
 def complex_linear_autograd(x_real, x_imag, w_real, w_imag):
-    if _native_op("complex_linear") is not None:
-        return _launch_native(
-            "_complex_linear_kernel", "complex_linear", x_real, x_imag, w_real, w_imag
-        )
+    from .dispatch import _linear_kernel_names
+
+    kernel_name, op_name = _linear_kernel_names()
+    if _native_op(op_name) is not None:
+        return _launch_native(kernel_name, op_name, x_real, x_imag, w_real, w_imag)
     return _ComplexLinearFn.apply(x_real, x_imag, w_real, w_imag)
 
 

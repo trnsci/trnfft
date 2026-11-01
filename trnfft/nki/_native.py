@@ -129,6 +129,20 @@ def complex_gemm_bf16(
 
 
 @nki_op(
+    "trnfft::complex_gemm_bf16_t2d",
+    mutates_args={},
+    fake_fn=lambda a_real, a_imag, b_real, b_imag: _fake_pair(
+        (a_real.shape[0], b_real.shape[1]), torch.float32, a_real
+    ),
+)
+def complex_gemm_bf16_t2d(
+    a_real: torch.Tensor, a_imag: torch.Tensor, b_real: torch.Tensor, b_imag: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # TRNFFT_PE_TRANSPOSE=0: the load_transpose2d BF16 GEMM (trnfft#100).
+    return _d._complex_gemm_bf16_t2d_kernel(a_real, a_imag, b_real, b_imag)
+
+
+@nki_op(
     "trnfft::complex_linear",
     mutates_args={},
     fake_fn=lambda x_real, x_imag, w_real, w_imag: _fake_pair(
@@ -139,6 +153,20 @@ def complex_linear(
     x_real: torch.Tensor, x_imag: torch.Tensor, w_real: torch.Tensor, w_imag: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _d._complex_linear_kernel(x_real, x_imag, w_real, w_imag)
+
+
+@nki_op(
+    "trnfft::complex_linear_t2d",
+    mutates_args={},
+    fake_fn=lambda x_real, x_imag, w_real, w_imag: _fake_pair(
+        (x_real.shape[0], w_real.shape[0]), x_real.dtype, x_real
+    ),
+)
+def complex_linear_t2d(
+    x_real: torch.Tensor, x_imag: torch.Tensor, w_real: torch.Tensor, w_imag: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # TRNFFT_PE_TRANSPOSE=0: the load_transpose2d complex linear (trnfft#100).
+    return _d._complex_linear_t2d_kernel(x_real, x_imag, w_real, w_imag)
 
 
 @nki_op(
@@ -155,6 +183,7 @@ def complex_mul(
 _register_backward(complex_gemm, _ag.complex_gemm_backward)
 _register_backward(complex_gemm_t2d, _ag.complex_gemm_backward)
 _register_backward(complex_linear, _ag.complex_linear_backward)
+_register_backward(complex_linear_t2d, _ag.complex_linear_backward)
 _register_backward(complex_mul, _ag.complex_mul_backward)
 
 
@@ -293,9 +322,11 @@ fft.register_autograd(_fft_backward, setup_context=_fft_setup_context)
 OPS = {
     "complex_gemm": complex_gemm,
     "complex_gemm_bf16": complex_gemm_bf16,
+    "complex_gemm_bf16_t2d": complex_gemm_bf16_t2d,
     "complex_gemm_tn": complex_gemm_tn,
     "complex_gemm_t2d": complex_gemm_t2d,
     "complex_linear": complex_linear,
+    "complex_linear_t2d": complex_linear_t2d,
     "complex_mul": complex_mul,
     "butterfly_stage": butterfly_stage,
     "butterfly_stage_kahan": butterfly_stage_kahan,

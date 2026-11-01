@@ -166,6 +166,48 @@ _CASES = {
         "_complex_linear_kernel",
         lambda: ((_f32(128, 128), _f32(128, 128), _f32(128, 128), _f32(128, 128)), {}),
     ),
+    # trnfft#100: tail tiles in M, K and N, and the load_transpose2d versions
+    # of the BF16 GEMM and the complex linear kernel.
+    "complex-gemm-tails": (
+        "dispatch",
+        "_complex_gemm_kernel",
+        lambda: ((_f32(200, 200), _f32(200, 200), _f32(200, 600), _f32(200, 600)), {}),
+    ),
+    "complex-gemm-b1000": (
+        "dispatch",
+        "_complex_gemm_kernel",
+        lambda: ((_f32(1000, 64), _f32(1000, 64), _f32(64, 64), _f32(64, 64)), {}),
+    ),
+    "complex-gemm-t2d-tails": (
+        "dispatch",
+        "_complex_gemm_t2d_kernel",
+        lambda: ((_f32(200, 200), _f32(200, 200), _f32(200, 600), _f32(200, 600)), {}),
+    ),
+    "complex-gemm-bf16-tails": (
+        "dispatch",
+        "_complex_gemm_kernel_bf16",
+        lambda: ((_bf16(1000, 200), _bf16(1000, 200), _bf16(200, 600), _bf16(200, 600)), {}),
+    ),
+    "complex-gemm-bf16-t2d-tails": (
+        "dispatch",
+        "_complex_gemm_bf16_t2d_kernel",
+        lambda: ((_bf16(1000, 200), _bf16(1000, 200), _bf16(200, 600), _bf16(200, 600)), {}),
+    ),
+    "complex-linear-tails": (
+        "dispatch",
+        "_complex_linear_kernel",
+        lambda: ((_f32(129, 200), _f32(129, 200), _f32(600, 200), _f32(600, 200)), {}),
+    ),
+    "complex-linear-t2d-tails": (
+        "dispatch",
+        "_complex_linear_t2d_kernel",
+        lambda: ((_f32(129, 200), _f32(129, 200), _f32(600, 200), _f32(600, 200)), {}),
+    ),
+    "complex-mul-free-tail": (
+        "dispatch",
+        "_complex_mul_kernel",
+        lambda: ((_f32(128, 600), _f32(128, 600), _f32(128, 600), _f32(128, 600)), {}),
+    ),
     "complex-mul": (
         "dispatch",
         "_complex_mul_kernel",

@@ -13,6 +13,12 @@ path is the single DFT-GEMM) for each ``B:N`` case in four input modes:
 
 under ``TRNFFT_PE_TRANSPOSE=0`` (``load_transpose2d`` kernels) and ``=1``
 (plain load + Tensor-engine transpose), in rounds 0,1,1,0 in one process.
+``--op bf16`` times ``precision="bf16"`` (the BF16 DFT-GEMM) instead, and
+``--op linear`` an ``nn.ComplexLinear(N, N)`` on (B, N) activations, and
+``--op gemm_bf16`` ``complex_gemm_bf16`` of (B, N) BF16 inputs against a
+fixed (N, N) BF16 matrix (trnfft#100). The ``bf16`` FFT casts its input to
+BF16 on every call, so its input address is the allocator's choice in every
+mode; ``gemm_bf16`` controls it.
 Each call is synchronised and timed on its own; the figure is the median
 call. Prints one line per case and mode:
 
@@ -41,6 +47,7 @@ def main():
     ap.add_argument("--inverse", action="store_true")
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--knobs", default="0,1,1,0", help="TRNFFT_PE_TRANSPOSE per round")
+    ap.add_argument("--op", default="fft", choices=["fft", "bf16", "linear", "gemm_bf16"])
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
 
@@ -62,12 +69,42 @@ def main():
     pool = 8
     for case in args.cases.split(","):
         B, N = map(int, case.split(":"))
+        if args.op == "linear":
+            from trnfft.nn import ComplexLinear
+
+            torch.manual_seed(N)
+            layer = ComplexLinear(N, N, bias=False).to(dev)
+
+            def op(x, layer=layer):
+                with torch.no_grad():
+                    return layer(x)
+
+        elif args.op == "gemm_bf16":
+            from trnfft.nki.dispatch import complex_gemm_bf16
+
+            gw = torch.Generator().manual_seed(N)
+            w = ComplexTensor(
+                torch.randn(N, N, generator=gw).bfloat16().to(dev),
+                torch.randn(N, N, generator=gw).bfloat16().to(dev),
+            )
+
+            def op(x, w=w):
+                return complex_gemm_bf16(x, w)
+
+        else:
+            prec = "bf16" if args.op == "bf16" else None
+
+            def op(x, prec=prec):
+                return fft_core(x, inverse=args.inverse, precision=prec)
+
         g = torch.Generator().manual_seed(7919 * N + B)
         host = [
             (torch.randn(B, N, generator=g), torch.randn(B, N, generator=g)) for _ in range(pool)
         ]
         if B == 1:
             host = [(r[0], i[0]) for r, i in host]
+        if args.op == "gemm_bf16":
+            host = [(r.bfloat16(), i.bfloat16()) for r, i in host]
         devs = [ComplexTensor(r.to(dev), i.to(dev)) for r, i in host]
         hosts = [ComplexTensor(r, i) for r, i in host]
         sync()
@@ -88,15 +125,15 @@ def main():
                 os.environ["TRNFFT_PE_TRANSPOSE"] = knob
                 # Warm: compile, and put the mode's addresses through once.
                 for k in range(pool if mode in ("fresh", "host") else 2):
-                    y = fft_core(inputs(mode, k), inverse=args.inverse)
+                    y = op(inputs(mode, k))
                 sync()
                 for k in range(args.calls):
                     x = inputs(mode, k)
                     t = time.perf_counter()
-                    y = fft_core(x, inverse=args.inverse)
+                    y = op(x)
                     sync()
                     times[knob].append((time.perf_counter() - t) * 1e3)
-                outs[knob] = fft_core(inputs(mode, 0), inverse=args.inverse)
+                outs[knob] = op(inputs(mode, 0))
                 sync()
                 del y
             equal = None
@@ -110,7 +147,8 @@ def main():
                 return f"{statistics.median(times[k]):.3f}" if times[k] else "-"
 
             print(
-                f"RESULT B={B} N={N} mode={mode} t2d_ms={med('0')} pe_ms={med('1')} equal={equal}",
+                f"RESULT op={args.op} B={B} N={N} mode={mode} "
+                f"t2d_ms={med('0')} pe_ms={med('1')} equal={equal}",
                 flush=True,
             )
         del devs, hosts, host
