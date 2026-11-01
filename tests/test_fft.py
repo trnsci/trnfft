@@ -1833,26 +1833,39 @@ class TestPETransposeSelection:
         monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "0")
         assert fc._dft_gemm_pack(rows, n) == 1
 
+    # (rows, n, BF16 GEMM shape when packing is on). 1000 rows is not a multiple
+    # of 128, so the BF16 GEMMs stay unpacked there (the routing rule); the
+    # FP32 GEMM of bf16_refined pads to 1024 rows and does pack.
     @pytest.mark.parametrize("precision", ["bf16", "bf16_refined", "ozaki", "ozaki_hq"])
     @pytest.mark.parametrize(
         "rows,n,shape", [(1000, 8, (1000, 8)), (256, 16, (32, 128)), (1024, 64, (512, 128))]
     )
-    def test_packed_bf16_gemm_same_bits(self, monkeypatch, precision, rows, n, shape):
+    def test_packed_bf16_gemm_routing(self, monkeypatch, precision, rows, n, shape):
         """The BF16 DFT-GEMMs pack rows for n < 128 (trnfft#101 follow-up).
-        With an FP64 stand-in for ``complex_gemm_bf16`` (exact BF16 products,
-        like the FP32 PSUM) packed and unpacked give the same bits."""
+
+        Checks the GEMM shapes each driver launches with packing on and off,
+        and that both results agree to FP32 rounding and match FP64. The
+        GEMMs are CPU stand-ins (FP64 matmul, FP32 out) whose BLAS rounding
+        depends on the call shape (AVX2 OpenBLAS, see trnfft#101), so packed
+        and unpacked are not bit-identical here by construction. The bitwise
+        check is on device: ``test_tail_tiles.py::test_bf16_packed_same_bits``.
+        """
         from trnfft import fft_core as fc
         from trnfft.nki import dispatch
 
         seen = []
 
-        def fake_gemm(a, b):
-            seen.append((tuple(a.real.shape), tuple(b.real.shape)))
-            ar, ai, br, bi = (t.double() for t in (a.real, a.imag, b.real, b.imag))
-            return ComplexTensor((ar @ br - ai @ bi).float(), (ar @ bi + ai @ br).float())
+        def stand_in(kind):
+            def gemm(a, b):
+                seen.append((kind, tuple(a.real.shape), tuple(b.real.shape)))
+                ar, ai, br, bi = (t.double() for t in (a.real, a.imag, b.real, b.imag))
+                return ComplexTensor((ar @ br - ai @ bi).float(), (ar @ bi + ai @ br).float())
+
+            return gemm
 
         monkeypatch.setattr(fc, "_use_nki", lambda: True)
-        monkeypatch.setattr(dispatch, "complex_gemm_bf16", fake_gemm)
+        monkeypatch.setattr(dispatch, "complex_gemm_bf16", stand_in("bf16"))
+        monkeypatch.setattr(dispatch, "complex_gemm", stand_in("fp32"))
         monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "1")
         g = torch.Generator().manual_seed(rows + n)
         x = ComplexTensor(torch.randn(rows, n, generator=g), torch.randn(rows, n, generator=g))
@@ -1862,14 +1875,30 @@ class TestPETransposeSelection:
             "ozaki": fc._fft_via_ozaki,
             "ozaki_hq": fc._fft_via_ozaki_hq,
         }
+
+        def bf16_shapes():
+            return [(a, b) for kind, a, b in seen if kind == "bf16"]
+
         packed = drivers[precision](x, False)
-        assert seen and all(s == (shape, (shape[1], shape[1])) for s in seen)
+        assert bf16_shapes() and all(s == (shape, (shape[1], shape[1])) for s in bf16_shapes())
         monkeypatch.setenv("TRNFFT_GEMM_PACK", "0")
         seen.clear()
         plain = drivers[precision](x, False)
-        assert seen and all(s == ((rows, n), (n, n)) for s in seen)
-        assert torch.equal(packed.real.view(torch.int32), plain.real.view(torch.int32))
-        assert torch.equal(packed.imag.view(torch.int32), plain.imag.view(torch.int32))
+        assert bf16_shapes() and all(s == ((rows, n), (n, n)) for s in bf16_shapes())
+
+        def c128(t):
+            return torch.complex(t.real.double(), t.imag.double())
+
+        def rel(a, b):
+            return (torch.linalg.vector_norm(a - b) / torch.linalg.vector_norm(b)).item()
+
+        ref = torch.fft.fft(c128(x))
+        # Same sums in a different BLAS order: FP32 output rounding only.
+        assert rel(c128(packed), c128(plain)) < 1e-6
+        # Stated accuracy of each mode (fft_core docstrings), with margin.
+        tol = {"bf16": 3e-3, "bf16_refined": 1e-5, "ozaki": 1e-5, "ozaki_hq": 1e-6}[precision]
+        assert rel(c128(packed), ref) < tol
+        assert rel(c128(plain), ref) < tol
 
     @pytest.mark.parametrize("inverse", [False, True])
     def test_packed_gemm_matches_numpy(self, monkeypatch, inverse):
