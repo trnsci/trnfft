@@ -338,8 +338,17 @@ class TestBF16GEMMSimulator:
 
 class TestComplexGemmTNSimulator:
     """_complex_gemm_tn_kernel (trnfft#97) under nki.simulate: stacked blocks
-    given transposed give the same bits as _complex_gemm_kernel on the
-    stacked untransposed blocks."""
+    given transposed give the same bits as _complex_gemm_kernel on each
+    untransposed block, and match FP64.
+
+    The reference runs one GEMM per block, so both kernels use the same
+    (min(M, 128), K) stationary tiles. On one stacked (G*M, K) GEMM, M < 128
+    gives 128-row tiles where the TN kernel has M-row ones. The simulator does
+    each matmul as one numpy (BLAS) call, and on AVX2 OpenBLAS kernels
+    (Haswell, Zen: the CI runners) its rounding depends on that tile shape, so
+    (2, 32, 64, 32) differed in the last bit there (trnfft#100). On device the
+    six-step pass is bitwise-equal to the transposed one
+    (TestSixStepPass1TNNeuron)."""
 
     @pytest.mark.parametrize("g,k,m,n", [(3, 64, 128, 64), (2, 32, 64, 32), (1, 256, 256, 1024)])
     def test_matches_gemm_kernel_bitwise(self, g, k, m, n):
@@ -353,11 +362,18 @@ class TestComplexGemmTNSimulator:
         at_r, at_i = torch.randn(g * k, m, generator=gen), torch.randn(g * k, m, generator=gen)
         b_r, b_i = torch.randn(k, n, generator=gen), torch.randn(k, n, generator=gen)
         c_r, c_i = _simulate_kernel(_complex_gemm_tn_kernel, at_r, at_i, b_r, b_i)
-        a_r = at_r.reshape(g, k, m).transpose(1, 2).reshape(g * m, k).contiguous()
-        a_i = at_i.reshape(g, k, m).transpose(1, 2).reshape(g * m, k).contiguous()
-        w_r, w_i = _simulate_kernel(_complex_gemm_kernel, a_r, a_i, b_r, b_i)
         assert c_r.shape == (g * m, n)
+        a_r = at_r.reshape(g, k, m).transpose(1, 2).contiguous()
+        a_i = at_i.reshape(g, k, m).transpose(1, 2).contiguous()
+        blocks = [
+            _simulate_kernel(_complex_gemm_kernel, a_r[j], a_i[j], b_r, b_i) for j in range(g)
+        ]
+        w_r = torch.cat([w for w, _ in blocks])
+        w_i = torch.cat([w for _, w in blocks])
         assert torch.equal(c_r, w_r) and torch.equal(c_i, w_i)
+        ref = torch.complex(a_r.double(), a_i.double()) @ torch.complex(b_r.double(), b_i.double())
+        got = torch.complex(c_r.double(), c_i.double()).reshape(g, m, n)
+        assert ((got - ref).abs().max() / ref.abs().max()).item() < 1e-6
 
 
 class TestPETransposeSimulator:
