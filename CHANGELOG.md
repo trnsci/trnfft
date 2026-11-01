@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
   traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
 - README: known platform issue note for #1454.
+### Fixed
+
+- **Integer inputs gave wrong FFTs** (silent). Affects **every release
+  (0.1.0–0.26.0)**, on every backend. `fft` / `ifft` / `rfft` / `ihfft` /
+  `fft2` / `fftn` / `rfft2` / `rfftn` (and `irfft` / `irfftn` on an integer
+  `ComplexTensor`) computed in the integer dtype. Power-of-2 lengths
+  truncated each butterfly and returned an integer tensor (40–60 % off);
+  Bluestein lengths cast the chirp to 0/±1 (~100 % off). Integer and bool
+  inputs are now promoted to the default float dtype, as `torch.fft` does
+  (#113).
 
 ## [0.26.0] - 2026-11-01
 

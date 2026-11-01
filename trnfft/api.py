@@ -37,6 +37,7 @@ def ifft(input: torch.Tensor | ComplexTensor, n: int | None = None) -> ComplexTe
 
 def rfft(input: torch.Tensor, n: int | None = None) -> ComplexTensor:
     """1-D FFT of real signal, returning positive frequencies only."""
+    input = _promote_real(input)
     if n is not None:
         input = _resize_real(input, n)
     n = input.shape[-1]
@@ -48,6 +49,7 @@ def rfft(input: torch.Tensor, n: int | None = None) -> ComplexTensor:
 
 def irfft(input: ComplexTensor, n: int | None = None) -> torch.Tensor:
     """Inverse FFT of Hermitian-symmetric spectrum, returning real signal."""
+    input = _to_complex(input)
     if n is None:
         n = 2 * (input.shape[-1] - 1)
 
@@ -200,6 +202,7 @@ def rfftn(
     if ``s`` is None).
     """
     assert not torch.is_complex(input), "rfftn requires real input"
+    input = _promote_real(input)
     ndim = input.dim()
 
     if dim is None:
@@ -258,6 +261,7 @@ def irfftn(
     The last dim in ``dim`` is Hermitian-reconstructed to full length. If
     ``s`` is None, its size defaults to ``2 * (input.shape[last_dim] - 1)``.
     """
+    input = _to_complex(input)
     ndim = input.real.dim()
 
     if dim is None:
@@ -499,10 +503,24 @@ def istft(
 # --- Helpers ---
 
 
+def _promote_real(x: torch.Tensor) -> torch.Tensor:
+    """Promote integer / bool tensors to the default float dtype, as torch.fft does.
+
+    The FFT kernels work in the input dtype; an integer input truncated every
+    butterfly (power-of-2 N) or every chirp twiddle (Bluestein), giving
+    silently wrong values (#113).
+    """
+    if x.is_floating_point() or x.is_complex():
+        return x
+    return x.to(torch.get_default_dtype())
+
+
 def _to_complex(x) -> ComplexTensor:
     if isinstance(x, ComplexTensor):
-        return x
-    return ComplexTensor(x)
+        if x.real.is_floating_point():
+            return x
+        return ComplexTensor(_promote_real(x.real), _promote_real(x.imag))
+    return ComplexTensor(_promote_real(x))
 
 
 def _resize_last(x: ComplexTensor, n: int) -> ComplexTensor:
