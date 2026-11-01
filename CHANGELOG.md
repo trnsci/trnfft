@@ -16,6 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `n = 2L-1` were right: e.g. `L = 33, n = 62/63` was 3–6 % off, `n = 33`
   78 %, and `n = 20, 32, 100` raised. Also the last axis of `irfft2` /
   `irfftn` with `s=` (#104).
+- **Float64 FFTs on the NKI path returned non-finite values** (silent).
+  Measured on **0.25.0** on Trn2 (earlier releases not measured), with
+  `set_backend("nki")` or `"auto"` on Neuron hardware, for host and device
+  inputs. Every kernel past the FP32 DFT-GEMM range is FP32-only, and float64
+  operands came back as inf/NaN with no error. That covers:
+  - any float64 `fft`/`ifft` (and the transforms built on them): non-finite
+    at every measured N (256, 1000, 2048, 3000, 4096), and returned as float32
+    at N = 256;
+  - every `precision="double"` Bluestein FFT at N > 512, float32 input
+    included, because Bluestein promotes to float64.
+
+  Float64 now runs the kernels in FP32 and returns float64. `"double"` above
+  the FP64 GEMM range computes on the host in FP64 (#108).
 
 ## [0.25.0] - 2026-11-01
 

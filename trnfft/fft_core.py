@@ -966,6 +966,19 @@ def _fft_via_gemm(x: ComplexTensor, inverse: bool) -> ComplexTensor:
     return result
 
 
+def _fft_host_fp64(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """FP64 FFT on the host, result on ``x``'s device in ``x``'s dtype.
+
+    ``precision="double"`` above the FP64 DFT-GEMM range: the NKI kernels
+    are FP32-only (#108), and an N^2 W does not scale, so this is the host's
+    FP64 FFT, the same accuracy-first trade as :func:`_fft_via_gemm_double`.
+    """
+    dev, dt = x.real.device, x.real.dtype
+    z = torch.complex(x.real.detach().cpu().double(), x.imag.detach().cpu().double())
+    y = torch.fft.ifft(z) if inverse else torch.fft.fft(z)
+    return ComplexTensor(y.real.to(dtype=dt, device=dev), y.imag.to(dtype=dt, device=dev))
+
+
 def _dft_gemm_bf16(xr, xi, wr, wi, packed_w=None) -> ComplexTensor:
     """``complex_gemm_bf16(x, W)`` for x (rows, n) and an (n, n) DFT-matrix
     term W, with #99's row packing for n < 128 (trnfft#101 follow-up).
@@ -1863,6 +1876,21 @@ def _cooley_tukey_nki_nograd(
     # "double" mode: NKI PSUM is always FP32, so bypass NKI and use CPU FP64.
     if precision == "double" and n <= _DOUBLE_GEMM_THRESHOLD:
         return _fft_via_gemm_double(x, inverse)
+
+    # Float64 past the FP64 GEMM check: every kernel below is FP32-only, and
+    # float64 operands came back non-finite on Trn2 (#108), at every measured N
+    # for a float64 caller (the DFT-GEMM path at N = 256 included) and for every
+    # "double" Bluestein (which promotes to float64) at N > 512. "double" is the accuracy-
+    # first mode, so it computes
+    # these on the host in FP64. Other modes run the kernels in FP32 and return
+    # float64, as the FP32 GEMM paths already do for float64 input.
+    if x.real.dtype == torch.float64:
+        if precision == "double":
+            return _fft_host_fp64(x, inverse)
+        y = _cooley_tukey_nki_nograd(
+            ComplexTensor(x.real.float(), x.imag.float()), inverse, precision=precision
+        )
+        return ComplexTensor(y.real.double(), y.imag.double())
 
     # "bf16" mode: BF16 compute on Tensor Engine, FP32 PSUM → FP32 output.
     if precision == "bf16" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
