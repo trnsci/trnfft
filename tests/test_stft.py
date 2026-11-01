@@ -79,6 +79,29 @@ class TestISTFT:
         np.testing.assert_allclose(recovered[interior].numpy(), signal[interior].numpy(), atol=1e-3)
 
 
+class TestSTFTBatchShape:
+    """A (B, L) input keeps its batch dim for every B, as torch.stft (#114)."""
+
+    @pytest.mark.parametrize("batch", [1, 2, 3])
+    @pytest.mark.parametrize("pad_mode", ["reflect", "constant"])
+    def test_batch_dim_kept_and_matches_torch(self, batch, pad_mode):
+        torch.manual_seed(0)
+        x = torch.randn(batch, 64, dtype=torch.float64)
+        w = torch.hann_window(16, dtype=torch.float64)
+        S = trnfft.stft(x, n_fft=16, window=w, pad_mode=pad_mode)
+        ref = torch.stft(x, 16, window=w, pad_mode=pad_mode, return_complex=True)
+        assert S.shape == ref.shape
+        torch.testing.assert_close(torch.complex(S.real, S.imag), ref)
+        y = trnfft.istft(S, n_fft=16, window=w, length=64)
+        assert y.shape == (batch, 64)
+        torch.testing.assert_close(y, x)
+
+    def test_1d_unchanged(self):
+        x = torch.randn(64, dtype=torch.float64)
+        w = torch.hann_window(16, dtype=torch.float64)
+        assert trnfft.stft(x, n_fft=16, window=w).shape == (9, 17)
+
+
 class TestSTFTMulticore:
     """STFT/ISTFT routed through multi-NeuronCore batch-split FFT (v0.22).
 

@@ -19,7 +19,9 @@ trnfft.set_backend("nki")  # Force NKI (fails if not on Trainium)
 | Variable | Effect |
 | --- | --- |
 | `TRNFFT_USE_SIMULATOR=1` | Route NKI kernels through `nki.simulate(kernel)(np_args)` on CPU instead of the NEFF + hardware path. Requires `nki>=0.3.0`. Correctness iteration only; simulator explicitly skips NEFF compile and SBUF/PSUM capacity checks. See [developing_kernels.md](../developing_kernels.md). |
-
+| `TRNFFT_SIX_STEP=0\|1` | The six-step FFT is the default for power-of-2 FP32 N ≥ 8192 (since v0.25.0, #94). `0` restores the Stockham (`"fast"`) / compensated butterfly (`"kahan"`) path; `1` forces the six-step for every N above 4096. `TRNFFT_SIX_STEP_MIN` moves the threshold. |
+| `TRNFFT_PE_TRANSPOSE=0` | Selects the older kernels that read their input with `nl.load_transpose2d` (the XLA path keeps them by default). Since v0.25.0 the native path transposes on the Tensor engine instead, because the runtime rebuilt a `load_transpose2d` input's DMA rings at every new input address (#97, #100). |
+| `TRNFFT_PINNED_OUTPUT=0` | Turns off pinned-memory host outputs (planes of 1 MiB and up, native path; since v0.25.0, #98). |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla\|cpu` | Suite-wide. Forces the device dispatch path (see below); `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | Emit one `DeprecationWarning` when the XLA path is selected. Off by default. |
 
