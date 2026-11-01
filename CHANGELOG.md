@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-11-01
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended.** (1) In every release through 0.25.0, `irfft` / `hfft` / `irfft2` / `irfftn` (with `s=`) used every input bin instead of the first `n//2+1`, so any `n` other than `2(L-1)` and `2L-1` gave silently wrong values (3–78% off) or a shape error, on every backend (#105, #104). (2) float64 FFTs on the NKI path (`nki` / `auto`, the default on Neuron hardware) returned inf/NaN, and every `precision="double"` Bluestein FFT at N > 512 was non-finite. float64 now runs the FP32 kernels and returns float64, and `"double"` past the FP64 GEMM range computes on the host in FP64 (#109, #108). Also: `precision="bf16"` FFTs are 2–6× faster for N < 128, and `ComplexLinear` transposes W once per launch (#103).
+
 ### Fixed
 
 - **`irfft` / `hfft` / `irfft2` / `irfftn` gave wrong values for most `n`**
