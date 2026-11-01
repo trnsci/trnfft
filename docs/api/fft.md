@@ -2,55 +2,73 @@
 
 All functions are available at the top level: `trnfft.fft()`, `trnfft.ifft()`, etc.
 
-## 1D transforms
+## Common arguments
 
-### `fft(input, n=None)`
+Every transform takes `torch.fft`'s size, `dim` and `norm` arguments with the same meaning (#123):
 
-1-D discrete Fourier Transform along the last dimension.
+- **n** (1-D) / **s** (2-D, N-D): signal size along each transformed dim. The input is zero-padded or truncated to it. For the c2r transforms (`irfft*`, `hfft*`) this is the *output* size along the last transformed dim (default `2 * (L - 1)` for `L` input bins), and the first `n // 2 + 1` input bins are used. `s[i] == -1` keeps the default size for that dim. Sizes below 1 raise `RuntimeError`.
+- **dim**: the dim to transform (1-D, default `-1`) or the dims (2-D default `(-2, -1)`; N-D default: the last `len(s)` dims if `s` is given, else all dims). Negative dims count from the end. For `rfft*` / `irfft*` / `hfft*` / `ihfft*` the one-sided (Hermitian) dim is the *last* entry of `dim`.
+- **norm**: `None` / `"backward"` (default), `"ortho"` or `"forward"`. For a size-`n` transform (`n` = product of the transformed sizes):
 
-- **input**: `torch.Tensor` or `ComplexTensor`
-- **n**: Output size (zero-pads or truncates input). Default: input size.
-- **Returns**: `ComplexTensor`
+  | norm | forward (`fft`, `rfft`, `hfft`, ...) | inverse (`ifft`, `irfft`, `ihfft`, ...) |
+  |---|---|---|
+  | `"backward"` | no scaling | `1/n` |
+  | `"ortho"` | `1/sqrt(n)` | `1/sqrt(n)` |
+  | `"forward"` | `1/n` | no scaling |
 
-### `ifft(input, n=None)`
+  The default is unchanged from earlier releases. An unknown mode raises `RuntimeError`.
 
-1-D inverse DFT. Same signature as `fft`.
+Inputs: complex transforms take a `torch.Tensor` (real or complex) or a `ComplexTensor`; `rfft*` / `ihfft*` take a real `torch.Tensor` (complex input raises `TypeError`). Integer and bool inputs are promoted to the default float dtype. Complex outputs are `ComplexTensor`; real outputs are `torch.Tensor`.
 
-### `rfft(input, n=None)`
+**Non-last dims and the NKI path.** A transformed dim other than the last is swapped to the last axis (a contiguous copy) before the transform and swapped back after, so the NKI kernels see the same `(..., n)` row layout as a last-axis transform. Strided loads that avoid the copy are future work (#123).
 
-1-D FFT of a real signal, returning only positive frequencies (N//2 + 1 bins).
+**Differences from `torch.fft`:** no `out=` argument. A repeated entry in `dim` transforms that dim twice, where `torch.fft` raises (#127). `fftshift(x, dim=())` returns a copy, where `torch.fft.fftshift` raises.
 
-- **input**: `torch.Tensor` (real-valued)
-- **Returns**: `ComplexTensor` with shape `(..., N//2 + 1)`
+## 1-D transforms
 
-### `irfft(input, n=None)`
+### `fft(input, n=None, dim=-1, norm=None)` / `ifft(input, n=None, dim=-1, norm=None)`
 
-Inverse of `rfft`. Reconstructs full spectrum via Hermitian symmetry.
+1-D DFT and inverse DFT along `dim`. Returns a `ComplexTensor`.
 
-- **input**: `ComplexTensor` (positive frequencies)
-- **n**: Output signal length. Default: `2 * (input.shape[-1] - 1)`. Uses the first `n // 2 + 1` input bins (truncated or zero-padded), as `torch.fft.irfft` does; before v0.26.0 every bin was used, which was wrong for most `n` (#105).
-- **Returns**: `torch.Tensor` (real-valued)
+### `rfft(input, n=None, dim=-1, norm=None)`
 
-### `hfft(input, n=None)` / `ihfft(input, n=None)`
+1-D FFT of a real signal, returning only the `n // 2 + 1` non-negative frequencies along `dim`.
 
-FFT of a Hermitian-symmetric signal (real output of length `n`) and its inverse (one-sided spectrum of `n // 2 + 1` bins). Since v0.16.0.
+### `irfft(input, n=None, dim=-1, norm=None)`
 
-## N-D transforms
+Inverse of `rfft`. Reconstructs the full spectrum via Hermitian symmetry and returns a real `torch.Tensor` of length `n` along `dim` (default `2 * (L - 1)`). Uses the first `n // 2 + 1` input bins (truncated or zero-padded), as `torch.fft.irfft` does; before v0.26.0 every bin was used, which was wrong for most `n` (#105).
 
-### `fft2(input, s=None)`
+### `hfft(input, n=None, dim=-1, norm=None)` / `ihfft(input, n=None, dim=-1, norm=None)`
 
-2-D FFT along the last two dimensions. Delegates to `fftn`.
+FFT of a Hermitian-symmetric signal (real output of length `n`) and its inverse (one-sided spectrum of `n // 2 + 1` bins). `hfft` is a forward transform, so its default `norm` leaves it unscaled and `ihfft` scales by `1/n`. Since v0.16.0; `hfft` accepts a real input since #123.
 
-### `fftn(input, s=None, dim=None)`
+## 2-D and N-D transforms
 
-N-D FFT along specified dimensions.
+### `fft2` / `ifft2` / `rfft2` / `irfft2` / `hfft2` / `ihfft2` `(input, s=None, dim=(-2, -1), norm=None)`
 
-- **s**: Output sizes per dimension (tuple)
-- **dim**: Dimensions to transform (tuple). Default: all dimensions.
+2-D transforms; each delegates to its N-D version. `ifft2`, `hfft2` and `ihfft2` are new in #123.
 
-### `ifftn(input, s=None, dim=None)`
+### `fftn` / `ifftn` `(input, s=None, dim=None, norm=None)`
 
-N-D inverse FFT. Same signature as `fftn`.
+N-D DFT and inverse along `dim`. `dim=()` returns a copy of the input.
+
+### `rfftn` / `irfftn` `(input, s=None, dim=None, norm=None)`
+
+N-D real-to-complex FFT and its inverse. Only the last dim in `dim` is one-sided (`s[-1] // 2 + 1` bins); `irfftn` returns a real tensor.
+
+### `hfftn` / `ihfftn` `(input, s=None, dim=None, norm=None)`
+
+N-D FFT of a signal that is Hermitian-symmetric along the last of `dim` (real output), and its inverse (one-sided along the last of `dim`). New in #123.
+
+## Helper functions
+
+### `fftshift(input, dim=None)` / `ifftshift(input, dim=None)`
+
+Roll each dim in `dim` (default: all) by `size // 2` (`fftshift`) or `-(size // 2)` (`ifftshift`), moving the zero-frequency bin to the centre and back. Takes and returns a `torch.Tensor` or a `ComplexTensor`.
+
+### `fftfreq(n, d=1.0, *, dtype=None, device=None, requires_grad=False)` / `rfftfreq(...)`
+
+Sample frequencies of an `n`-point `fft` (`[0, 1, ..., (n-1)//2, -(n//2), ..., -1] / (d*n)`) and `rfft` (`[0, ..., n//2] / (d*n)`), as `torch.fft.fftfreq` / `rfftfreq`. `out=` and `layout=` are not supported.
 
 ## Time-frequency
 

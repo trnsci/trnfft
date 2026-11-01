@@ -157,8 +157,8 @@ NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https
 
 **v0.26.0** — validated on Trn2 (Neuron SDK 2.33, native TorchNeuron). Correctness releases, upgrade recommended: 0.25.0 fixed GEMM tail tiles that ≤ 0.24.0 dropped silently (small-N DFT-GEMM, bf16 precision modes, `nn.ComplexLinear`, `complex_gemm`); 0.26.0 fixed `irfft` / `hfft` / `irfft2` / `irfftn` using every bin instead of the first `n//2+1` (#105) and float64 FFTs on the NKI path returning inf/NaN (#109). See the [CHANGELOG](CHANGELOG.md).
 
-**API coverage** (15 `torch.fft` functions):
-`fft`, `ifft`, `rfft`, `irfft`, `hfft`, `ihfft`, `fft2`, `rfft2`, `irfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `stft`, `istft`. `hfft` / `ihfft` shipped in v0.16.0.
+**API coverage** (24 `torch.fft` functions):
+`fft`, `ifft`, `rfft`, `irfft`, `hfft`, `ihfft`, `fft2`, `ifft2`, `rfft2`, `irfft2`, `hfft2`, `ihfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `hfftn`, `ihfftn`, `fftshift`, `ifftshift`, `fftfreq`, `rfftfreq`, `stft`, `istft`. Every transform takes `torch.fft`'s `n` / `s`, `dim` and `norm` arguments with the same meaning (#123).
 
 **Roadmap**
 - NKI `ComplexConv1d` / `ComplexModReLU` kernels (today both fall back to PyTorch on NKI)
