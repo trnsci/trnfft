@@ -228,7 +228,25 @@ def test_complex_gemm_bf16_tails(nki_backend, monkeypatch, m, k, n):
     assert _same_bits(old.real, new.real) and _same_bits(old.imag, new.imag)
 
 
-@pytest.mark.parametrize("m,k,n", _GEMM_SHAPES)
+@pytest.mark.parametrize("precision", ["bf16", "ozaki"])
+@pytest.mark.parametrize("rows,n", [(1000, 8), (4096, 16), (8192, 64)])
+def test_bf16_packed_same_bits(nki_backend, monkeypatch, precision, rows, n):
+    """The BF16 DFT-GEMM's row packing for n < 128 (trnfft#101 follow-up)
+    gives the bits of the unpacked GEMM (``TRNFFT_GEMM_PACK=0``)."""
+    xr, xi = _rand_pair(rows, n, seed=rows * n)
+    drive = fc._fft_via_gemm_bf16 if precision == "bf16" else fc._fft_via_ozaki
+    monkeypatch.setenv("TRNFFT_PE_TRANSPOSE", "1")
+    monkeypatch.setenv("TRNFFT_GEMM_PACK", "0")
+    old = drive(ComplexTensor(xr, xi), False)
+    monkeypatch.setenv("TRNFFT_GEMM_PACK", "1")
+    new = drive(ComplexTensor(xr, xi), False)
+    _check_rows(new, _fft_ref(xr, xi), 2e-2 if precision == "bf16" else 1e-3)
+    assert _same_bits(old.real, new.real) and _same_bits(old.imag, new.imag)
+
+
+# (300, 1024, 1024): W^T is too large to keep resident in SBUF, so the linear
+# kernel keeps the per-tile W transposes (``_HOIST_SBUF_BYTES``).
+@pytest.mark.parametrize("m,k,n", _GEMM_SHAPES + [(300, 1024, 1024)])
 def test_complex_linear_tails(nki_backend, monkeypatch, m, k, n):
     """``nn.ComplexLinear`` (``_complex_linear_kernel``): batch m, in k, out n."""
     from trnfft.nn import ComplexLinear
