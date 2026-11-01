@@ -34,6 +34,11 @@ import torch
 from ..complex import ComplexTensor, complex_matmul
 
 PMAX = 128  # Max partition dimension (systolic array rows)
+# SBUF bytes per partition the complex linear kernel may spend on keeping
+# W^T resident for the whole launch (``_complex_gemm_tiles``): three planes of
+# ceil(in/128) * out elements. 64 KiB of the 192 KiB: FP32 W of (512, 1024) or
+# (1024, 512) fits, (1024, 1024) keeps the per-tile transposes.
+_HOIST_SBUF_BYTES = 64 * 1024
 
 # When set, dispatch bypasses torch_xla and runs kernels through
 # `nki.simulate(kernel)(np_args)` on CPU. Lets us iterate kernels on any
@@ -244,18 +249,58 @@ if HAS_NKI:
                 nisa.tensor_copy(dst=bt[:, c0 : c0 + cs], src=pt)
             return bt
 
+        # B^T once per launch (trnfft#101 follow-up). Without this the
+        # B^T path re-transposes (and re-negates) every W tile for every
+        # 128-row tile of A: M/128 times. When the three K-major planes
+        # (B_real^T, B_imag^T, -B_imag^T) fit in ``_HOIST_SBUF_BYTES`` per
+        # partition they are built once, before the tile loops, with the same
+        # loads, transposes and negation as ``_load_b``; the matmuls read
+        # slices of them. Same values in the same matmuls: same bits.
+        k_tiles = k_full + (1 if k_tail else 0)
+        b_bytes = 4 if b_real.dtype == nl.float32 else 2
+        hoist = b_nk and not t2d and 3 * k_tiles * N * b_bytes <= _HOIST_SBUF_BYTES
+        if hoist:
+            # Column block kt*N .. kt*N+N holds K-tile kt of B^T, (tk, N).
+            bt_r = nl.ndarray((TILE_K, k_tiles * N), dtype=b_real.dtype, buffer=nl.sbuf)
+            bt_i = nl.ndarray((TILE_K, k_tiles * N), dtype=b_real.dtype, buffer=nl.sbuf)
+            bt_ni = nl.ndarray((TILE_K, k_tiles * N), dtype=b_real.dtype, buffer=nl.sbuf)
+            for kt in range(k_tiles):
+                k_off = kt * TILE_K
+                tk = TILE_K if kt < k_full else k_tail
+                for src, dst in ((b_real, bt_r), (b_imag, bt_i)):
+                    for c in range((N + PMAX - 1) // PMAX):
+                        c0 = c * PMAX
+                        cs = min(PMAX, N - c0)
+                        t = nl.load(src[c0 : c0 + cs, k_off : k_off + tk])
+                        pt = nl.ndarray((tk, cs), dtype=t_dtype, buffer=nl.psum)
+                        nisa.nc_transpose(dst=pt, data=t, engine=nisa.engine.tensor)
+                        nisa.tensor_copy(dst=dst[:tk, kt * N + c0 : kt * N + c0 + cs], src=pt)
+                # As nl.negative: multiply by -1 in the input dtype.
+                nisa.tensor_scalar(
+                    dst=bt_ni[:tk, kt * N : kt * N + N],
+                    data=bt_i[:tk, kt * N : kt * N + N],
+                    op0=nl.multiply,
+                    operand0=-1.0,
+                )
+
         def _tile(m_off, tm, n_off, tn):
             psum_cr = nl.zeros((tm, tn), dtype=nl.float32, buffer=nl.psum)
             psum_ci = nl.zeros((tm, tn), dtype=nl.float32, buffer=nl.psum)
 
-            def _acc(k_off, tk):
+            def _acc(k_off, tk, kt):
                 ar_t = _load_t(a_real, m_off, tm, k_off, tk)
                 ai_t = _load_t(a_imag, m_off, tm, k_off, tk)
-                br = _load_b(b_real, k_off, tk, n_off, tn)
-                bi = _load_b(b_imag, k_off, tk, n_off, tn)
-                # NKI 2.24 doesn't support `psum -=` inside affine_range;
-                # negate B_imag on the Vector engine, then accumulate with +=.
-                neg_bi = nl.negative(bi)
+                if hoist:
+                    c0 = kt * N + n_off
+                    br = bt_r[:tk, c0 : c0 + tn]
+                    bi = bt_i[:tk, c0 : c0 + tn]
+                    neg_bi = bt_ni[:tk, c0 : c0 + tn]
+                else:
+                    br = _load_b(b_real, k_off, tk, n_off, tn)
+                    bi = _load_b(b_imag, k_off, tk, n_off, tn)
+                    # NKI 2.24 doesn't support `psum -=` inside affine_range;
+                    # negate B_imag on the Vector engine, then accumulate with +=.
+                    neg_bi = nl.negative(bi)
                 # C_real += A_real @ B_real  +  A_imag @ (-B_imag)
                 nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=br, accumulate=True)
                 nisa.nc_matmul(dst=psum_cr, stationary=ai_t, moving=neg_bi, accumulate=True)
@@ -264,9 +309,9 @@ if HAS_NKI:
                 nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=br, accumulate=True)
 
             for k in nl.affine_range(k_full):
-                _acc(k * TILE_K, TILE_K)
+                _acc(k * TILE_K, TILE_K, k)
             if k_tail:
-                _acc(k_full * TILE_K, k_tail)
+                _acc(k_full * TILE_K, k_tail, k_full)
 
             # NKI 0.3.0: nl.copy returns a view; PSUM->SBUF goes through
             # nisa.tensor_copy into a pre-allocated SBUF tile. Cast after, when

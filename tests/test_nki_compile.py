@@ -198,6 +198,12 @@ _CASES = {
         "_complex_linear_kernel",
         lambda: ((_f32(129, 200), _f32(129, 200), _f32(600, 200), _f32(600, 200)), {}),
     ),
+    # W^T over _HOIST_SBUF_BYTES: the per-tile W transposes (trnfft#101 follow-up).
+    "complex-linear-wide": (
+        "dispatch",
+        "_complex_linear_kernel",
+        lambda: ((_f32(300, 1024), _f32(300, 1024), _f32(1024, 1024), _f32(1024, 1024)), {}),
+    ),
     "complex-linear-t2d-tails": (
         "dispatch",
         "_complex_linear_t2d_kernel",
