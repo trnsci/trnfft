@@ -308,7 +308,14 @@ def stft(
     normalized: bool = False,
     onesided: bool = True,
 ) -> ComplexTensor:
-    """Short-time Fourier Transform. Matches torch.stft signature."""
+    """Short-time Fourier Transform. Takes torch.stft's arguments, except
+    ``return_complex``: the result is always a ``ComplexTensor`` of shape
+    ``(..., freq, frames)``.
+
+    ``window=None`` uses a Hann window of ``win_length``. ``torch.stft`` uses
+    a rectangular window (ones) there, so pass ``window`` explicitly to match
+    it; with an explicit window the results agree to FP32 tolerance.
+    """
     if hop_length is None:
         hop_length = n_fft // 4
     if win_length is None:
@@ -385,7 +392,11 @@ def istft(
     onesided: bool = True,
     length: int | None = None,
 ) -> torch.Tensor:
-    """Inverse Short-time Fourier Transform. Reconstructs signal via overlap-add."""
+    """Inverse Short-time Fourier Transform. Reconstructs signal via overlap-add.
+
+    ``window=None`` uses a Hann window of ``win_length``, as :func:`stft` does
+    (``torch.istft`` uses ones). Pass the window used for the forward STFT.
+    """
     if hop_length is None:
         hop_length = n_fft // 4
     if win_length is None:

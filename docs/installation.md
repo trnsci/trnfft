@@ -106,6 +106,10 @@ pytest tests/ -v
 
 The NKI kernels in trnfft are validated against this stack:
 
+Trn2 (trn2.3xlarge) is validated on **Neuron SDK 2.33** with native
+TorchNeuron (`[torchneuron]` extra, see above); v0.23.0 through v0.26.0 were
+validated there. The XLA lineage stack:
+
 | Component | Version |
 |-----------|---------|
 | Neuron SDK | **2.29+** (ships NKI 0.3.0 Stable) |
