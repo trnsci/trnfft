@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `set_backend("nki")` or `"auto"` on Neuron hardware, for host and device
   inputs. Every kernel past the FP32 DFT-GEMM range is FP32-only, and float64
   operands came back as inf/NaN with no error. That covers:
-  - any float64 `fft`/`ifft` (and the transforms built on them) at power-of-2
-    N > 1024, or at Bluestein N > 512;
+  - any float64 `fft`/`ifft` (and the transforms built on them): non-finite
+    at every measured N (256, 1000, 2048, 3000, 4096), and returned as float32
+    at N = 256;
   - every `precision="double"` Bluestein FFT at N > 512, float32 input
     included, because Bluestein promotes to float64.
 

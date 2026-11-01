@@ -1838,10 +1838,10 @@ def _cooley_tukey_nki_nograd(
     if precision == "double" and n <= _DOUBLE_GEMM_THRESHOLD:
         return _fft_via_gemm_double(x, inverse)
 
-    # Float64 past the GEMM range: every kernel below is FP32-only, and float64
-    # operands came back non-finite (#108). That hit a float64 caller at N > 1024
-    # (or Bluestein N > 512), and every "double" Bluestein (which promotes to
-    # float64) at N > 512. "double" is the accuracy-first mode, so it computes
+    # Float64 past the FP64 GEMM check: every kernel below is FP32-only, and
+    # float64 operands came back non-finite on Trn2 (#108), at every measured N
+    # for a float64 caller (the DFT-GEMM path at N = 256 included) and for every
+    # "double" Bluestein (which promotes to float64) at N > 512. "double" is the accuracy-first mode, so it computes
     # these on the host in FP64. Other modes run the kernels in FP32 and return
     # float64, as the FP32 GEMM paths already do for float64 input.
     if x.real.dtype == torch.float64:
