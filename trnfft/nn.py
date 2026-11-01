@@ -115,12 +115,13 @@ class ComplexModReLU(nn.Module):
 
     def forward(self, x: ComplexTensor) -> ComplexTensor:
         mag = x.abs()
-        # Add bias (broadcast over non-feature dims)
+        # Broadcast the (F,) bias over the non-feature dims. The feature dim is
+        # dim 1 for rank >= 2, as in ComplexConv1d / BatchNorm1d: (B, F) or
+        # (B, F, L, ...). Unsqueezing at dim 0 only put it on the *last* dim,
+        # wrong for (B, F, L) inputs (#115).
         bias = self.bias
-        while bias.dim() < mag.dim():
-            bias = bias.unsqueeze(0)
-        if mag.dim() > bias.dim():
-            bias = bias.unsqueeze(-1)
+        if mag.dim() >= 2:
+            bias = bias.reshape(1, -1, *([1] * (mag.dim() - 2)))
 
         activated_mag = torch.relu(mag + bias)
         # Avoid division by zero

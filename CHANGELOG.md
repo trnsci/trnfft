@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`nn.ComplexModReLU` applied its bias along the wrong axis for
+  `(B, C, L)` inputs** (silent when `C == L`, a shape error otherwise).
+  Affects **every release (0.1.0–0.26.0)**, on every backend. The `(F,)`
+  bias was broadcast over the last dim instead of the feature dim (dim 1).
+  1-D and 2-D inputs are unchanged (#115).
+
 ## [0.26.0] - 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
