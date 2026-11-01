@@ -144,6 +144,11 @@ def fftn(
             x = _resize_dim(x, d, size)
 
     # Apply 1D FFT along each dimension
+    if not dim:
+        # No transformed dims: return a copy, never a view of the caller's input,
+        # as torch.fft.fftn does (#116).
+        return x.clone()
+
     for d in dim:
         x = _fft_along_dim(x, d, inverse=False)
 
@@ -171,6 +176,11 @@ def ifftn(
         assert len(s) == len(dim), f"len(s)={len(s)} must match len(dim)={len(dim)}"
         for size, d in zip(s, dim, strict=True):
             x = _resize_dim(x, d, size)
+
+    if not dim:
+        # No transformed dims: return a copy, never a view of the caller's input,
+        # as torch.fft.fftn does (#116).
+        return x.clone()
 
     for d in dim:
         x = _fft_along_dim(x, d, inverse=True)

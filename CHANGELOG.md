@@ -45,6 +45,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Affects **every release (0.1.0–0.26.0)**, on every backend. The `(F,)`
   bias was broadcast over the last dim instead of the feature dim (dim 1).
   1-D and 2-D inputs are unchanged (#115).
+### Fixed
+
+- **`fftn` / `ifftn` with `dim=()` returned a view of the input** (silent
+  aliasing: writing to the result changed the caller's tensor). Affects
+  **every release since 0.2.0**, on every backend. The values were right;
+  a copy is now returned, as `torch.fft.fftn` does (#116).
 
 ## [0.26.0] - 2026-11-01
 

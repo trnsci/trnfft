@@ -2005,3 +2005,15 @@ class TestIrfftLength:
         want = torch.fft.irfftn(X, s=s, dim=dim if dim else (-2, -1))
         assert got.shape == want.shape
         np.testing.assert_allclose(got.numpy(), want.numpy(), atol=1e-4)
+
+
+@pytest.mark.parametrize("op", [trnfft.fftn, trnfft.ifftn])
+def test_fftn_empty_dim_returns_copy(op):
+    # dim=() transforms nothing; the result must not alias the input (#116).
+    x = torch.randn(4, 5)
+    before = x.clone()
+    y = op(x, dim=())
+    torch.testing.assert_close(y.real, x)
+    torch.testing.assert_close(y.imag, torch.zeros_like(x))
+    y.real.add_(1.0)
+    assert torch.equal(x, before)
