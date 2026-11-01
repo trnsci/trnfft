@@ -1858,3 +1858,32 @@ class TestPETransposeSelection:
         ref = (torch.fft.ifft if inverse else torch.fft.fft)(x.to(torch.complex128))
         got = torch.complex(y.real.double(), y.imag.double())
         assert (torch.linalg.vector_norm(got - ref) / torch.linalg.vector_norm(ref)) < 1e-6
+
+
+class TestIrfftLength:
+    """irfft/hfft use the first n//2 + 1 bins, zero-padded when shorter, like
+    torch.fft (#104). Only n = 2(L-1) and n = 2L-1 were right before."""
+
+    @pytest.mark.parametrize("n", [None, 1, 2, 20, 31, 32, 33, 62, 63, 64, 65, 100])
+    @pytest.mark.parametrize("name", ["irfft", "hfft"])
+    def test_matches_torch(self, name, n):
+        g = torch.Generator().manual_seed(0)
+        X = torch.complex(torch.randn(3, 33, generator=g), torch.randn(3, 33, generator=g))
+        got = getattr(trnfft, name)(ComplexTensor(X.real, X.imag), n=n)
+        want = getattr(torch.fft, name)(X, n=n)
+        assert got.shape == want.shape
+        np.testing.assert_allclose(
+            got.numpy(), want.numpy(), atol=2e-4 * max(1.0, want.abs().max().item())
+        )
+
+    @pytest.mark.parametrize(
+        "s,dim", [((6,), (0,)), ((16,), (-1,)), ((8, 4), None), ((20, 10), None)]
+    )
+    def test_irfftn_s(self, s, dim):
+        g = torch.Generator().manual_seed(1)
+        shape = (3, 16, 5) if dim != (0,) else (2, 16, 8)
+        X = torch.complex(torch.randn(*shape, generator=g), torch.randn(*shape, generator=g))
+        got = trnfft.irfftn(ComplexTensor(X.real, X.imag), s=s, dim=dim if dim else (-2, -1))
+        want = torch.fft.irfftn(X, s=s, dim=dim if dim else (-2, -1))
+        assert got.shape == want.shape
+        np.testing.assert_allclose(got.numpy(), want.numpy(), atol=1e-4)
