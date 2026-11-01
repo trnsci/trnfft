@@ -30,8 +30,9 @@ case fails loudly (XPASS) once the behaviour changes and the marker must go:
   Hann; ``torch.stft``/``torch.istft`` use ones.
 - trnsci/trnfft#121: ``fftn``-family raise on a 0-size non-transformed dim.
 
-Missing ``dim=``/``norm=`` keywords on the 1-D transforms are tracked by
-trnsci/trnfft#123 and are not tested here.
+``dim=``/``norm=`` (#123) are covered exhaustively by
+``tests/test_torch_fft_parity.py``; this file runs a bounded cross-section of
+them (every norm, a non-last dim, awkward sizes) so they also run on device.
 """
 
 from __future__ import annotations
@@ -176,8 +177,14 @@ OPS_ND = {
     "rfftn": (lambda x, **k: trnfft.rfftn(x, **k), torch.fft.rfftn, "r"),
     "irfft2": (lambda x, **k: trnfft.irfft2(CT(x), **k), torch.fft.irfft2, "h"),
     "irfftn": (lambda x, **k: trnfft.irfftn(CT(x), **k), torch.fft.irfftn, "h"),
+    "ifft2": (lambda x, **k: trnfft.ifft2(_ct(x), **k), torch.fft.ifft2, "c"),
+    "hfft2": (lambda x, **k: trnfft.hfft2(CT(x), **k), torch.fft.hfft2, "h"),
+    "ihfft2": (lambda x, **k: trnfft.ihfft2(x, **k), torch.fft.ihfft2, "r"),
+    "hfftn": (lambda x, **k: trnfft.hfftn(CT(x), **k), torch.fft.hfftn, "h"),
+    "ihfftn": (lambda x, **k: trnfft.ihfftn(x, **k), torch.fft.ihfftn, "r"),
 }
-ND_TORCH_KW = {"fft2", "rfft2", "irfft2"}  # s= only (no dim=)
+OPS_2D = ["fft2", "ifft2", "rfft2", "irfft2", "hfft2", "ihfft2"]
+OPS_NDIM = ["fftn", "ifftn", "rfftn", "irfftn", "hfftn", "ihfftn"]
 
 # Sizes: trivial, odd/prime, around the 128 tile, Bluestein (non-power-of-2
 # and > 512), large non-power-of-2, and power-of-2 Cooley-Tukey.
@@ -292,7 +299,7 @@ DIM_S = [
 
 
 @pytest.mark.parametrize("dim,s", DIM_S, ids=[f"dim={d}-s={s}" for d, s in DIM_S])
-@pytest.mark.parametrize("op", ["fftn", "ifftn", "rfftn", "irfftn"])
+@pytest.mark.parametrize("op", OPS_NDIM)
 def test_nd_dim_s(op, dim, s):
     f, ref, kind = OPS_ND[op]
     x4 = rand("r", (3, 4, 5, 6), seed=1)
@@ -306,7 +313,7 @@ def test_nd_dim_s(op, dim, s):
 
 
 @pytest.mark.parametrize("s", [None, (3, 5), (8, 8), (2, 20), (1, 1), (127, 3)])
-@pytest.mark.parametrize("op", ["fft2", "rfft2", "irfft2"])
+@pytest.mark.parametrize("op", OPS_2D)
 def test_2d_s(op, s):
     f, ref, kind = OPS_ND[op]
     x4 = rand("r", (3, 4, 5, 6), seed=3)
@@ -424,7 +431,7 @@ EDGE_ND = [
 
 
 @pytest.mark.parametrize("shape", EDGE_ND, ids=str)
-@pytest.mark.parametrize("op", ["fftn", "ifftn", "rfftn", "irfftn"])
+@pytest.mark.parametrize("op", OPS_NDIM)
 def test_edge_nd_all_dims(op, shape):
     f, ref, kind = OPS_ND[op]
     if kind == "h" and shape[-1] < 2:
@@ -434,7 +441,7 @@ def test_edge_nd_all_dims(op, shape):
 
 
 @pytest.mark.parametrize("shape", [(0, 4, 4), (1, 1), (4, 1), (1, 4), (3, 5, 1)], ids=str)
-@pytest.mark.parametrize("op", ["fft2", "rfft2", "irfft2"])
+@pytest.mark.parametrize("op", OPS_2D)
 def test_edge_2d(op, shape):
     f, ref, kind = OPS_ND[op]
     if kind == "h" and shape[-1] < 2:
@@ -590,6 +597,9 @@ def _cplx_fns(n):
         "fft2": lambda a, b: _split(trnfft.fft2(CT(a, b))),
         "fftn(dim=0)": lambda a, b: _split(trnfft.fftn(CT(a, b), dim=(0,))),
         "ifftn": lambda a, b: _split(trnfft.ifftn(CT(a, b))),
+        "ifft2(norm=ortho)": lambda a, b: _split(trnfft.ifft2(CT(a, b), norm="ortho")),
+        "fft(dim=0,norm=forward)": lambda a, b: _split(trnfft.fft(CT(a, b), dim=0, norm="forward")),
+        "fftshift": lambda a, b: _split(trnfft.fftshift(CT(a, b))),
         "complex_matmul": lambda a, b: _split(
             trnfft.complex_matmul(CT(a, b), CT(b.t().contiguous(), a.t().contiguous()))
         ),
@@ -610,6 +620,10 @@ def _real_fns(n):
         "irfft": lambda a: _split(trnfft.irfft(half(a), n=n)),
         "hfft": lambda a: _split(trnfft.hfft(half(a), n=n)),
         "irfft2": lambda a: _split(trnfft.irfft2(half(a), s=(3, n))),
+        "hfftn": lambda a: _split(trnfft.hfftn(half(a), s=(3, n))),
+        "ihfftn": lambda a: _split(trnfft.ihfftn(a)),
+        "ihfft2(norm=ortho)": lambda a: _split(trnfft.ihfft2(a, norm="ortho")),
+        "rfft(dim=0)": lambda a: _split(trnfft.rfft(a, dim=0)),
         "stft": lambda a: _split(
             trnfft.stft(a.reshape(-1), n_fft=4, hop_length=2, window=torch.ones(4, dtype=a.dtype))
         ),
@@ -820,6 +834,83 @@ def test_batch_split_vs_whole():
             whole.to_torch_complex(),
             tol=TOL[torch.float32],
         )
+
+
+# ===================================================== dim= / norm= (#123)
+NORMS = [None, "backward", "ortho", "forward"]
+
+
+@pytest.mark.parametrize("norm", NORMS, ids=str)
+@pytest.mark.parametrize("dim", [-1, 0, 1])
+@pytest.mark.parametrize("op", list(OPS_1D))
+def test_1d_dim_norm(op, dim, norm):
+    """Every norm along last, first and middle dims, at awkward sizes."""
+    f, ref, kind = OPS_1D[op]
+    x = rand("r" if kind == "r" else "c", (33, 4, 127), seed=abs(dim) + 40)
+    kw = dict(dim=dim, norm=norm)
+    if kind == "h":
+        kw["n"] = 2 * x.shape[dim] - 3  # odd n, fewer bins than the input
+    check(f(dev(x), **kw), ref(x, **kw), dtype=torch.float64)
+
+
+@pytest.mark.parametrize("norm", NORMS, ids=str)
+@pytest.mark.parametrize("op", list(OPS_ND))
+def test_nd_norm(op, norm):
+    f, ref, kind = OPS_ND[op]
+    x = rand("r" if kind == "r" else "c", (3, 7, 10), seed=41)
+    dim = (0, 2) if op in OPS_2D else (2, 0)
+    check(f(dev(x), dim=dim, norm=norm), ref(x, dim=dim, norm=norm), dtype=torch.float64)
+
+
+@pytest.mark.parametrize("op", list(OPS_1D) + list(OPS_ND))
+def test_norm_rejects_unknown(op):
+    f, ref, kind = {**OPS_1D, **OPS_ND}[op]
+    x = rand("r" if kind == "r" else "c", (4, 6), seed=42)
+    with pytest.raises(RuntimeError):
+        ref(x, norm="bogus")
+    with pytest.raises((ValueError, RuntimeError)):
+        f(dev(x), norm="bogus")
+
+
+# ======================================================= shift / freq helpers
+@pytest.mark.parametrize("dim", [None, 0, -1, (0, 2), (2, 0, 1)], ids=str)
+@pytest.mark.parametrize("shape", [(1,), (7,), (4, 5, 6), (1, 127, 2)], ids=str)
+@pytest.mark.parametrize("which", ["fftshift", "ifftshift"])
+def test_shift(which, shape, dim):
+    if dim is not None:
+        dims = (dim,) if isinstance(dim, int) else dim
+        if any(d >= len(shape) or d < -len(shape) for d in dims):
+            pytest.skip("dim out of range for this rank")
+    ours, ref = getattr(trnfft, which), getattr(torch.fft, which)
+    x = torch.randn(*shape, dtype=torch.float64, generator=gen(43))
+    z = torch.randn(*shape, dtype=torch.complex128, generator=gen(44))
+    out = ours(dev(x), dim=dim)
+    assert isinstance(out, torch.Tensor)
+    check(out, ref(x, dim=dim), dtype=torch.float64)
+    outc = ours(dev(CT(z)), dim=dim)
+    assert isinstance(outc, CT)
+    check(outc, ref(z, dim=dim), dtype=torch.float64)
+    # fftshift and ifftshift invert each other on odd sizes too
+    inv = getattr(trnfft, "ifftshift" if which == "fftshift" else "fftshift")
+    check(inv(out, dim=dim), x)
+
+
+@pytest.mark.parametrize("dtype", [None, torch.float32, torch.float64], ids=str)
+@pytest.mark.parametrize("d", [1.0, 0.1, 3])
+@pytest.mark.parametrize("n", [1, 2, 7, 127, 128, 1000])
+@pytest.mark.parametrize("which", ["fftfreq", "rfftfreq"])
+def test_freq(which, n, d, dtype):
+    ours = getattr(trnfft, which)(n, d, dtype=dtype, device=_STATE["device"])
+    ref = getattr(torch.fft, which)(n, d, dtype=dtype)
+    assert ours.dtype == ref.dtype and ours.shape == ref.shape
+    assert ours.device.type == _STATE["device"].type
+    torch.testing.assert_close(ours.cpu(), ref, rtol=1e-6, atol=0)
+
+
+@pytest.mark.parametrize("which", ["fftfreq", "rfftfreq"])
+def test_freq_requires_grad(which):
+    out = getattr(trnfft, which)(8, requires_grad=True)
+    assert out.requires_grad and out.is_leaf
 
 
 # ========================================================= precision modes
