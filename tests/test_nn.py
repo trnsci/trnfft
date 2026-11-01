@@ -50,6 +50,21 @@ class TestComplexModReLU:
         # Phase should be preserved: atan2(4,3)
         np.testing.assert_allclose(y.angle().item(), x.angle().item(), atol=1e-5)
 
+    @pytest.mark.parametrize("shape", [(5,), (7, 5), (2, 5, 5), (2, 5, 9), (2, 5, 3, 4)])
+    def test_bias_on_feature_dim(self, shape):
+        # Bias is per feature (dim 1 for rank >= 2), as in BatchNorm1d (#115).
+        torch.manual_seed(0)
+        layer = ComplexModReLU(5).double()
+        layer.bias.data = torch.linspace(-1.0, 1.0, 5, dtype=torch.float64)
+        z = torch.randn(*shape, dtype=torch.complex128)
+        y = layer(ComplexTensor(z.real.contiguous(), z.imag.contiguous()))
+        b = layer.bias.detach()
+        if len(shape) >= 2:
+            b = b.reshape(1, 5, *([1] * (len(shape) - 2)))
+        mag = z.abs()
+        expected = torch.relu(mag + b) * z / mag.clamp_min(1e-8)
+        torch.testing.assert_close(torch.complex(y.real, y.imag).detach(), expected)
+
     def test_thresholding(self):
         layer = ComplexModReLU(1)
         layer.bias.data.fill_(-10.0)  # Large negative bias kills small magnitudes
