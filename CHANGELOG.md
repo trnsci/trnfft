@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
+  trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every
+  `@nki.jit` kernel and fails if its body, or a helper it calls, reads a
+  closure variable or a module global that is not a constant expression
+  (reviewed exceptions are allow-listed with a reason), and checks each
+  kernel's `__closure__` at runtime against a stub `nki`.
+- Tests: `conftest.py` no longer turns the NKI trace cache off. Neuron tests
+  run with it on, as under `import torch_neuronx`, with a fresh
+  `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
+  traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
+- README: known platform issue note for #1454.
+### Fixed
+
+- **Integer inputs gave wrong FFTs** (silent). Affects **every release
+  (0.1.0–0.26.0)**, on every backend. `fft` / `ifft` / `rfft` / `ihfft` /
+  `fft2` / `fftn` / `rfft2` / `rfftn` (and `irfft` / `irfftn` on an integer
+  `ComplexTensor`) computed in the integer dtype. Power-of-2 lengths
+  truncated each butterfly and returned an integer tensor (40–60 % off);
+  Bluestein lengths cast the chirp to 0/±1 (~100 % off). Integer and bool
+  inputs are now promoted to the default float dtype, as `torch.fft` does
+  (#113).
+### Fixed
+
+- **`stft` dropped the batch dim of a `(1, L)` input** (silent shape
+  change). Affects **every release (0.1.0–0.26.0)**, on every backend, with
+  `center=True` (the default). The reflect-pad path squeezed any leading
+  size-1 dim, so `(1, L)` gave `(F, T)` instead of `(1, F, T)` as
+  `torch.stft` returns, and `istft` of it gave `(L,)`. 1-D, batch > 1 and
+  `center=False` callers are unchanged (#114).
+### Fixed
+
+- **`nn.ComplexModReLU` applied its bias along the wrong axis for
+  `(B, C, L)` inputs** (silent when `C == L`, a shape error otherwise).
+  Affects **every release (0.1.0–0.26.0)**, on every backend. The `(F,)`
+  bias was broadcast over the last dim instead of the feature dim (dim 1).
+  1-D and 2-D inputs are unchanged (#115).
 ### Fixed
 
 - **`fftn` / `ifftn` with `dim=()` returned a view of the input** (silent

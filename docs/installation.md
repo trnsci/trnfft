@@ -81,7 +81,17 @@ with `pip install -e`, turn the cache off before starting Python:
 export NKI_ENABLE_TRACE_CACHE=0
 ```
 
-The test suite's `conftest.py` sets this by default. See the TorchNeuron
+The test suite keeps the cache on, as users run it, but gives each session
+a fresh, empty cache directory (`NKI_TRACE_CACHE_URL`), so edits never hit
+a stale entry.
+
+The cache also ignores constants captured in a kernel's closure
+([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454));
+trnfft's kernels take every specialising value as an argument
+(`tests/test_trace_cache_safety.py`). Set `NKI_ENABLE_TRACE_CACHE=0` if
+you write NKI kernels that a factory specialises through a closure.
+
+See the TorchNeuron
 [environment variables](https://github.com/aws-neuron/torch-neuronx/blob/main/docs/environment_variables.md)
 reference.
 
@@ -105,6 +115,10 @@ pytest tests/ -v
 ## Hardware compatibility
 
 The NKI kernels in trnfft are validated against this stack:
+
+Trn2 (trn2.3xlarge) is validated on **Neuron SDK 2.33** with native
+TorchNeuron (`[torchneuron]` extra, see above); v0.23.0 through v0.26.0 were
+validated there. The XLA lineage stack:
 
 | Component | Version |
 |-----------|---------|

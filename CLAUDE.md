@@ -86,16 +86,15 @@ trnfft/
 
 ## Known Gaps & Design Notes
 
-- **NKI kernels are stubs.** Both GEMM and butterfly kernels fall back to
-  PyTorch even when NKI is available. Next milestone is on-hardware validation
-  on a trn2 instance, wiring the actual kernels from neuron-complex-ops.
+- **NKI kernels are hardware-validated** on Trn2 (SDK 2.33, native
+  TorchNeuron) and Trn1 (XLA). NKI-path routing for power-of-2 FP32: DFT-GEMM
+  for N < 512, batch-fused four-step to 4096, six-step from 8192 (default
+  since v0.25.0; `TRNFFT_SIX_STEP=0` restores Stockham / butterfly).
 
-- **Bluestein FP32 precision.** N>=500 accumulates ~2e-2 error through the
-  3-FFT Bluestein chain in float32. Use `trnfft.set_precision("double")` to
-  promote Bluestein host math to FP64 (~1e-11 rel error at any N); power-of-2
-  Cooley-Tukey is unaffected. `set_precision("kahan")` switches the NKI
-  butterfly to a Dekker 2Prod compensated variant for hardware where FP64
-  isn't available. See `docs/architecture.md` for the full precision table.
+- **Bluestein FP32 precision.** Since the FP64 chirp fix (v0.23.0) "fast"
+  measures ~4e-7 at N=1000/4097 on CPU. `trnfft.set_precision("double")`
+  promotes Bluestein to FP64 (on the NKI path that FP64 work runs on the
+  host, v0.26.0). See `trnfft/precision.py` and `docs/architecture.md`.
 
 - **ComplexBatchNorm** uses independent real/imag normalization, not the
   covariance-based variant (Trabelsi et al. 2018). Deliberate simplicity —
@@ -105,7 +104,7 @@ trnfft/
 
 - `torch>=2.1` — tensor operations and CPU fallback
 - `numpy>=1.24` — reference FFT for testing
-- `neuronxcc` — NKI kernels (optional, only on Neuron hardware)
+- `nki` + `torch-neuronx` — NKI kernels (optional, `[neuron]` / `[torchneuron]` extras, only on Neuron hardware)
 
 ## Development
 

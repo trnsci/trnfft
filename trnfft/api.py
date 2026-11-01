@@ -37,6 +37,7 @@ def ifft(input: torch.Tensor | ComplexTensor, n: int | None = None) -> ComplexTe
 
 def rfft(input: torch.Tensor, n: int | None = None) -> ComplexTensor:
     """1-D FFT of real signal, returning positive frequencies only."""
+    input = _promote_real(input)
     if n is not None:
         input = _resize_real(input, n)
     n = input.shape[-1]
@@ -48,6 +49,7 @@ def rfft(input: torch.Tensor, n: int | None = None) -> ComplexTensor:
 
 def irfft(input: ComplexTensor, n: int | None = None) -> torch.Tensor:
     """Inverse FFT of Hermitian-symmetric spectrum, returning real signal."""
+    input = _to_complex(input)
     if n is None:
         n = 2 * (input.shape[-1] - 1)
 
@@ -210,6 +212,7 @@ def rfftn(
     if ``s`` is None).
     """
     assert not torch.is_complex(input), "rfftn requires real input"
+    input = _promote_real(input)
     ndim = input.dim()
 
     if dim is None:
@@ -268,6 +271,7 @@ def irfftn(
     The last dim in ``dim`` is Hermitian-reconstructed to full length. If
     ``s`` is None, its size defaults to ``2 * (input.shape[last_dim] - 1)``.
     """
+    input = _to_complex(input)
     ndim = input.real.dim()
 
     if dim is None:
@@ -318,7 +322,14 @@ def stft(
     normalized: bool = False,
     onesided: bool = True,
 ) -> ComplexTensor:
-    """Short-time Fourier Transform. Matches torch.stft signature."""
+    """Short-time Fourier Transform. Takes torch.stft's arguments, except
+    ``return_complex``: the result is always a ``ComplexTensor`` of shape
+    ``(..., freq, frames)``.
+
+    ``window=None`` uses a Hann window of ``win_length``. ``torch.stft`` uses
+    a rectangular window (ones) there, so pass ``window`` explicitly to match
+    it; with an explicit window the results agree to FP32 tolerance.
+    """
     if hop_length is None:
         hop_length = n_fft // 4
     if win_length is None:
@@ -328,10 +339,13 @@ def stft(
 
     if center:
         pad_amount = n_fft // 2
-        # torch.nn.functional.pad with reflect needs 2D+ input
-        input = input.unsqueeze(0) if input.dim() == 1 else input
+        # torch.nn.functional.pad with reflect needs 2D+ input. Squeeze only
+        # the dim added here: a caller's (1, L) batch must stay (1, F, T),
+        # as torch.stft returns (#114).
+        was_1d = input.dim() == 1
+        input = input.unsqueeze(0) if was_1d else input
         input = torch.nn.functional.pad(input, (pad_amount, pad_amount), mode=pad_mode)
-        input = input.squeeze(0) if input.dim() == 2 and input.shape[0] == 1 else input
+        input = input.squeeze(0) if was_1d else input
 
     # Frame the signal. torch.Tensor.unfold is a view op that is not
     # implemented on the XLA backend (torch-xla 2.9 / torch-neuronx), so we
@@ -395,7 +409,11 @@ def istft(
     onesided: bool = True,
     length: int | None = None,
 ) -> torch.Tensor:
-    """Inverse Short-time Fourier Transform. Reconstructs signal via overlap-add."""
+    """Inverse Short-time Fourier Transform. Reconstructs signal via overlap-add.
+
+    ``window=None`` uses a Hann window of ``win_length``, as :func:`stft` does
+    (``torch.istft`` uses ones). Pass the window used for the forward STFT.
+    """
     if hop_length is None:
         hop_length = n_fft // 4
     if win_length is None:
@@ -498,10 +516,24 @@ def istft(
 # --- Helpers ---
 
 
+def _promote_real(x: torch.Tensor) -> torch.Tensor:
+    """Promote integer / bool tensors to the default float dtype, as torch.fft does.
+
+    The FFT kernels work in the input dtype; an integer input truncated every
+    butterfly (power-of-2 N) or every chirp twiddle (Bluestein), giving
+    silently wrong values (#113).
+    """
+    if x.is_floating_point() or x.is_complex():
+        return x
+    return x.to(torch.get_default_dtype())
+
+
 def _to_complex(x) -> ComplexTensor:
     if isinstance(x, ComplexTensor):
-        return x
-    return ComplexTensor(x)
+        if x.real.is_floating_point():
+            return x
+        return ComplexTensor(_promote_real(x.real), _promote_real(x.imag))
+    return ComplexTensor(_promote_real(x))
 
 
 def _resize_last(x: ComplexTensor, n: int) -> ComplexTensor:
