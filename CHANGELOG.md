@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-11-01
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fix — upgrade recommended.** Releases up to and including 0.24.0 return silently wrong results when a GEMM dimension is not a whole number of tiles: the small-N DFT-GEMM (N < 512) for batches over 128 rows not a multiple of 128 (e.g. rows 896–999 unwritten at B=1000, N=64), every bf16 precision mode (`bf16`, `bf16_refined`, `ozaki`, `ozaki_hq`) at such batches, `nn.ComplexLinear` at awkward shapes, and direct `complex_gemm` / `complex_gemm_bf16` calls with M, K or N tails (#99, #101, #100). Also: the six-step FFT is the default for power-of-2 N ≥ 8192 (9.7–340× faster, 11–17× lower error, #96), host batches move once (#94), pinned-memory downloads (#98), and kernels no longer use `load_transpose2d`, which rebuilt DMA rings on every new input address (#97, aws-neuron/aws-neuron-sdk#1452).
+
 ### Fixed
 
 - **Tail tiles in every GEMM-family kernel (#100).** `_complex_gemm_kernel`,
