@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
   traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
 - README: known platform issue note for #1454.
+- **`torch.fft` argument parity: `dim=` and `norm=` on every transform**
+  (#123). `fft` / `ifft` / `rfft` / `irfft` / `hfft` / `ihfft` take `n`,
+  `dim` and `norm`; the 2-D and N-D transforms take `s`, `dim` and `norm`,
+  all with `torch.fft`'s meaning (`norm` in `None` / `"backward"` /
+  `"ortho"` / `"forward"`; `s[i] == -1` keeps that dim's size; `fft2` and
+  friends take `dim`). Defaults are unchanged and give bit-identical
+  results. A non-last `dim` is swapped to the last axis before the
+  transform, so the NKI kernels get the same row layout as before (no
+  kernel change). New functions: `ifft2`, `hfft2`, `ihfft2`, `hfftn`,
+  `ihfftn`, `fftshift`, `ifftshift`, `fftfreq`, `rfftfreq`. Not added:
+  `out=` (no function takes it). A repeated `dim` still transforms twice,
+  where `torch.fft` raises (needs a decision, #127).
+  `tests/test_torch_fft_parity.py` compares every function with
+  `torch.fft` over dim / norm / n / s / real and complex inputs.
 ### Fixed
 
 - **Integer inputs gave wrong FFTs** (silent). Affects **every release
@@ -51,6 +65,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   aliasing: writing to the result changed the caller's tensor). Affects
   **every release since 0.2.0**, on every backend. The values were right;
   a copy is now returned, as `torch.fft.fftn` does (#116).
+
+### Fixed
+
+- **Negative sizes, `s=-1`, and `hfft` of a real tensor** (#123). A
+  negative `n` / `s` entry sliced the input (`n=-1` dropped the last sample
+  and returned a transform one shorter, silently), so `fftn(x, s=(-1, 8))`
+  truncated where `torch.fft` keeps the size. `s[i] == -1` now keeps the
+  size, and other sizes below 1 raise `RuntimeError`, as in `torch.fft`.
+  `hfft` / `hfftn` now accept a real `torch.Tensor` (it raised
+  `TypeError`). `rfft*` / `ihfft*` given a complex input now raise
+  `TypeError`, as `torch.fft` does: a `ComplexTensor` raised
+  `AttributeError` / `AssertionError`, and `rfft` / `ihfft` of a torch
+  complex tensor returned the first `n // 2 + 1` bins of its full complex
+  FFT, which is not a real-input transform. An `s` / `dim` length mismatch
+  raises `RuntimeError` rather than an `assert`.
 
 ## [0.26.0] - 2026-11-01
 

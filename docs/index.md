@@ -8,7 +8,7 @@ Part of the trnsci scientific computing suite ([github.com/trnsci](https://githu
 
 ## Features
 
-- **`torch.fft`-compatible API** — `fft`, `ifft`, `rfft`, `irfft`, `hfft`, `ihfft`, `fft2`, `rfft2`, `irfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `stft`, `istft` (`hfft` / `ihfft` since v0.16.0). `stft(window=None)` uses a Hann window, where `torch.stft` uses ones; pass `window` to match it.
+- **`torch.fft`-compatible API** — `fft`, `ifft`, `rfft`, `irfft`, `hfft`, `ihfft`, the `2` / `n` variants of each (`fft2`, `ifftn`, `hfftn`, ...), `fftshift`, `ifftshift`, `fftfreq`, `rfftfreq`, `stft`, `istft`. The transforms take `torch.fft`'s `n` / `s`, `dim` and `norm` arguments with the same meaning. `stft(window=None)` uses a Hann window, where `torch.stft` uses ones; pass `window` to match it.
 - **ComplexTensor** — split real/imaginary representation with full arithmetic
 - **Complex NN layers** — `ComplexLinear`, `ComplexConv1d`, `ComplexBatchNorm1d`, `ComplexModReLU`
 - **NKI acceleration** — DFT-GEMM, four-step and six-step FFTs, Stockham and butterfly stages, complex GEMM, ComplexLinear, and fused multiply kernels for Trainium. Validated on Trn2 (Neuron SDK 2.33, native TorchNeuron) and on trn1.2xlarge (XLA). See [Benchmarks](benchmarks.md) and the CHANGELOG.
