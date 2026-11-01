@@ -131,6 +131,23 @@ def rand(kind, shape, dtype=torch.float64, seed=0):
     return torch.randn(*shape, generator=gen(seed), dtype=cd)
 
 
+def ref_empty_safe(ref, x, **kw):
+    """Reference for inputs with 0-size batch dims.
+
+    oneMKL (Linux x86 torch wheels) rejects some 0-batch FFT plans, so run the
+    reference with each 0-size dim set to 1 and slice the result back to 0.
+    The transformed dims here are never 0-size.
+    """
+    zero = [d for d, n in enumerate(x.shape) if n == 0]
+    if not zero:
+        return ref(x, **kw)
+    shape = [1 if n == 0 else n for n in x.shape]
+    out = ref(torch.zeros(shape, dtype=x.dtype), **kw)
+    for d in zero:
+        out = out.narrow(d, 0, 0)
+    return out
+
+
 def need_cpu_autograd():
     if _STATE["device"].type != "cpu":
         pytest.skip("fp64 gradcheck is CPU-only")
@@ -394,7 +411,7 @@ def test_edge_1d(op, shape):
     if kind == "h" and shape[-1] < 2:
         pytest.skip("torch raises for a default n of 0")
     x = rand("r" if kind == "r" else "c", shape, seed=10)
-    check(f(dev(x)), ref(x))
+    check(f(dev(x)), ref_empty_safe(ref, x))
 
 
 EDGE_ND = [
@@ -413,7 +430,7 @@ def test_edge_nd_all_dims(op, shape):
     if kind == "h" and shape[-1] < 2:
         pytest.skip("torch raises for a default last size of 0")
     x = rand("r" if kind == "r" else "c", shape, seed=11)
-    check(f(dev(x)), ref(x))
+    check(f(dev(x)), ref_empty_safe(ref, x))
 
 
 @pytest.mark.parametrize("shape", [(0, 4, 4), (1, 1), (4, 1), (1, 4), (3, 5, 1)], ids=str)
@@ -423,7 +440,7 @@ def test_edge_2d(op, shape):
     if kind == "h" and shape[-1] < 2:
         pytest.skip("torch raises for a default last size of 0")
     x = rand("r" if kind == "r" else "c", shape, seed=12)
-    check(f(dev(x)), ref(x))
+    check(f(dev(x)), ref_empty_safe(ref, x))
 
 
 def test_edge_0d_raises_like_torch():
@@ -790,7 +807,7 @@ def test_alias_complex_input(name):
 def test_batch_dims_1d(op, bshape):
     f, ref, kind = OPS_1D[op]
     x = rand("r" if kind == "r" else "c", (*bshape, 12), seed=19)
-    check(f(dev(x)), ref(x))
+    check(f(dev(x)), ref_empty_safe(ref, x))
 
 
 def test_batch_split_vs_whole():
