@@ -27,6 +27,22 @@ import torch
 
 def pytest_addoption(parser):
     parser.addoption("--run-slow", action="store_true", default=False, help="run tests marked slow")
+    # tests/test_conformance.py: the same reference cases on any backend/device.
+    # CPU CI uses the defaults; a Trn2 run passes e.g.
+    # `--backend nki --conformance-device neuron` (trnsci/trnsci#105).
+    parser.addoption(
+        "--backend",
+        action="store",
+        default="pytorch",
+        choices=("pytorch", "nki", "auto"),
+        help="trnfft backend for the conformance suite (default: pytorch)",
+    )
+    parser.addoption(
+        "--conformance-device",
+        action="store",
+        default="cpu",
+        help="device for conformance-suite inputs, e.g. cpu or neuron (default: cpu)",
+    )
 
 
 def pytest_configure(config):
