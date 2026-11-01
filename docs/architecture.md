@@ -54,25 +54,19 @@ trnfft/
 
 ## Precision modes
 
-Introduced in v0.11.0. Select via `trnfft.set_precision(mode)`. The mode
-mainly changes Bluestein's arbitrary-size FFT path; power-of-2 FFTs run
-through Cooley-Tukey and are less error-prone.
+Introduced in v0.11.0. Select via `trnfft.set_precision(mode)`. The table
+covers the FP32 / FP64 modes; the BF16 modes (`"bf16"`, `"bf16_refined"`,
+`"ozaki"`, `"ozaki_hq"`, N ≤ 256 DFT-GEMM) are documented in
+`trnfft/precision.py`.
 
 | Mode | Scope | Typical rel error (Bluestein) | Cost |
 |------|-------|------------------------------|------|
-| `"fast"` (default) | FP32 throughout | ~2e-2 at N ∈ [500, 1000]; worse beyond | Baseline |
+| `"fast"` (default) | FP32 throughout | ~4e-7 at N = 1000 / 4097 (CPU) since the FP64 chirp fix in v0.23.0; it was 1.2e-4 at N = 1000 before | Baseline |
 | `"kahan"` | Compensated Kahan/Dekker multiplies in Bluestein chirps; twoProd variant of NKI butterfly kernel | Matches "fast" on CPU (chirps aren't the error hotspot); meaningful reduction on NKI butterfly | ~2× butterfly op count on NKI |
-| `"double"` | Promote entire Bluestein host math to FP64, cast back on exit | ~1e-11 at any N; 10+ orders of magnitude better than "fast" | Bluestein uses PyTorch FP64 (no NKI); power-of-2 FFTs unaffected |
+| `"double"` | Promote Bluestein to FP64; power-of-2 N ≤ 1024 runs the DFT-GEMM on the host in FP64 | Near FP64 | No NKI: on the NKI path, FP64 work above the FP64 GEMM range computes on the host (v0.26.0, #109); power-of-2 N > 1024 runs the FP32 kernels |
 
 **Recommendation:** use `"fast"` for STFT, batched FFT, and any
-power-of-2 case. Use `"double"` when you need precision for Bluestein
-sizes (non-power-of-2, N ≥ 500). `"kahan"` is useful only on Trainium
-hardware where FP64 isn't available — on CPU it's equivalent to `"fast"`
-for this particular API.
-
-Source of the error: Bluestein runs three power-of-2 FFTs in series.
-Each butterfly stage accumulates rounding error in the complex multiply
-`prod_re = t_re*o_re - t_im*o_im`, and the three-FFT chain compounds
-that loss. The chirp multiplications on the host are O(N) — compensating
-them alone (as "kahan" on CPU does) doesn't reach the dominant O(N log N)
-error source in the FFT itself.
+power-of-2 case. Use `"double"` when you need more than FP32 accuracy.
+Since v0.23.0 (#82) `"kahan"` takes the same GEMM paths as `"fast"` up to
+N = 4096 (they are more accurate on Trn2 than the Kahan butterfly) and is
+never less accurate than `"fast"`.

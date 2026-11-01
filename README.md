@@ -90,9 +90,9 @@ X = trnfft.rfft(signal)
 image = torch.randn(256, 256)
 F = trnfft.fft2(image)
 
-# STFT (matches torch.stft signature)
+# STFT (torch.stft's arguments; window=None means Hann here, ones in torch.stft)
 waveform = torch.randn(16000)
-S = trnfft.stft(waveform, n_fft=512, hop_length=256)
+S = trnfft.stft(waveform, n_fft=512, hop_length=256, window=torch.hann_window(512))
 ```
 
 ## Complex Neural Network Layers
@@ -140,14 +140,14 @@ y = layer(x)
 **FFT → butterflies → matmul.** Each Cooley-Tukey butterfly stage performs complex-multiply-and-add across all groups simultaneously. On NKI, the complex multiply maps to the Tensor Engine (systolic array).
 
 **Algorithms:**
-- **Power-of-2**: Cooley-Tukey radix-2 (iterative, decimation-in-time)
+- **Power-of-2**: Cooley-Tukey radix-2 (iterative, decimation-in-time) on the PyTorch backend. On the NKI path, FP32: a single DFT-GEMM for N < 512, the batch-fused four-step (two GEMMs) up to N = 4096, and the six-step for N ≥ 8192 (the default since v0.25.0; `TRNFFT_SIX_STEP=0` restores the Stockham / butterfly path)
 - **Arbitrary sizes**: Bluestein's chirp-z transform (pads to power-of-2)
 
 **NKI complex GEMM** uses stationary tile reuse (2 SBUF loads instead of 8) and PSUM accumulation, overlapping Vector Engine negation with Tensor Engine matmul.
 
 ## Hardware compatibility
 
-NKI kernels are validated against **Neuron SDK 2.24+** on the **Deep Learning AMI Neuron PyTorch 2.9 (Ubuntu 24.04)** AMI (20260410 or later). See [docs/installation.md](https://trnsci.github.io/trnfft/installation/#hardware-compatibility) for the full compatibility matrix.
+NKI kernels are validated on Trn2 (trn2.3xlarge) against **Neuron SDK 2.33** with native TorchNeuron, and on Trn1 against **Neuron SDK 2.29+** on the **Deep Learning AMI Neuron PyTorch 2.9 (Ubuntu 24.04)** AMI (XLA lineage). See [docs/installation.md](https://trnsci.github.io/trnfft/installation/#hardware-compatibility) for the full compatibility matrix.
 
 ## Benchmarks
 
@@ -155,23 +155,14 @@ NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https
 
 ## Status
 
-**v0.13.0** — NKI 0.3.0 (Neuron SDK 2.29) migration validated on trn1.2xlarge. DFT-as-GEMM fast path (N ≤ 256) up to 14× on batched FFT/STFT. Stockham radix-4 POC: precision-safe to N=4096, available via bench toggle. See [benchmarks](https://trnsci.github.io/trnfft/benchmarks/) for the full picture.
+**v0.26.0** — validated on Trn2 (Neuron SDK 2.33, native TorchNeuron). Correctness releases, upgrade recommended: 0.25.0 fixed GEMM tail tiles that ≤ 0.24.0 dropped silently (small-N DFT-GEMM, bf16 precision modes, `nn.ComplexLinear`, `complex_gemm`); 0.26.0 fixed `irfft` / `hfft` / `irfft2` / `irfftn` using every bin instead of the first `n//2+1` (#105) and float64 FFTs on the NKI path returning inf/NaN (#109). See the [CHANGELOG](CHANGELOG.md).
 
-**API coverage** (13 common `torch.fft` functions):
-`fft`, `ifft`, `rfft`, `irfft`, `fft2`, `rfft2`, `irfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `stft`, `istft`.
-
-**Not implemented: `hfft`, `ihfft`** — Hermitian-symmetric input variants.
-These assume the input tensor is already conjugate-symmetric (`X[k] = conj(X[N-k])`),
-which in practice means you've post-processed an `rfft` output or are
-reconstructing from a known real signal's spectrum. Both workflows are
-easier expressed with `rfft` / `irfft` plus a manual unpack/pack step.
-If you have a use-case producing Hermitian-symmetric tensors directly,
-[open an issue](https://github.com/trnsci/trnfft/issues) with the
-concrete workload and we'll add them.
+**API coverage** (15 `torch.fft` functions):
+`fft`, `ifft`, `rfft`, `irfft`, `hfft`, `ihfft`, `fft2`, `rfft2`, `irfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `stft`, `istft`. `hfft` / `ihfft` shipped in v0.16.0.
 
 **Roadmap**
 - NKI `ComplexConv1d` / `ComplexModReLU` kernels (today both fall back to PyTorch on NKI)
-- BF16 / FP16 support across NKI kernels
+- BF16 beyond the N ≤ 256 DFT-GEMM precision modes (`bf16`, `bf16_refined`, `ozaki`, `ozaki_hq`); FP16
 - Multi-NeuronCore parallelism: `set_multicore` splits host batches across cores, but
   on Trn2 the host link limits it (#93); large N runs best on one core, on the
   six-step path that is the default from N=8192 (#94; `TRNFFT_SIX_STEP=0` turns it off)
@@ -184,11 +175,11 @@ All six siblings are on PyPI, along with the umbrella meta-package:
 | Project | What | Latest |
 |---------|------|-------:|
 | [trnsci](https://github.com/trnsci/trnsci) | Umbrella meta-package pulling the whole suite | v0.1.0 |
-| [trnblas](https://github.com/trnsci/trnblas) | BLAS Level 1–3 for Trainium | v0.4.0 |
-| [trnrand](https://github.com/trnsci/trnrand) | Philox / Sobol / Halton random number generation | v0.1.0 |
-| [trnsolver](https://github.com/trnsci/trnsolver) | Linear solvers (CG, GMRES) and eigendecomposition | v0.3.0 |
-| [trnsparse](https://github.com/trnsci/trnsparse) | Sparse matrix operations | v0.1.1 |
-| [trntensor](https://github.com/trnsci/trntensor) | Tensor contractions (einsum, TT/Tucker decompositions) | v0.1.1 |
+| [trnblas](https://github.com/trnsci/trnblas) | BLAS Level 1–3 for Trainium | v0.9.1 |
+| [trnrand](https://github.com/trnsci/trnrand) | Philox / Sobol / Halton random number generation | v0.12.1 |
+| [trnsolver](https://github.com/trnsci/trnsolver) | Linear solvers (CG, GMRES) and eigendecomposition | v0.20.0 |
+| [trnsparse](https://github.com/trnsci/trnsparse) | Sparse matrix operations | v0.12.1 |
+| [trntensor](https://github.com/trnsci/trntensor) | Tensor contractions (einsum, TT/Tucker decompositions) | v0.22.0 |
 | [neuron-complex-ops](https://github.com/scttfrdmn/neuron-complex-ops) | Original proof-of-concept, folded into trnfft | archived |
 
 ## License
