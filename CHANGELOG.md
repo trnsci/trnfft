@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-11-01
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: `precision="bf16"` FFTs are 2–6× faster end to end for N < 128, because the BF16 DFT matrix is cached on the device and rows are packed (#103). `ComplexLinear` transposes W once per launch (2–9% faster). Outputs are bitwise equal to 0.25.0.
+
 ## [0.25.0] - 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
