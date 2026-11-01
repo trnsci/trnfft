@@ -1,5 +1,13 @@
 # Benchmarks
 
+!!! note "Historical numbers"
+    The tables on this page are from v0.8.0 on trn1.2xlarge (XLA lineage). The
+    FFT paths have since been rebuilt (DFT-GEMM, batch-fused four-step, and the
+    six-step that is the default for N ≥ 8192 since v0.25.0). Current Trn2
+    measurements (Neuron SDK 2.33, native TorchNeuron) are in the
+    [CHANGELOG](https://github.com/trnsci/trnfft/blob/main/CHANGELOG.md),
+    v0.23.0 through v0.26.0.
+
 trnfft NKI kernels measured against two baselines on the same Trainium instance:
 
 1. **NKI** — trnfft with `set_backend("nki")` running on Tensor + Vector Engines
@@ -23,7 +31,7 @@ The second comparison (1 vs 3) answers *"what's the user-visible difference betw
 
 - **Small sizes are dispatch-bound.** NKI kernel invocation has fixed overhead (XLA dispatch + tensor staging). Below some per-op threshold the host CPU wins.
 - **Single-NeuronCore only.** trn1.2xlarge has one NeuronCore. Multi-NeuronCore parallelism will change the picture for large transforms.
-- **FP32 throughout.** BF16 / FP16 paths are future work.
+- **FP32 throughout.** The BF16 precision modes (`"bf16"`, `"bf16_refined"`, `"ozaki"`, `"ozaki_hq"`, N ≤ 256) came after these measurements; FP16 is future work.
 - Numbers can vary 5-15% run-to-run; treat the table as approximate.
 
 ## Findings (v0.8.0)
