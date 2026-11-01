@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-11-01
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fix:** in every release up to 0.25.0, `irfft` / `hfft` / `irfftn` (with `s=`) used every input bin instead of the first `n//2+1`, so any `n` other than `2(L-1)` and `2L-1` gave silently wrong values (e.g. 3–78% off) or a shape error. This is host-side and affects every backend (#105, #104). Also: `precision="bf16"` FFTs are 2–6× faster for N < 128 (the BF16 DFT matrix is cached on the device and rows are packed), and `ComplexLinear` transposes W once per launch (#103). Outputs are bitwise equal to 0.25.0 where `n` was already correct.
+
 ### Fixed
 
 - **`irfft` / `hfft` / `irfft2` / `irfftn` gave wrong values for most `n`**
