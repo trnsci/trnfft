@@ -1204,13 +1204,17 @@ class TestFourStepBatchFused(TestFourStepDispatch):
         assert (a.real - b.real).abs().max() / scale < 1e-5
         assert (a.imag - b.imag).abs().max() / scale < 1e-5
 
-    def test_non_fp32_uses_unfused(self, monkeypatch):
+    def test_float64_runs_fp32_fused(self, monkeypatch):
+        """Float64 is cast to FP32 before any kernel path (#108): on Trn2 the
+        unfused four-step this test used to expect returned non-finite values
+        for float64. It now takes the fused FP32 kernel and returns float64."""
         calls = self._install_fakes(monkeypatch, batch_fused=True)
         x = ComplexTensor(torch.randn(4, 2048).double(), torch.randn(4, 2048).double())
         from trnfft import fft_core as fc
 
-        fc._cooley_tukey_nki_nograd(x, inverse=False)
-        assert calls["four_step"] == 0 and calls["gemm"] == 2
+        y = fc._cooley_tukey_nki_nograd(x, inverse=False)
+        assert calls["four_step"] == 1 and calls["gemm"] == 0
+        assert y.real.dtype == torch.float64
 
     def test_knob_off_uses_unfused(self, monkeypatch):
         calls = self._install_fakes(monkeypatch, batch_fused=False)
@@ -1858,3 +1862,50 @@ class TestPETransposeSelection:
         ref = (torch.fft.ifft if inverse else torch.fft.fft)(x.to(torch.complex128))
         got = torch.complex(y.real.double(), y.imag.double())
         assert (torch.linalg.vector_norm(got - ref) / torch.linalg.vector_norm(ref)) < 1e-6
+
+
+class TestFloat64OnKernelPath:
+    """Float64 must not reach the FP32-only NKI kernels (#108): "double" goes to
+    the host in FP64, other modes run the kernels in FP32 and return float64."""
+
+    @pytest.fixture
+    def fake_kernels(self, monkeypatch):
+        from trnfft import fft_core
+
+        seen = []
+
+        def fake_fused(x, inverse, *a, **k):
+            seen.append(x.real.dtype)
+            assert x.real.dtype == torch.float32, "float64 reached an FP32 kernel"
+            z = torch.complex(x.real, x.imag)
+            y = torch.fft.ifft(z) if inverse else torch.fft.fft(z)
+            return ComplexTensor(y.real.contiguous(), y.imag.contiguous())
+
+        import trnfft.nki.butterfly as bf
+
+        for name in ("butterfly_stage_kernel", "butterfly_stage_kernel_kahan"):
+            monkeypatch.setattr(bf, name, None, raising=False)  # absent without NKI
+        monkeypatch.setattr(fft_core, "_use_fused_four_step", lambda x, n: True)
+        monkeypatch.setattr(fft_core, "_fft_via_four_step_fused", fake_fused)
+        return seen
+
+    @pytest.mark.parametrize("inverse", [False, True])
+    @pytest.mark.parametrize("precision", ["fast", "kahan", "double"])
+    def test_float64_input(self, fake_kernels, precision, inverse):
+        from trnfft.fft_core import _cooley_tukey_nki_nograd
+
+        g = torch.Generator().manual_seed(0)
+        z = torch.complex(
+            torch.randn(3, 2048, generator=g, dtype=torch.float64),
+            torch.randn(3, 2048, generator=g, dtype=torch.float64),
+        )
+        y = _cooley_tukey_nki_nograd(ComplexTensor(z.real, z.imag), inverse, precision=precision)
+        want = torch.fft.ifft(z) if inverse else torch.fft.fft(z)
+        assert y.real.dtype == torch.float64
+        err = (torch.complex(y.real, y.imag) - want).abs().max() / want.abs().max()
+        if precision == "double":
+            assert fake_kernels == []  # host FP64, no kernel
+            assert err < 1e-12
+        else:
+            assert fake_kernels == [torch.float32]
+            assert err < 1e-5

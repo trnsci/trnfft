@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Float64 FFTs on the NKI path returned non-finite values** (silent).
+  Measured on **0.25.0** on Trn2 (earlier releases not measured), with
+  `set_backend("nki")` or `"auto"` on Neuron hardware, for host and device
+  inputs. Every kernel past the FP32 DFT-GEMM range is FP32-only, and float64
+  operands came back as inf/NaN with no error. That covers:
+  - any float64 `fft`/`ifft` (and the transforms built on them) at power-of-2
+    N > 1024, or at Bluestein N > 512;
+  - every `precision="double"` Bluestein FFT at N > 512, float32 input
+    included, because Bluestein promotes to float64.
+
+  Float64 now runs the kernels in FP32 and returns float64. `"double"` above
+  the FP64 GEMM range computes on the host in FP64 (#108).
+
 ## [0.25.0] - 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
