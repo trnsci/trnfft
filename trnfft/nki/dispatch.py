@@ -81,6 +81,148 @@ def _use_nki() -> bool:
     return HAS_NKI
 
 
+# ── Kernel operand dtypes: one guard at the NKI boundary (trnsci#35) ─────────
+#
+# float64, integer, bool and complex tensors reached the FP32 kernels as is and
+# came back inf/NaN, garbage or in the wrong dtype (#108, #131, and the same
+# class in trnblas#68, trntensor#87, trnsolver#83, trnsparse#78/#79). Each fix
+# was local. Two layers close the class here:
+#
+# * ``_launch`` and ``_simulate_kernel`` (every kernel launch: native op, XLA
+#   direct call, simulator) check each tensor operand against
+#   ``KERNEL_DTYPES[op]`` and raise ``TypeError`` if it is not listed, so no
+#   kernel can be reached with an unsupported dtype even when a wrapper forgets
+#   the guard.
+# * The public wrappers (``complex_gemm``, ``complex_linear``,
+#   ``complex_mask_apply``, ``complex_gemm_bf16``) and the FFT driver call
+#   ``_kernel_operands`` first: float64 runs the kernel in float32 and the
+#   result is cast back to float64 (the trade the FFT paths have made since
+#   #108); any other unsupported dtype (integer, bool, complex, mixed) runs the
+#   PyTorch backend, so the result is exactly what ``set_backend("pytorch")``
+#   returns. Under ``TRNFFT_REQUIRE_NKI=1`` both raise ``NotImplementedError``
+#   instead (the trnblas#69 convention).
+#
+# The kernels allocate their outputs in the input dtype and accumulate in an
+# FP32 PSUM, so BF16 / FP16 operands are passed through as before.
+# ``four_step_fft`` and ``complex_gemm_tn`` are FP32-only: their drivers only
+# launch them for float32 (the four-step kernel stores its FP32 SBUF tiles
+# without a cast).
+_FP32 = frozenset({torch.float32})
+_FP32_HALF = frozenset({torch.float32, torch.bfloat16, torch.float16})
+
+KERNEL_DTYPES: dict[str, frozenset] = {
+    "complex_gemm": _FP32_HALF,
+    "complex_gemm_t2d": _FP32_HALF,
+    "complex_gemm_tn": _FP32,
+    "complex_gemm_bf16": _FP32_HALF,
+    "complex_gemm_bf16_t2d": _FP32_HALF,
+    "complex_linear": _FP32_HALF,
+    "complex_linear_t2d": _FP32_HALF,
+    "complex_mul": _FP32_HALF,
+    "butterfly_stage": _FP32_HALF,
+    "butterfly_stage_kahan": _FP32_HALF,
+    "stockham_radix4_stage": _FP32_HALF,
+    "stockham_radix8_w8": _FP32_HALF,
+    "stockham_radix8_w8_t2d": _FP32_HALF,
+    "four_step_fft": _FP32,
+    # The composite ``trnfft::fft`` op is host code, not a kernel: its driver
+    # (``fft_core._cooley_tukey_nki_nograd``) handles float64 itself and every
+    # stage kernel it launches is checked against its own entry.
+    "fft": _FP32_HALF | {torch.float64},
+}
+
+# (module, attribute) of each kernel, for ``_simulate_kernel`` callers that
+# pass only the kernel object.
+_KERNEL_ATTRS: dict[str, tuple[str, str]] = {
+    "complex_gemm": ("dispatch", "_complex_gemm_kernel"),
+    "complex_gemm_t2d": ("dispatch", "_complex_gemm_t2d_kernel"),
+    "complex_gemm_tn": ("dispatch", "_complex_gemm_tn_kernel"),
+    "complex_gemm_bf16": ("dispatch", "_complex_gemm_kernel_bf16"),
+    "complex_gemm_bf16_t2d": ("dispatch", "_complex_gemm_bf16_t2d_kernel"),
+    "complex_linear": ("dispatch", "_complex_linear_kernel"),
+    "complex_linear_t2d": ("dispatch", "_complex_linear_t2d_kernel"),
+    "complex_mul": ("dispatch", "_complex_mul_kernel"),
+    "butterfly_stage": ("butterfly", "butterfly_stage_kernel"),
+    "butterfly_stage_kahan": ("butterfly", "butterfly_stage_kernel_kahan"),
+    "stockham_radix4_stage": ("stockham", "stockham_radix4_stage_kernel"),
+    "stockham_radix8_w8": ("stockham", "stockham_radix8_w8_kernel"),
+    "stockham_radix8_w8_t2d": ("stockham", "stockham_radix8_w8_t2d_kernel"),
+    "four_step_fft": ("four_step", "four_step_fft_kernel"),
+}
+
+
+def _require_nki() -> bool:
+    """``TRNFFT_REQUIRE_NKI=1`` (read per call): refuse dtypes the kernels do not
+    take instead of casting float64 to float32 or computing in torch."""
+    return os.environ.get("TRNFFT_REQUIRE_NKI", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dtype_names(dtypes) -> list[str]:
+    return sorted(str(d).removeprefix("torch.") for d in dtypes)
+
+
+def _check_kernel_dtypes(op_name: str, tensors) -> None:
+    """Raise ``TypeError`` unless every tensor operand of ``op_name`` has a dtype
+    listed in ``KERNEL_DTYPES``. Called by every kernel launch."""
+    allowed = KERNEL_DTYPES.get(op_name)
+    if allowed is None:
+        raise TypeError(f"trnfft: kernel op {op_name!r} has no KERNEL_DTYPES entry")
+    dts = {t.dtype for t in tensors if isinstance(t, torch.Tensor)}
+    if not dts <= allowed:
+        raise TypeError(
+            f"trnfft: kernel {op_name!r} takes {_dtype_names(allowed)} operands, got "
+            f"{_dtype_names(dts)}. The caller must go through _kernel_operands "
+            "(float64 is cast to float32, other dtypes run in torch)."
+        )
+
+
+def _no_kernel_for_dtype(what: str, op_name: str, dtypes) -> None:
+    """Under TRNFFT_REQUIRE_NKI, refuse a dtype the kernel does not take.
+
+    Without it float64 runs the kernel in float32 (result cast back) and other
+    dtypes run in torch. Before this guard they reached the FP32 kernels as is
+    (#108, #131, trnsci#35).
+    """
+    if _require_nki():
+        raise NotImplementedError(
+            f"trnfft {what}: the NKI kernel {op_name!r} takes "
+            f"{_dtype_names(KERNEL_DTYPES[op_name])}, got {_dtype_names(dtypes)}. "
+            "Unset TRNFFT_REQUIRE_NKI to run float64 in float32 on the kernel "
+            "(result cast back to float64) and other dtypes in torch."
+        )
+
+
+def _kernel_operands(*tensors: torch.Tensor, op: str, what: str):
+    """Operands for kernel ``op`` from the caller's tensors.
+
+    Returns ``(operands, out_dtype)`` to launch the kernel, where ``out_dtype``
+    is the dtype to cast the result back to (None: keep the kernel's), or
+    ``None`` when the caller must compute in torch (the PyTorch backend).
+
+    * every operand one dtype the kernel takes: unchanged;
+    * floating operands including float64: cast to float32, ``out_dtype``
+      float64 (FP32 kernel precision, as the FFT paths since #108 and
+      ``complex_linear`` since #131);
+    * anything else (integer, bool, complex, mixed half/fp32): ``None``.
+
+    Under ``TRNFFT_REQUIRE_NKI=1`` the last two raise ``NotImplementedError``.
+    """
+    allowed = KERNEL_DTYPES[op]
+    dts = {t.dtype for t in tensors}
+    if len(dts) == 1 and dts <= allowed:
+        return tensors, None
+    _no_kernel_for_dtype(what, op, dts)
+    if torch.float64 in dts and all(t.is_floating_point() for t in tensors):
+        return tuple(t.float() for t in tensors), torch.float64
+    return None
+
+
+def _cast_result(c: ComplexTensor, out_dtype) -> ComplexTensor:
+    if out_dtype is None:
+        return c
+    return ComplexTensor(c.real.to(out_dtype), c.imag.to(out_dtype))
+
+
 def complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     """Complex matrix multiply with backend dispatch.
 
@@ -88,9 +230,18 @@ def complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     - Phase 1: A_real stationary, stream B_real and B_imag
     - Phase 2: A_imag stationary, stream -B_imag and B_real
     - 4 SBUF loads instead of 8, PSUM accumulation
+
+    float64 runs the kernel in float32 and returns float64; integer, bool and
+    complex operands compute in torch (``TRNFFT_REQUIRE_NKI=1``: both raise).
     """
     if _use_nki():
-        return _nki_complex_gemm(a, b)
+        ops = _kernel_operands(
+            a.real, a.imag, b.real, b.imag, op=_gemm_kernel_names()[1], what="complex_gemm"
+        )
+        if ops is not None:
+            (ar, ai, br, bi), out_dtype = ops
+            c = _nki_complex_gemm(ComplexTensor(ar, ai), ComplexTensor(br, bi))
+            return _cast_result(c, out_dtype)
     return complex_matmul(a, b)
 
 
@@ -113,10 +264,18 @@ def complex_linear(x: ComplexTensor, w_real: torch.Tensor, w_imag: torch.Tensor)
         if xr.numel() == 0 or w_real.numel() == 0:
             out = (*lead, w_real.shape[0])
             return ComplexTensor(xr.new_zeros(out), xi.new_zeros(out))
-        if xr.dim() == 2:
-            return _nki_complex_linear(x, w_real, w_imag)
-        y = _nki_complex_linear(ComplexTensor(xr.reshape(-1, k), xi.reshape(-1, k)), w_real, w_imag)
-        return ComplexTensor(y.real.reshape(*lead, -1), y.imag.reshape(*lead, -1))
+        # float64 runs in float32 and returns float64 (#131); integer, bool,
+        # complex and mixed operands take the PyTorch fallback below.
+        ops = _kernel_operands(
+            xr, xi, w_real, w_imag, op=_linear_kernel_names()[1], what="complex_linear"
+        )
+        if ops is not None:
+            (xr, xi, wr, wi), out_dtype = ops
+            if xr.dim() == 2:
+                return _cast_result(_nki_complex_linear(ComplexTensor(xr, xi), wr, wi), out_dtype)
+            y = _nki_complex_linear(ComplexTensor(xr.reshape(-1, k), xi.reshape(-1, k)), wr, wi)
+            y = ComplexTensor(y.real.reshape(*lead, -1), y.imag.reshape(*lead, -1))
+            return _cast_result(y, out_dtype)
     # PyTorch fallback: 4 real matmuls
     yr = torch.matmul(x.real, w_real.t()) - torch.matmul(x.imag, w_imag.t())
     yi = torch.matmul(x.real, w_imag.t()) + torch.matmul(x.imag, w_real.t())
@@ -129,8 +288,17 @@ def complex_mask_apply(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTenso
     NKI kernel fuses all 6 element-wise ops into single kernel invocation,
     avoiding 6 HBM round-trips.
     """
-    if _use_nki():
-        return _nki_complex_mask(mask, spec)
+    # Sizes the kernel cannot take (not a multiple of 128 elements) run in
+    # torch at the caller's dtype before the dtype guard: that route is already
+    # full precision, so float64 must not be cast for it.
+    if _use_nki() and mask.real.numel() % 128 == 0:
+        ops = _kernel_operands(
+            mask.real, mask.imag, spec.real, spec.imag, op="complex_mul", what="complex_mask_apply"
+        )
+        if ops is not None:
+            (mr, mi, sr, si), out_dtype = ops
+            c = _nki_complex_mask(ComplexTensor(mr, mi), ComplexTensor(sr, si))
+            return _cast_result(c, out_dtype)
     return mask * spec
 
 
@@ -798,6 +966,9 @@ def _launch(kernel, op_name: str, *args):
     there between stages) are not copied, and the result stays there.
     """
     tensors = [a for a in args if isinstance(a, torch.Tensor)]
+    # Structural dtype guard (trnsci#35): no kernel runs with an operand dtype
+    # it does not take, whichever wrapper launched it.
+    _check_kernel_dtypes(op_name, tensors)
     if _is_native():
         orig = tensors[0].device
         op = _get_native_ops()[op_name]
@@ -817,7 +988,18 @@ def _launch(kernel, op_name: str, *args):
     return _to_host(out, orig)
 
 
-def _simulate_kernel(kernel, *tensors):
+def _kernel_op_name(kernel) -> str:
+    """The ``KERNEL_DTYPES`` key of a kernel object (``TypeError`` if unknown)."""
+    mods = {"dispatch": sys.modules[__name__]}
+    for name in ("butterfly", "stockham", "four_step"):
+        mods[name] = sys.modules.get(f"{__package__}.{name}")
+    for op, (mod, attr) in _KERNEL_ATTRS.items():
+        if mods[mod] is not None and getattr(mods[mod], attr, None) is kernel:
+            return op
+    raise TypeError(f"trnfft: {kernel!r} is not a known kernel; pass op= to _simulate_kernel")
+
+
+def _simulate_kernel(kernel, *tensors, op: str | None = None):
     """Route a kernel call through `nki.simulate` on CPU.
 
     Converts each input tensor to numpy, calls the simulator, and marshals
@@ -828,7 +1010,11 @@ def _simulate_kernel(kernel, *tensors):
     Used by the dispatch wrappers when ``TRNFFT_USE_SIMULATOR=1`` is set
     in the environment. Bypasses torch_xla and NEFF compile entirely —
     correctness iteration only; hardware still owns perf numbers.
+
+    ``op`` is the kernel's ``KERNEL_DTYPES`` key (looked up from ``kernel``
+    when omitted); operand dtypes are checked as in ``_launch``.
     """
+    _check_kernel_dtypes(op if op is not None else _kernel_op_name(kernel), tensors)
     orig_device = tensors[0].device
     # numpy has no BF16 dtype — cast to FP32 before simulation (simulator
     # uses the kernel's declared dtype, not the numpy input dtype).
@@ -860,19 +1046,23 @@ def complex_gemm_bf16(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     On CPU (no NKI): falls back to ``complex_matmul`` with whatever dtype
     the inputs carry (correctness path; no throughput benefit on CPU).
     """
-    if _use_nki() and not _use_simulator():
-        # Move inputs to the device, then move results back to the caller's
-        # device (like the autograd wrappers). Returning device tensors here
-        # made _fft_via_ozaki_hq mix device and CPU tensors (trnfft#80).
+    if _use_nki() or _use_simulator():
         kernel_name, op_name = _bf16_kernel_names()
-        c_real, c_imag = _launch(
-            globals().get(kernel_name), op_name, a.real, a.imag, b.real, b.imag
-        )
-        return ComplexTensor(c_real, c_imag)
-    if _use_simulator():
-        kernel = globals()[_bf16_kernel_names()[0]]
-        c_real, c_imag = _simulate_kernel(kernel, a.real, a.imag, b.real, b.imag)
-        return ComplexTensor(c_real, c_imag)
+        # The result is FP32 on every route (as the fallback below): float64
+        # runs the kernel in float32 and stays float32; integer, bool and
+        # complex operands take the fallback (TRNFFT_REQUIRE_NKI=1: raise).
+        ops = _kernel_operands(a.real, a.imag, b.real, b.imag, op=op_name, what="complex_gemm_bf16")
+        if ops is not None:
+            ar, ai, br, bi = ops[0]
+            if _use_simulator():
+                kernel = globals()[kernel_name]
+                c_real, c_imag = _simulate_kernel(kernel, ar, ai, br, bi, op=op_name)
+                return ComplexTensor(c_real, c_imag)
+            # Move inputs to the device, then move results back to the caller's
+            # device (like the autograd wrappers). Returning device tensors here
+            # made _fft_via_ozaki_hq mix device and CPU tensors (trnfft#80).
+            c_real, c_imag = _launch(globals().get(kernel_name), op_name, ar, ai, br, bi)
+            return ComplexTensor(c_real, c_imag)
     # CPU fallback: simulate FP32 PSUM behaviour by casting BF16 inputs to
     # FP32 before the matmul. On hardware, nc_matmul accumulates BF16 products
     # into a FP32 PSUM; on CPU torch.matmul accumulates in BF16 without the

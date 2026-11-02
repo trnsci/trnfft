@@ -218,7 +218,7 @@ def _launch_stockham_stage(
     the native path, ``kernel`` on the XLA path); operands are already on the
     kernel device, so nothing is copied.
     """
-    from .nki.dispatch import _launch, _pe_transpose_enabled
+    from .nki.dispatch import _check_kernel_dtypes, _launch, _pe_transpose_enabled
 
     if op_name == "stockham_radix8_w8" and not _pe_transpose_enabled():
         # TRNFFT_PE_TRANSPOSE=0: the load_transpose2d W_8 kernel (trnfft#97).
@@ -230,6 +230,7 @@ def _launch_stockham_stage(
         if use_sim:
             import nki as _nki
 
+            _check_kernel_dtypes(op_name, (a, b, c, d))
             o_re, o_im = _nki.simulate(kernel)(
                 a.detach().cpu().numpy(),
                 b.detach().cpu().numpy(),
@@ -550,7 +551,7 @@ def _fft_via_four_step_fused(
         packs = _fs.four_step_group_packs(n1, r.shape[0], pack)
         consts = _four_step_fused_consts(n1, n2, inverse, r.dtype, r.device, pack, packs)
         if _use_simulator():
-            return _simulate_kernel(kernel, r, i, *consts)
+            return _simulate_kernel(kernel, r, i, *consts, op="four_step_fft")
         return _launch(kernel, "four_step_fft", r, i, *consts)
 
     rows = re.shape[0]
@@ -733,7 +734,7 @@ def _six_step_pass1_tn(re, im, B: int, n1: int, n2: int, inverse: bool):
     def run(s, e):
         a_r, a_i = at_re[s * n2 : e * n2], at_im[s * n2 : e * n2]
         if _use_simulator():
-            return _simulate_kernel(kernel, a_r, a_i, W.real, W.imag)
+            return _simulate_kernel(kernel, a_r, a_i, W.real, W.imag, op="complex_gemm_tn")
         return _launch(kernel, "complex_gemm_tn", a_r, a_i, W.real, W.imag)
 
     outs = [run(s, min(s + per, B)) for s in range(0, B, per)]
@@ -1856,12 +1857,48 @@ def _cooley_tukey_nki_nograd(
     _DFT_GEMM_THRESHOLD = 0 to force the Kahan butterfly at any N.
     """
     from .nki.butterfly import butterfly_stage_kernel, butterfly_stage_kernel_kahan
-    from .nki.dispatch import _kernel_device, _launch, _use_simulator
+    from .nki.dispatch import (
+        KERNEL_DTYPES,
+        _check_kernel_dtypes,
+        _kernel_device,
+        _launch,
+        _no_kernel_for_dtype,
+        _use_simulator,
+    )
 
     kernel = butterfly_stage_kernel_kahan if precision == "kahan" else butterfly_stage_kernel
     op_name = "butterfly_stage_kahan" if precision == "kahan" else "butterfly_stage"
     use_sim = _use_simulator()
     n = x.shape[-1]
+
+    # Operand dtypes first, ahead of the bench toggles too, so no path below
+    # sees a dtype its kernels do not take (trnsci#35). Every kernel is FP32
+    # (BF16/FP16 pass through), and float64 operands came back non-finite on
+    # Trn2 (#108), at every measured N for a float64 caller (the DFT-GEMM path
+    # at N = 256 included) and for every "double" Bluestein (which promotes to
+    # float64) at N > 512. "double" is the accuracy-first mode, so it computes
+    # these on the host in FP64 (the FP64 DFT-GEMM up to its threshold, as
+    # before). Other modes run the kernels in FP32 and return float64, as the
+    # FP32 GEMM paths already do for float64 input; TRNFFT_REQUIRE_NKI=1
+    # refuses that cast. Integer, bool and complex parts are refused: the
+    # public API promotes integer/bool input to a float dtype first (#113).
+    dt = x.real.dtype
+    if dt == torch.float64:
+        if precision == "double":
+            if n <= _DOUBLE_GEMM_THRESHOLD:
+                return _fft_via_gemm_double(x, inverse)
+            return _fft_host_fp64(x, inverse)
+        _no_kernel_for_dtype("fft", "butterfly_stage", {dt})
+        y = _cooley_tukey_nki_nograd(
+            ComplexTensor(x.real.float(), x.imag.float()), inverse, precision=precision
+        )
+        return ComplexTensor(y.real.double(), y.imag.double())
+    if dt not in KERNEL_DTYPES["butterfly_stage"]:
+        _no_kernel_for_dtype("fft", "butterfly_stage", {dt})
+        raise TypeError(
+            f"trnfft: the NKI FFT takes floating-point real/imag parts, got {dt}; "
+            "trnfft.fft and the other public transforms promote integer and bool input"
+        )
 
     # Bench-toggles: force a specific path ahead of all threshold checks.
     if _FORCE_OZAKI_HQ:
@@ -1880,21 +1917,6 @@ def _cooley_tukey_nki_nograd(
     # "double" mode: NKI PSUM is always FP32, so bypass NKI and use CPU FP64.
     if precision == "double" and n <= _DOUBLE_GEMM_THRESHOLD:
         return _fft_via_gemm_double(x, inverse)
-
-    # Float64 past the FP64 GEMM check: every kernel below is FP32-only, and
-    # float64 operands came back non-finite on Trn2 (#108), at every measured N
-    # for a float64 caller (the DFT-GEMM path at N = 256 included) and for every
-    # "double" Bluestein (which promotes to float64) at N > 512. "double" is the accuracy-
-    # first mode, so it computes
-    # these on the host in FP64. Other modes run the kernels in FP32 and return
-    # float64, as the FP32 GEMM paths already do for float64 input.
-    if x.real.dtype == torch.float64:
-        if precision == "double":
-            return _fft_host_fp64(x, inverse)
-        y = _cooley_tukey_nki_nograd(
-            ComplexTensor(x.real.float(), x.imag.float()), inverse, precision=precision
-        )
-        return ComplexTensor(y.real.double(), y.imag.double())
 
     # "bf16" mode: BF16 compute on Tensor Engine, FP32 PSUM → FP32 output.
     if precision == "bf16" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
@@ -2025,6 +2047,7 @@ def _cooley_tukey_nki_nograd(
         if use_sim:
             import nki as _nki
 
+            _check_kernel_dtypes(op_name, (re, im, tw_re_bcast, tw_im_bcast))
             re_np, im_np = _nki.simulate(kernel)(
                 re.detach().cpu().numpy(),
                 im.detach().cpu().numpy(),

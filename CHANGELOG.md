@@ -7,7 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **One dtype guard at the NKI kernel boundary: float64, integer, bool and
+  complex operands no longer reach a kernel that does not take them**
+  (trnsci/trnsci#35; the class of #108, #131, #113). `dispatch.KERNEL_DTYPES`
+  lists what each kernel takes: float32, bfloat16 and float16, or float32 only
+  for `four_step_fft` and `complex_gemm_tn`. `_launch` (native and XLA),
+  `_simulate_kernel`, the direct `nki.simulate` calls and every `nki_op` body
+  (so a direct `torch.ops.trnfft.<op>` call too) raise `TypeError` for any
+  other operand dtype. The public wrappers convert first:
+  - `complex_gemm`, `complex_linear` / `ComplexLinear` and `complex_mask_apply`
+    with float64 operands used to return inf/NaN with no error (#131). They
+    now run the kernel in float32 and return float64.
+  - `complex_gemm_bf16` with float64 operands now runs the kernel in float32.
+    It returns float32, as its fallback always has.
+  - Integer, bool, complex and mixed half/float32 operands run the PyTorch
+    backend, so the result (or the error) is the one `set_backend("pytorch")`
+    gives.
+  - In the FFT driver, the float64 handling now runs before the bench
+    toggles, and a direct `fft_core` call with integer or bool parts raises
+    `TypeError`. The public transforms already promote integer and bool input
+    (#113).
+  - `complex_mask_apply` sizes that are not a multiple of 128 keep their
+    float64 torch route.
+  - The FFT float64 paths and `precision="double"` are unchanged.
+
 ### Added
+
+- **`TRNFFT_REQUIRE_NKI=1`** (read per call): an operand dtype a kernel does
+  not take raises `NotImplementedError` instead of being cast to float32 or
+  computed in torch, as `TRNBLAS_REQUIRE_NKI` does (trnblas#69).
+  `precision="double"` keeps its host FP64 route, which is part of the mode
+  and not a fallback. Open decisions: #136 (float64 policy) and #137
+  (half-precision operands and the result dtype of the low-precision modes).
 
 - **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
   trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every

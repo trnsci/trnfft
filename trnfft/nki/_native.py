@@ -27,6 +27,10 @@ lineage (whose `torch_neuronx` has no `nki_op`) never load it.
 This module deliberately does not use `from __future__ import annotations`:
 `nki_op` builds the op schema from the live annotation objects.
 
+Each op body checks its tensor operands against ``dispatch.KERNEL_DTYPES``
+first (``TypeError`` otherwise, trnsci#35), so a direct
+``torch.ops.trnfft.<op>`` call cannot hand a kernel a dtype it does not take.
+
 The kernels are looked up on their modules at call time rather than
 imported by name, so registration itself does not trace or compile
 anything; the first call per input shape does.
@@ -83,6 +87,7 @@ def _register_backward(op, backward_math):
 def complex_gemm(
     a_real: torch.Tensor, a_imag: torch.Tensor, b_real: torch.Tensor, b_imag: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("complex_gemm", (a_real, a_imag, b_real, b_imag))
     return _d._complex_gemm_kernel(a_real, a_imag, b_real, b_imag)
 
 
@@ -97,6 +102,7 @@ def complex_gemm_t2d(
     a_real: torch.Tensor, a_imag: torch.Tensor, b_real: torch.Tensor, b_imag: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # TRNFFT_PE_TRANSPOSE=0: the load_transpose2d GEMM (trnfft#97).
+    _d._check_kernel_dtypes("complex_gemm_t2d", (a_real, a_imag, b_real, b_imag))
     return _d._complex_gemm_t2d_kernel(a_real, a_imag, b_real, b_imag)
 
 
@@ -112,6 +118,7 @@ def complex_gemm_t2d(
 def complex_gemm_tn(
     at_real: torch.Tensor, at_imag: torch.Tensor, b_real: torch.Tensor, b_imag: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("complex_gemm_tn", (at_real, at_imag, b_real, b_imag))
     return _d._complex_gemm_tn_kernel(at_real, at_imag, b_real, b_imag)
 
 
@@ -125,6 +132,7 @@ def complex_gemm_tn(
 def complex_gemm_bf16(
     a_real: torch.Tensor, a_imag: torch.Tensor, b_real: torch.Tensor, b_imag: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("complex_gemm_bf16", (a_real, a_imag, b_real, b_imag))
     return _d._complex_gemm_kernel_bf16(a_real, a_imag, b_real, b_imag)
 
 
@@ -139,6 +147,7 @@ def complex_gemm_bf16_t2d(
     a_real: torch.Tensor, a_imag: torch.Tensor, b_real: torch.Tensor, b_imag: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # TRNFFT_PE_TRANSPOSE=0: the load_transpose2d BF16 GEMM (trnfft#100).
+    _d._check_kernel_dtypes("complex_gemm_bf16_t2d", (a_real, a_imag, b_real, b_imag))
     return _d._complex_gemm_bf16_t2d_kernel(a_real, a_imag, b_real, b_imag)
 
 
@@ -152,6 +161,7 @@ def complex_gemm_bf16_t2d(
 def complex_linear(
     x_real: torch.Tensor, x_imag: torch.Tensor, w_real: torch.Tensor, w_imag: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("complex_linear", (x_real, x_imag, w_real, w_imag))
     return _d._complex_linear_kernel(x_real, x_imag, w_real, w_imag)
 
 
@@ -166,6 +176,7 @@ def complex_linear_t2d(
     x_real: torch.Tensor, x_imag: torch.Tensor, w_real: torch.Tensor, w_imag: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # TRNFFT_PE_TRANSPOSE=0: the load_transpose2d complex linear (trnfft#100).
+    _d._check_kernel_dtypes("complex_linear_t2d", (x_real, x_imag, w_real, w_imag))
     return _d._complex_linear_t2d_kernel(x_real, x_imag, w_real, w_imag)
 
 
@@ -177,6 +188,7 @@ def complex_linear_t2d(
 def complex_mul(
     a_real: torch.Tensor, a_imag: torch.Tensor, b_real: torch.Tensor, b_imag: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("complex_mul", (a_real, a_imag, b_real, b_imag))
     return _d._complex_mul_kernel(a_real, a_imag, b_real, b_imag)
 
 
@@ -203,6 +215,7 @@ def butterfly_stage(
     n: int,
     stage: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("butterfly_stage", (x_re, x_im, tw_re, tw_im))
     return _bfly.butterfly_stage_kernel(x_re, x_im, tw_re, tw_im, n, stage)
 
 
@@ -219,6 +232,7 @@ def butterfly_stage_kahan(
     n: int,
     stage: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("butterfly_stage_kahan", (x_re, x_im, tw_re, tw_im))
     return _bfly.butterfly_stage_kernel_kahan(x_re, x_im, tw_re, tw_im, n, stage)
 
 
@@ -230,6 +244,7 @@ def butterfly_stage_kahan(
 def stockham_radix4_stage(
     x_re: torch.Tensor, x_im: torch.Tensor, tw_re: torch.Tensor, tw_im: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("stockham_radix4_stage", (x_re, x_im, tw_re, tw_im))
     return _st.stockham_radix4_stage_kernel(x_re, x_im, tw_re, tw_im)
 
 
@@ -241,6 +256,7 @@ def stockham_radix4_stage(
 def stockham_radix8_w8(
     a_re: torch.Tensor, a_im: torch.Tensor, w8_re: torch.Tensor, w8_im: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("stockham_radix8_w8", (a_re, a_im, w8_re, w8_im))
     return _st.stockham_radix8_w8_kernel(a_re, a_im, w8_re, w8_im)
 
 
@@ -253,6 +269,7 @@ def stockham_radix8_w8_t2d(
     a_re: torch.Tensor, a_im: torch.Tensor, w8_re: torch.Tensor, w8_im: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # TRNFFT_PE_TRANSPOSE=0: the load_transpose2d W_8 kernel (trnfft#97).
+    _d._check_kernel_dtypes("stockham_radix8_w8_t2d", (a_re, a_im, w8_re, w8_im))
     return _st.stockham_radix8_w8_t2d_kernel(a_re, a_im, w8_re, w8_im)
 
 
@@ -270,6 +287,7 @@ def four_step_fft(
     w2_re: torch.Tensor,
     w2_im: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("four_step_fft", (x_re, x_im, w1_blk, t_re, t_im, w2_re, w2_im))
     return _fs.four_step_fft_kernel(x_re, x_im, w1_blk, t_re, t_im, w2_re, w2_im)
 
 
