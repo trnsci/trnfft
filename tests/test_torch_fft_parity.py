@@ -394,6 +394,56 @@ def test_c2r_r2c_need_one_dim(name):
         getattr(trnfft, name)(torch.randn(4, 8), dim=())
 
 
+# A repeated dim: torch.fft raises "FFT dims must be unique"; trnfft still
+# transforms once per occurrence, with a DeprecationWarning (#127).
+REPEATED_DIM_FNS = ["fftn", "ifftn", "fft2", "ifft2", "rfftn", "irfftn", "hfftn", "ihfftn"]
+
+
+@pytest.mark.parametrize("dim", [(0, 0), (2, -1), (0, 1, 0)], ids=str)
+@pytest.mark.parametrize("name", REPEATED_DIM_FNS)
+def test_repeated_dim_deprecated_behaviour_unchanged(name, dim):
+    if name.endswith("2") and len(dim) != 2:
+        pytest.skip("2-D transform takes two dims")
+    real_in = name in ("rfftn", "ihfftn")
+    x = _rand((6, 5, 4), seed=_seed(name, dim), complex_=not real_in)
+    with pytest.raises(RuntimeError, match="unique"):
+        getattr(torch.fft, name)(x, dim=dim)
+    with pytest.warns(DeprecationWarning, match="will raise in the next minor release") as rec:
+        got = getattr(trnfft, name)(_trn_in(x), dim=dim)
+    assert len(rec) == 1
+    assert rec[0].filename == __file__  # attributed to the caller, not trnfft
+    # Unchanged: one transform per occurrence. Build the same result from
+    # single-dim torch.fft calls (the last occurrence is the r2c / c2r step).
+    if name in ("hfftn", "ihfftn"):
+        return  # thin wrappers over irfftn / rfftn, checked there
+    nd = x.dim()
+    dims = [d % nd for d in dim]
+    want = x
+    if name == "rfftn":
+        want = torch.fft.rfft(want, dim=dims[-1])
+        for d in dims[:-1]:
+            want = torch.fft.fft(want, dim=d)
+    elif name == "irfftn":
+        for d in dims[:-1]:
+            want = torch.fft.ifft(want, dim=d)
+        want = torch.fft.irfft(want, dim=dims[-1])
+    else:
+        step = torch.fft.ifft if name.startswith("i") else torch.fft.fft
+        for d in dims:
+            want = step(want, dim=d)
+    _assert_matches(got, want, rtol=1e-9, atol=1e-9)
+
+
+def test_unique_dims_do_not_warn():
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        trnfft.fftn(torch.randn(4, 6), dim=(0, 1))
+        trnfft.rfftn(torch.randn(4, 6), dim=(-2, -1))
+        trnfft.irfftn(ComplexTensor(torch.randn(4, 6), torch.randn(4, 6)), dim=(1, 0))
+
+
 # --- Device validation (manual, -m neuron) ----------------------------------
 
 
