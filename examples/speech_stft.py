@@ -62,6 +62,7 @@ def main():
 
     n_fft = args.n_fft
     hop = args.hop
+    window = torch.hann_window(n_fft)
 
     # Synthetic data: clean signal + noise
     sr = 16000
@@ -73,8 +74,8 @@ def main():
 
     if args.demo:
         print(f"Signal length: {len(noisy)} samples")
-        noisy_spec = stft(noisy, n_fft=n_fft, hop_length=hop)
-        clean_spec = stft(clean, n_fft=n_fft, hop_length=hop)
+        noisy_spec = stft(noisy, n_fft=n_fft, hop_length=hop, window=window)
+        clean_spec = stft(clean, n_fft=n_fft, hop_length=hop, window=window)
         print(f"STFT shape: {noisy_spec.shape} (freq x time)")
         print(f"Noisy energy: {noisy_spec.abs().sum():.1f}")
         print(f"Clean energy: {clean_spec.abs().sum():.1f}")
@@ -92,8 +93,8 @@ def main():
         noise_batch = torch.randn_like(clean_batch) * 0.1
         noisy_batch = clean_batch + noise_batch
 
-        noisy_spec = stft(noisy_batch, n_fft=n_fft, hop_length=hop)
-        clean_spec = stft(clean_batch, n_fft=n_fft, hop_length=hop)
+        noisy_spec = stft(noisy_batch, n_fft=n_fft, hop_length=hop, window=window)
+        clean_spec = stft(clean_batch, n_fft=n_fft, hop_length=hop, window=window)
 
         # Ideal ratio mask
         mask = model(noisy_spec)
