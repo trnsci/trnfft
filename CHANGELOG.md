@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     float64 torch route.
   - The FFT float64 paths and `precision="double"` are unchanged.
 
+- **`ComplexLinear` / `complex_linear` with float64 host tensors on the NKI
+  backend returned inf/NaN** (silent, #131). The native `complex_linear` op
+  received float64 operands as is. float64 now runs through the fp32 kernel
+  and comes back float64, as `complex_gemm` already did. Affects 0.25.0
+  through 0.26.0 on Trainium with `set_backend("nki")`. Found by the round-3
+  device harness on Trn2 (trnsci/trnsci#35).
+
 ### Added
 
 - **`TRNFFT_REQUIRE_NKI=1`** (read per call): an operand dtype a kernel does

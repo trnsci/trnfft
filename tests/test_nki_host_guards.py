@@ -48,8 +48,12 @@ def test_zero_size_batch_skips_kernels(nki_on, monkeypatch, fn, shape):
     monkeypatch.setattr(fc, "create_plan", _no_kernel)
     x = torch.randn(shape)
     got = fn(x)
-    ref = getattr(torch.fft, fn.__name__)(x)
-    assert tuple(got.shape) == tuple(ref.shape)
+    # oneMKL (Linux CI) rejects torch.fft on a zero-size batch, so take the
+    # reference shape from a non-empty batch and restore the zero batch dims.
+    x1 = torch.randn(tuple(s or 1 for s in shape))
+    ref1 = getattr(torch.fft, fn.__name__)(x1)
+    want = tuple(0 if s == 0 else r for s, r in zip(shape, ref1.shape, strict=True))
+    assert tuple(got.shape) == want
     assert got.real.numel() == 0
 
 

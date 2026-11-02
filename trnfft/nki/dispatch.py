@@ -1089,6 +1089,8 @@ def _nki_complex_linear(
         raise RuntimeError("NKI not available")
     from .autograd import complex_linear_autograd
 
+    # float64 (#131) is cast by ``complex_linear`` through ``_kernel_operands``
+    # before this point; ``_launch`` refuses any dtype the kernel does not take.
     y_real, y_imag = complex_linear_autograd(x.real, x.imag, w_real, w_imag)
     return ComplexTensor(y_real, y_imag)
 
