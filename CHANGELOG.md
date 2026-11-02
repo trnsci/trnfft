@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
+  layer (same fix as trnblas#92).** On the native path a `trnfft::` custom-op
+  call cost about 0.1 ms of host time before the kernel was queued, against
+  0.016 ms for aten. Most of it went to nki's `Kernel.__call__`, which
+  rebuilds the torch handle on every call, plus the `torch.library` layer.
+  `dispatch._launch` now calls a `torch_neuronx.wrap_nki` handle built once
+  per kernel for ops whose body is one kernel call (`_native.KERNELS`); the
+  butterfly `n` / `stage` ints pass through unchanged. On trn2 (LNC=2),
+  `complex_gemm` 128x128x128 issue drops from 0.144 to 0.053 ms (e2e 0.197 to
+  0.124 ms), a `butterfly_stage` launch from 0.183 to 0.073 ms, and a
+  device-resident `trnfft.fft` of 128x1024 from 0.336 to 0.223 ms e2e.
+  Results are bit-identical. `torch.compile`, requires-grad, int64 and
+  tensor-subclass inputs, and the composite `trnfft::fft` op keep the custom
+  op. `TRNFFT_NKI_EAGER_HANDLE=0` turns this off;
+  `scripts/bench_eager_handle.py` measures it.
+
 ### Added
 
 - **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
