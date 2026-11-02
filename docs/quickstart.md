@@ -26,8 +26,9 @@ recovered = trnfft.ifftn(F)
 
 # STFT / ISTFT
 waveform = torch.randn(16000)
-S = trnfft.stft(waveform, n_fft=512, hop_length=256)
-recovered = trnfft.istft(S, n_fft=512, hop_length=256, length=16000)
+window = torch.hann_window(512)
+S = trnfft.stft(waveform, n_fft=512, hop_length=256, window=window)
+recovered = trnfft.istft(S, n_fft=512, hop_length=256, window=window, length=16000)
 ```
 
 ## Complex tensors

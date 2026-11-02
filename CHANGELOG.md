@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   They now emit a `DeprecationWarning`, and will raise in the next minor
   release, as `torch.fft` does. The result is unchanged in this release.
   Pass each dim once; to transform a dim twice, call the transform twice.
+- **The `window=None` default of `stft` and `istft` (#106).** It is a Hann
+  window of `win_length`, while `torch.stft`/`torch.istft` (whose signature
+  `stft` documents matching) use a rectangular window of ones. Both now emit
+  a `DeprecationWarning`. The default changes to torch's rectangular window
+  in the next minor release (#145), and `stft` and `istft` change together
+  so a default round trip stays consistent. The result is unchanged in this
+  release. To keep the Hann window, pass
+  `window=torch.hann_window(win_length)` explicitly. The example and
+  quickstart now do.
 
 ## [0.27.0] - 2026-11-02
 
