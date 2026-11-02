@@ -25,8 +25,8 @@ Lands in the next release (0.28.0). Needs device validation on Trn2.
   - **`set_backend("auto")`** (the default): the call runs as
     `set_backend("pytorch")` runs it, in torch on the tensors' device, with no
     kernel. The result is float64-accurate (the pytorch backend's result).
-    `complex_gemm_bf16` runs its fallback, which is FP32 by design. On a
-    Neuron device the torch ops run there.
+    `complex_gemm_bf16` runs its fallback, which is FP32 by design. Operands
+    already on the neuron device compute on the host (next item).
   - **`set_backend("nki")`**: the kernel runs on float32 copies, and each op
     emits a `UserWarning` the first time it does this ("precision is reduced
     to float32"). The result is cast back to the pytorch backend's dtype.
@@ -34,6 +34,17 @@ Lands in the next release (0.28.0). Needs device validation on Trn2.
     ahead of the cast or the torch route.
   - `precision="double"` keeps its host FP64 route on both backends (no
     warning, no raise).
+  - **float64 already on the neuron device, under `auto`**: computed on the
+    host. Device aten on Trainium computes float64 at FP32 precision
+    (measured on Trn2), so "torch at float64 accuracy" means host torch.
+    Every transform, `stft`/`istft`, `complex_gemm`, `complex_linear`,
+    `complex_mask_apply` and `ComplexLinear` copy their neuron-resident
+    operands to the host, compute in float64 and return the result on the
+    original device in float64 / complex128 (differentiable copies), with
+    one `UserWarning` per op ("float64 on the neuron device is computed on
+    the host for float64 accuracy (device arithmetic is fp32); pass float32
+    to stay on device"). One guard does this for every op
+    (`dispatch._fp64_host_guard`). Host-resident float64 is unchanged.
   - Mixed float64 operands (for example float32 activations with float64
     weights) compute at `torch.promote_types` of the operands: in torch at
     float64 under `auto`, and in the float32 kernel with a float64 result
@@ -74,6 +85,10 @@ Lands in the next release (0.28.0). Needs device validation on Trn2.
   computed in torch, as `TRNBLAS_REQUIRE_NKI` does (trnblas#69).
   `precision="double"` keeps its host FP64 route, which is part of the mode
   and not a fallback.
+- **`TRNFFT_FP64_ON_DEVICE=1`** (read per call): under `auto`, keep
+  float64 / complex128 operands that are already on the neuron device on
+  device aten (FP32 precision, no host copy, no warning) instead of the host
+  route.
 - Docs: "Precision and dtypes" in `docs/api/nki.md` states the policy.
 
 ### Deprecated

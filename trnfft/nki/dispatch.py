@@ -249,6 +249,128 @@ def _float64_route(what: str, op_name: str, dtypes) -> str:
     return "cast"
 
 
+# ── float64 already on the neuron device (trnfft#136 amendment) ─────────────
+#
+# "torch at float64 accuracy" under backend "auto" means host torch: on
+# Trainium, device aten computes float64 at FP32 precision (measured on Trn2),
+# so a float64 / complex128 operand already on the neuron device would get
+# FP32 accuracy from the torch route. ``_fp64_host_guard`` wraps every public
+# entry point: under "auto" it copies the neuron-resident operands to the
+# host, runs the op there (host float64 then takes the host-torch route) and
+# returns the result on the original device in its float64 / complex128
+# dtype, with one ``UserWarning`` per op. ``TRNFFT_FP64_ON_DEVICE=1`` (read
+# per call) keeps device aten (FP32 precision) instead.
+# ``TRNFFT_REQUIRE_NKI=1`` keeps raising (the guard steps aside), and backends
+# "nki" / "pytorch" are unchanged.
+_FP64_HOST_WARNED: set[str] = set()
+_FP64_DTYPES = (torch.float64, torch.complex128)
+_FP64_HOST_ROUTE = threading.local()  # set while a guarded op runs on the host
+
+
+def _fp64_on_device() -> bool:
+    """``TRNFFT_FP64_ON_DEVICE=1`` (read per call): keep device-resident float64
+    on device aten (FP32 precision) instead of the host route."""
+    return os.environ.get("TRNFFT_FP64_ON_DEVICE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _on_neuron_device(t: torch.Tensor) -> bool:
+    """True when ``t`` lives on the neuron device (patched in CPU tests)."""
+    return t.device.type == _NEURON_DEVICE
+
+
+def _walk_tensors(obj):
+    """Every tensor in ``obj`` (tensors, ComplexTensors, tuples, lists, dicts)."""
+    if isinstance(obj, torch.Tensor):
+        yield obj
+    elif isinstance(obj, ComplexTensor):
+        yield obj.real
+        yield obj.imag
+    elif isinstance(obj, (tuple, list)):
+        for o in obj:
+            yield from _walk_tensors(o)
+    elif isinstance(obj, dict):
+        for o in obj.values():
+            yield from _walk_tensors(o)
+
+
+def _map_tensors(obj, f):
+    """``obj`` with ``f`` applied to every tensor (structure kept)."""
+    if isinstance(obj, torch.Tensor):
+        return f(obj)
+    if isinstance(obj, ComplexTensor):
+        return ComplexTensor(f(obj.real), f(obj.imag))
+    if isinstance(obj, tuple) and hasattr(obj, "_fields"):  # namedtuple
+        return type(obj)(*(_map_tensors(o, f) for o in obj))
+    if isinstance(obj, (tuple, list)):
+        return type(obj)(_map_tensors(o, f) for o in obj)
+    if isinstance(obj, dict):
+        return {k: _map_tensors(v, f) for k, v in obj.items()}
+    return obj
+
+
+def _fp64_device_operand(args, kwargs):
+    """The device of the first float64 / complex128 operand on the neuron
+    device, or None."""
+    for t in _walk_tensors((args, kwargs)):
+        if t.dtype in _FP64_DTYPES and _on_neuron_device(t):
+            return t.device
+    return None
+
+
+def _fp64_to_host(t: torch.Tensor) -> torch.Tensor:
+    """Device -> host copy for the float64 host route (differentiable)."""
+    return t.to("cpu")
+
+
+def _fp64_to_device(t: torch.Tensor, device) -> torch.Tensor:
+    """Host -> ``device`` copy of a host-route result (differentiable)."""
+    return t.to(device)
+
+
+def _fp64_host_guard(op: str):
+    """Decorator for public entry point ``op``: under backend "auto", float64 /
+    complex128 operands on the neuron device compute on the host at float64
+    accuracy and the result returns to their device (see the block above)."""
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if (
+                _backend != "auto"
+                or getattr(_FP64_HOST_ROUTE, "on", False)  # nested op, already on host
+                or _require_nki()
+                or _fp64_on_device()
+            ):
+                return fn(*args, **kwargs)
+            device = _fp64_device_operand(args, kwargs)
+            if device is None:
+                return fn(*args, **kwargs)
+            if op not in _FP64_HOST_WARNED:
+                _FP64_HOST_WARNED.add(op)
+                warnings.warn(
+                    f"trnfft {op}: float64 on the neuron device is computed on the "
+                    "host for float64 accuracy (device arithmetic is fp32); pass "
+                    "float32 to stay on device, or set TRNFFT_FP64_ON_DEVICE=1 to "
+                    "keep device aten at fp32 precision. Warned once per op.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+            def to_host(t):
+                return _fp64_to_host(t) if _on_neuron_device(t) else t
+
+            _FP64_HOST_ROUTE.on = True
+            try:
+                out = fn(*_map_tensors(args, to_host), **_map_tensors(kwargs, to_host))
+            finally:
+                _FP64_HOST_ROUTE.on = False
+            return _map_tensors(out, lambda t: _fp64_to_device(t, device))
+
+        return wrapper
+
+    return deco
+
+
 def _kernel_operands(*tensors: torch.Tensor, op: str, what: str):
     """Operands for kernel ``op`` from the caller's tensors.
 
@@ -285,6 +407,7 @@ def _cast_result(c: ComplexTensor, out_dtype) -> ComplexTensor:
     return ComplexTensor(c.real.to(out_dtype), c.imag.to(out_dtype))
 
 
+@_fp64_host_guard("complex_gemm")
 def complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     """Complex matrix multiply with backend dispatch.
 
@@ -312,6 +435,7 @@ def complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
 # because it references _complex_gemm_kernel_bf16 which only exists when HAS_NKI.
 
 
+@_fp64_host_guard("complex_linear")
 def complex_linear(x: ComplexTensor, w_real: torch.Tensor, w_imag: torch.Tensor) -> ComplexTensor:
     """Complex linear forward: y = x @ W^T (complex) with backend dispatch.
 
@@ -346,6 +470,7 @@ def complex_linear(x: ComplexTensor, w_real: torch.Tensor, w_imag: torch.Tensor)
     return ComplexTensor(yr, yi)
 
 
+@_fp64_host_guard("complex_mask_apply")
 def complex_mask_apply(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTensor:
     """Apply complex mask to spectrogram with backend dispatch.
 

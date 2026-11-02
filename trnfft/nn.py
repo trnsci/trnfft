@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 
 from .complex import ComplexTensor
+from .nki.dispatch import _fp64_host_guard
 
 
 class ComplexLinear(nn.Module):
@@ -31,22 +32,32 @@ class ComplexLinear(nn.Module):
         nn.init.kaiming_uniform_(self.W_im.weight, a=math.sqrt(5))
 
     def forward(self, x: ComplexTensor) -> ComplexTensor:
-        # (W_re + iW_im)(x_re + ix_im) = (W_re*x_re - W_im*x_im) + i(W_re*x_im + W_im*x_re)
-        from .nki.dispatch import _use_nki
+        return _complex_linear_forward(
+            x, self.W_re.weight, self.W_im.weight, self.bias_re, self.bias_im
+        )
 
-        if _use_nki():
-            # NKI fused 4-real-matmul kernel reuses x tile across phases.
-            from .nki.dispatch import complex_linear
 
-            y = complex_linear(x, self.W_re.weight, self.W_im.weight)
-            re, im = y.real, y.imag
-        else:
-            re = self.W_re(x.real) - self.W_im(x.imag)
-            im = self.W_re(x.imag) + self.W_im(x.real)
-        if self.bias_re is not None:
-            re = re + self.bias_re
-            im = im + self.bias_im
-        return ComplexTensor(re, im)
+@_fp64_host_guard("ComplexLinear")
+def _complex_linear_forward(x, w_re, w_im, b_re, b_im) -> ComplexTensor:
+    """``ComplexLinear.forward`` on its parameters, so the float64 host guard
+    (``dispatch._fp64_host_guard``) sees the weights as operands."""
+    # (W_re + iW_im)(x_re + ix_im) = (W_re*x_re - W_im*x_im) + i(W_re*x_im + W_im*x_re)
+    from .nki.dispatch import _use_nki
+
+    if _use_nki():
+        # NKI fused 4-real-matmul kernel reuses x tile across phases.
+        from .nki.dispatch import complex_linear
+
+        y = complex_linear(x, w_re, w_im)
+        re, im = y.real, y.imag
+    else:
+        lin = torch.nn.functional.linear
+        re = lin(x.real, w_re) - lin(x.imag, w_im)
+        im = lin(x.imag, w_re) + lin(x.real, w_im)
+    if b_re is not None:
+        re = re + b_re
+        im = im + b_im
+    return ComplexTensor(re, im)
 
 
 class ComplexConv1d(nn.Module):
