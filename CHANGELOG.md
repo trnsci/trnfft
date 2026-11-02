@@ -36,6 +36,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `torch.fft` over dim / norm / n / s / real and complex inputs.
 ### Fixed
 
+- **NKI backend raised on zero-size batches and on non-2-D `ComplexLinear`
+  input** (loud, not silent). Affects the NKI path (`set_backend("nki")`,
+  or `"auto"` on a Neuron host): zero-size batches in every release
+  (0.1.0–0.26.0), and N-D / 1-D / empty `ComplexLinear` input in 0.6.0–0.26.0.
+  A zero-size batch (`fft` of `(0, 8)`, `fft2` of `(0, 4, 4)`, `rfft`, `ihfft`)
+  reached the kernels and failed lowering ("shape must be a
+  tuple of positive integers"); it now returns an empty result on the host.
+  `ComplexLinear` on `(B, T, K)` or `(K,)` input failed to unpack its shape
+  in the 2-D kernel; the leading dims are now flattened for the kernel and
+  restored, as `nn.Linear` does, and an empty batch returns on the host.
+  Found on Trn2 (#130). fp16/bf16 real input (#133) and the `ComplexConv1d`
+  fp64 compile error (#134) are separate.
+
 - **Integer inputs gave wrong FFTs** (silent). Affects **every release
   (0.1.0–0.26.0)**, on every backend. `fft` / `ifft` / `rfft` / `ihfft` /
   `fft2` / `fftn` / `rfft2` / `rfftn` (and `irfft` / `irfftn` on an integer
