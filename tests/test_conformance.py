@@ -19,9 +19,13 @@ The same cases run on a Trainium box through the conftest options::
     pytest tests/test_conformance.py --backend nki --conformance-device neuron
     pytest tests/test_conformance.py --backend auto --conformance-device cpu
 
-On a non-pytorch backend the tolerances are floored at FP32 level, and on a
-non-CPU device the fp64 gradchecks are skipped (fp64 autograd on device is not
-a trnfft contract).
+On a non-pytorch backend the tolerances are floored at FP32 level, except for
+float64 results under ``--backend auto`` on CPU: the float64 policy (trnfft#136)
+computes float64 in torch there, so those keep the FP64 tolerance. Under
+``--backend nki`` float64 runs the FP32 kernels (with a one-time warning per
+op), and on a non-CPU device Trainium computes float64 at FP32 precision, so
+both keep the FP32 floor. On a non-CPU device the fp64 gradchecks are skipped
+(fp64 autograd on device is not a trnfft contract).
 
 Known open behaviour is ``xfail(strict=True)`` with its issue number, so the
 case fails loudly (XPASS) once the behaviour changes and the marker must go:
@@ -77,6 +81,14 @@ def on_reference_path() -> bool:
     return _STATE["backend"] == "pytorch" and _STATE["device"].type == "cpu"
 
 
+def fp64_accurate(dtype) -> bool:
+    """float64 results computed at float64 accuracy: the reference path, and
+    float64 under backend "auto" on CPU, which computes in torch (#136)."""
+    if on_reference_path():
+        return True
+    return dtype == torch.float64 and _STATE["backend"] == "auto" and _STATE["device"].type == "cpu"
+
+
 def dev(t):
     d = _STATE["device"]
     if isinstance(t, CT):
@@ -113,7 +125,7 @@ def check(ours, ref, dtype=None, tol=None):
         return
     assert torch.isfinite(a).all(), "non-finite output"
     t = tol if tol is not None else TOL.get(out_dtype(ours), 2e-4)
-    if not on_reference_path():
+    if not fp64_accurate(out_dtype(ours)):
         t = max(t, 2e-3)
     scale = b.abs().max().item() or 1.0
     rel = (a - b).abs().max().item() / scale

@@ -47,6 +47,18 @@ def fft_core(
         # any kernel: NKI lowering rejects zero-size shapes (#130).
         return x.clone()
 
+    if x.real.dtype == torch.float64 and prec != "double" and _use_nki():
+        # float64 policy (trnfft#136): backend "auto" computes the whole
+        # transform as the pytorch backend does, at float64 accuracy, with no
+        # kernel; "nki" runs the kernels in float32 (one-time warning, in
+        # ``_cooley_tukey_nki_nograd``); TRNFFT_REQUIRE_NKI=1 raises.
+        # "double" keeps its host FP64 route.
+        from .nki.dispatch import _float64_route, _torch_route
+
+        if _float64_route("fft", "butterfly_stage", {torch.float64}) == "torch":
+            with _torch_route():
+                return fft_core(x, inverse, plan, prec)
+
     if plan is None:
         plan = create_plan(n, inverse=inverse)
 
@@ -1831,6 +1843,13 @@ def _fft_via_stockham_nki_mixed(x: ComplexTensor, inverse: bool) -> ComplexTenso
     return ComplexTensor(re, im)
 
 
+def _in_dtype(y: ComplexTensor, dt: torch.dtype) -> ComplexTensor:
+    """``y`` in dtype ``dt`` (the pytorch backend's result dtype)."""
+    if y.real.dtype == dt:
+        return y
+    return ComplexTensor(y.real.to(dt), y.imag.to(dt))
+
+
 def _cooley_tukey_nki_nograd(
     x: ComplexTensor, inverse: bool, precision: str = "fast"
 ) -> ComplexTensor:
@@ -1860,9 +1879,11 @@ def _cooley_tukey_nki_nograd(
     from .nki.dispatch import (
         KERNEL_DTYPES,
         _check_kernel_dtypes,
+        _float64_route,
         _kernel_device,
         _launch,
         _no_kernel_for_dtype,
+        _torch_route,
         _use_simulator,
     )
 
@@ -1878,17 +1899,22 @@ def _cooley_tukey_nki_nograd(
     # at N = 256 included) and for every "double" Bluestein (which promotes to
     # float64) at N > 512. "double" is the accuracy-first mode, so it computes
     # these on the host in FP64 (the FP64 DFT-GEMM up to its threshold, as
-    # before). Other modes run the kernels in FP32 and return float64, as the
-    # FP32 GEMM paths already do for float64 input; TRNFFT_REQUIRE_NKI=1
-    # refuses that cast. Integer, bool and complex parts are refused: the
-    # public API promotes integer/bool input to a float dtype first (#113).
+    # before). Other modes follow the float64 policy (trnfft#136,
+    # ``_float64_route``): torch at float64 accuracy under backend "auto"
+    # (``fft_core`` routes there first; this covers direct driver calls), the
+    # kernels in FP32 with the result cast back to float64 under "nki" (one
+    # warning), and NotImplementedError under TRNFFT_REQUIRE_NKI=1. Integer,
+    # bool and complex parts are refused: the public API promotes integer/bool
+    # input to a float dtype first (#113).
     dt = x.real.dtype
     if dt == torch.float64:
         if precision == "double":
             if n <= _DOUBLE_GEMM_THRESHOLD:
                 return _fft_via_gemm_double(x, inverse)
             return _fft_host_fp64(x, inverse)
-        _no_kernel_for_dtype("fft", "butterfly_stage", {dt})
+        if _float64_route("fft", "butterfly_stage", {dt}) == "torch":
+            with _torch_route():
+                return fft_core(x, inverse, precision=precision)
         y = _cooley_tukey_nki_nograd(
             ComplexTensor(x.real.float(), x.imag.float()), inverse, precision=precision
         )
@@ -1902,11 +1928,11 @@ def _cooley_tukey_nki_nograd(
 
     # Bench-toggles: force a specific path ahead of all threshold checks.
     if _FORCE_OZAKI_HQ:
-        return _fft_via_ozaki_hq(x, inverse)
+        return _in_dtype(_fft_via_ozaki_hq(x, inverse), dt)
     if _FORCE_OZAKI:
-        return _fft_via_ozaki(x, inverse)
+        return _in_dtype(_fft_via_ozaki(x, inverse), dt)
     if _FORCE_BF16_GEMM:
-        return _fft_via_gemm_bf16(x, inverse)
+        return _in_dtype(_fft_via_gemm_bf16(x, inverse), dt)
     if _FORCE_STOCKHAM_MIXED and precision != "kahan":
         return _fft_via_stockham_nki_mixed(x, inverse)
     if _FORCE_STOCKHAM_R8 and precision != "kahan":
@@ -1919,22 +1945,25 @@ def _cooley_tukey_nki_nograd(
         return _fft_via_gemm_double(x, inverse)
 
     # "bf16" mode: BF16 compute on Tensor Engine, FP32 PSUM → FP32 output.
+    # The low-precision modes return the input dtype, as the pytorch backend
+    # does (trnfft#137): for float32 input that is the PSUM's float32, for a
+    # half input the PSUM result is rounded to it.
     if precision == "bf16" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
-        return _fft_via_gemm_bf16(x, inverse)
+        return _in_dtype(_fft_via_gemm_bf16(x, inverse), dt)
 
     # "bf16_refined" mode: BF16 + one IR step with FP32 residual → ~5e-6 (#86).
     if precision == "bf16_refined" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
-        return _fft_iterative_refinement(x, inverse, steps=1)
+        return _in_dtype(_fft_iterative_refinement(x, inverse, steps=1), dt)
 
     # "ozaki_hq" mode: 2-level Ozaki, 6 matmuls, O(sqrt(N)*u_bf16^4) error.
     # Requires FP32 product precision in nc_matmul; not available on trn1.
     if precision == "ozaki_hq" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
-        return _ozaki_or_fallback(x, inverse, hq=True)
+        return _in_dtype(_ozaki_or_fallback(x, inverse, hq=True), dt)
 
     # "ozaki" mode: 1-level BF16 split, 3 matmuls, O(sqrt(N)*u_bf16^2) error.
     # Requires FP32 product precision in nc_matmul; not available on trn1.
     if precision == "ozaki" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
-        return _ozaki_or_fallback(x, inverse, hq=False)
+        return _in_dtype(_ozaki_or_fallback(x, inverse, hq=False), dt)
 
     # Batch-fused four-step (one launch per batch, trnfft#82 follow-up) from
     # _FOUR_STEP_FUSED_MIN to _FOUR_STEP_MAX; it beats the single GEMM there.

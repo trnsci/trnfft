@@ -7,11 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.27.0] - 2026-11-02
+Lands in the next release (0.28.0). Needs device validation on Trn2.
 
-Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+### Changed
 
-Headline: **correctness fixes — upgrade recommended.** Integer inputs were computed in the integer dtype (#113); `stft` dropped the batch dim of a (1, L) input (#114); `ComplexModReLU` applied its bias on the wrong axis (#115); `fftn(dim=())` aliased its input (#116); float64 `ComplexLinear` on the NKI path returned inf/NaN (#131). New: full `torch.fft` `n`/`s`/`dim`/`norm` parity plus `ifft2`, `hfft2`/`ihfft2`, `hfftn`/`ihfftn`, `fftshift`, `fftfreq`/`rfftfreq` (#128), and zero-size / N-D input host guards (#135).
+- **float64 under `auto` now computes in torch at float64 accuracy
+  (previously cast to fp32 on the NKI path).** This is the trnsci suite
+  float64 policy (#136). Trainium computes float64 at FP32 precision, so no
+  NKI kernel takes float64. Affected: float64 (and complex128) FFTs on the
+  NKI path in 0.26.0–0.27.0 (cast since #108), and float64 `complex_linear` /
+  `ComplexLinear` in 0.27.0 (cast since #131). In 0.27.0 and earlier,
+  `complex_gemm` and `complex_mask_apply` (and `complex_gemm_bf16`) passed
+  float64 to the kernel, which returned inf/NaN. Now, for every float64
+  operand on the NKI path (`fft` and every other transform, `stft`/`istft`,
+  `complex_gemm`, `complex_linear` / `ComplexLinear`, `complex_mask_apply`,
+  `complex_gemm_bf16`):
+  - **`set_backend("auto")`** (the default): the call runs as
+    `set_backend("pytorch")` runs it, in torch on the tensors' device, with no
+    kernel. The result is float64-accurate (the pytorch backend's result).
+    `complex_gemm_bf16` runs its fallback, which is FP32 by design. On a
+    Neuron device the torch ops run there.
+  - **`set_backend("nki")`**: the kernel runs on float32 copies, and each op
+    emits a `UserWarning` the first time it does this ("precision is reduced
+    to float32"). The result is cast back to the pytorch backend's dtype.
+  - **`TRNFFT_REQUIRE_NKI=1`**: `NotImplementedError` on either backend,
+    ahead of the cast or the torch route.
+  - `precision="double"` keeps its host FP64 route on both backends (no
+    warning, no raise).
+  - Mixed float64 operands (for example float32 activations with float64
+    weights) compute at `torch.promote_types` of the operands: in torch at
+    float64 under `auto`, and in the float32 kernel with a float64 result
+    under `nki`.
+- **Result dtype matches the pytorch backend** on every NKI path. The
+  low-precision modes (`bf16`, `bf16_refined`, `ozaki`, `ozaki_hq`) with a
+  bfloat16 or float16 input now return the input dtype, not the BF16 GEMM's
+  float32 PSUM (#137 item 2). float32 and float64 input are unchanged.
+  Whether half operands should run natively on the kernels or be upcast to
+  float32 is still open (#137 item 1); half operands run as before.
 
 ### Fixed
 
@@ -23,11 +55,8 @@ Headline: **correctness fixes — upgrade recommended.** Integer inputs were com
   `_simulate_kernel`, the direct `nki.simulate` calls and every `nki_op` body
   (so a direct `torch.ops.trnfft.<op>` call too) raise `TypeError` for any
   other operand dtype. The public wrappers convert first:
-  - `complex_gemm`, `complex_linear` / `ComplexLinear` and `complex_mask_apply`
-    with float64 operands used to return inf/NaN with no error (#131). They
-    now run the kernel in float32 and return float64.
-  - `complex_gemm_bf16` with float64 operands now runs the kernel in float32.
-    It returns float32, as its fallback always has.
+  - float64 follows the policy above. `complex_gemm`, `complex_mask_apply`
+    and `complex_gemm_bf16` used to return inf/NaN for float64 with no error.
   - Integer, bool, complex and mixed half/float32 operands run the PyTorch
     backend, so the result (or the error) is the one `set_backend("pytorch")`
     gives.
@@ -37,7 +66,23 @@ Headline: **correctness fixes — upgrade recommended.** Integer inputs were com
     (#113).
   - `complex_mask_apply` sizes that are not a multiple of 128 keep their
     float64 torch route.
-  - The FFT float64 paths and `precision="double"` are unchanged.
+
+### Added
+
+- **`TRNFFT_REQUIRE_NKI=1`** (read per call): an operand dtype a kernel does
+  not take raises `NotImplementedError` instead of being cast to float32 or
+  computed in torch, as `TRNBLAS_REQUIRE_NKI` does (trnblas#69).
+  `precision="double"` keeps its host FP64 route, which is part of the mode
+  and not a fallback.
+- Docs: "Precision and dtypes" in `docs/api/nki.md` states the policy.
+
+## [0.27.0] - 2026-11-02
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended.** Integer inputs were computed in the integer dtype (#113); `stft` dropped the batch dim of a (1, L) input (#114); `ComplexModReLU` applied its bias on the wrong axis (#115); `fftn(dim=())` aliased its input (#116); float64 `ComplexLinear` on the NKI path returned inf/NaN (#131). New: full `torch.fft` `n`/`s`/`dim`/`norm` parity plus `ifft2`, `hfft2`/`ihfft2`, `hfftn`/`ihfftn`, `fftshift`, `fftfreq`/`rfftfreq` (#128), and zero-size / N-D input host guards (#135).
+
+### Fixed
 
 - **`ComplexLinear` / `complex_linear` with float64 host tensors on the NKI
   backend returned inf/NaN** (silent, #131). The native `complex_linear` op
@@ -102,13 +147,6 @@ Headline: **correctness fixes — upgrade recommended.** Integer inputs were com
   raises `RuntimeError` rather than an `assert`.
 
 ### Added
-
-- **`TRNFFT_REQUIRE_NKI=1`** (read per call): an operand dtype a kernel does
-  not take raises `NotImplementedError` instead of being cast to float32 or
-  computed in torch, as `TRNBLAS_REQUIRE_NKI` does (trnblas#69).
-  `precision="double"` keeps its host FP64 route, which is part of the mode
-  and not a fallback. Open decisions: #136 (float64 policy) and #137
-  (half-precision operands and the result dtype of the low-precision modes).
 
 - **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
   trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every

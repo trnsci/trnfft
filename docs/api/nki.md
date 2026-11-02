@@ -22,9 +22,35 @@ trnfft.set_backend("nki")  # Force NKI (fails if not on Trainium)
 | `TRNFFT_SIX_STEP=0\|1` | The six-step FFT is the default for power-of-2 FP32 N ≥ 8192 (since v0.25.0, #94). `0` restores the Stockham (`"fast"`) / compensated butterfly (`"kahan"`) path; `1` forces the six-step for every N above 4096. `TRNFFT_SIX_STEP_MIN` moves the threshold. |
 | `TRNFFT_PE_TRANSPOSE=0` | Selects the older kernels that read their input with `nl.load_transpose2d` (the XLA path keeps them by default). Since v0.25.0 the native path transposes on the Tensor engine instead, because the runtime rebuilt a `load_transpose2d` input's DMA rings at every new input address (#97, #100). |
 | `TRNFFT_PINNED_OUTPUT=0` | Turns off pinned-memory host outputs (planes of 1 MiB and up, native path; since v0.25.0, #98). |
-| `TRNFFT_REQUIRE_NKI=1` | Refuse operand dtypes the kernels do not take (`dispatch.KERNEL_DTYPES`: float32/bfloat16/float16, float32 only for the fused four-step and the six-step GEMM). These raise `NotImplementedError` instead of running float64 in float32 on the kernel (result cast back to float64) or computing integer, bool and complex operands in torch. `precision="double"` keeps its host FP64 route. Read per call. |
+| `TRNFFT_REQUIRE_NKI=1` | Refuse operand dtypes the kernels do not take (`dispatch.KERNEL_DTYPES`: float32/bfloat16/float16, float32 only for the fused four-step and the six-step GEMM). These raise `NotImplementedError` instead of computing float64 in torch (`auto`) or in float32 on the kernel (`nki`), or computing integer, bool and complex operands in torch. `precision="double"` keeps its host FP64 route. Read per call. See [Precision and dtypes](#precision-and-dtypes). |
 | `TRNSCI_NKI_DISPATCH=auto\|native\|xla\|cpu` | Suite-wide. Forces the device dispatch path (see below); `auto` (default) detects. Forcing an unavailable path raises. |
 | `TRNSCI_XLA_DEPRECATION=1` | Emit one `DeprecationWarning` when the XLA path is selected. Off by default. |
+
+## Precision and dtypes
+
+Trainium computes float64 at FP32 precision, so no NKI kernel takes float64
+(or complex128, whose parts are float64). trnfft follows the trnsci suite
+policy (#136) for float64 operands on the NKI path, in every transform,
+`stft`/`istft`, `complex_gemm`, `complex_linear` / `ComplexLinear`,
+`complex_mask_apply` and `complex_gemm_bf16`:
+
+| Setting | float64 behaviour |
+| --- | --- |
+| `set_backend("auto")` (default) | Computes in torch, exactly as `set_backend("pytorch")` does, at float64 accuracy. No kernel runs. |
+| `set_backend("nki")` | The kernel runs on float32 copies; each op warns once (`UserWarning`) that precision is reduced to float32. |
+| `TRNFFT_REQUIRE_NKI=1` | Raises `NotImplementedError`, on either backend. |
+| `precision="double"` | Keeps its host FP64 route on either backend (no warning, no raise). |
+
+The result dtype is always what the pytorch backend returns for the same
+inputs: float64 in gives float64 out; bfloat16/float16 in gives the input
+dtype, also in the low-precision modes (`bf16`, `bf16_refined`, `ozaki`,
+`ozaki_hq`), whose BF16 GEMM accumulates in an FP32 PSUM. Mixed operands that
+include float64 give `torch.promote_types` of the operands. bfloat16 and
+float16 operands are passed to the kernels as they are (#137 tracks whether to
+upcast them). `complex_gemm_bf16` returns float32 on every backend. Integer,
+bool and complex `torch.Tensor` operands of the dispatch-level ops compute in
+torch; the transforms promote integer and bool input first, as `torch.fft`
+does.
 
 ## Dispatch path
 

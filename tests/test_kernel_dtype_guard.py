@@ -3,9 +3,13 @@
 float64 (and integer, bool, complex) tensors reached the FP32 kernels as is
 and came back inf/NaN or garbage on Trn2 (#108, #131; the same class in the
 other trnsci libraries). ``dispatch.KERNEL_DTYPES`` lists what each kernel
-takes; ``_launch`` / ``_simulate_kernel`` / every ``nki_op`` body enforce it,
-and the public wrappers cast float64 to float32 (result cast back) or run
-other dtypes in torch first.
+takes; ``_launch`` / ``_simulate_kernel`` / every ``nki_op`` body enforce it.
+The public wrappers apply the suite float64 policy (trnfft#136) first:
+backend "auto" computes float64 in torch at float64 accuracy (no kernel),
+explicit "nki" runs the kernel on float32 copies with one ``UserWarning`` per
+op, and ``TRNFFT_REQUIRE_NKI=1`` raises ``NotImplementedError``. Other
+unsupported dtypes run in torch. Every result has the pytorch backend's dtype
+(trnfft#137 item 2 for the low-precision modes).
 
 These tests import ``trnfft.nki._native`` fresh under a stand-in
 ``torch_neuronx`` whose ``nki_op`` replaces every kernel op by a stub. The stub
@@ -23,6 +27,7 @@ import importlib
 import importlib.machinery
 import sys
 import types
+import warnings
 
 import pytest
 import torch
@@ -33,6 +38,10 @@ import trnfft.nki as trnfft_nki
 import trnfft.nki.dispatch as dispatch
 from trnfft import ComplexTensor, precision
 from trnfft.nn import ComplexLinear
+
+# The explicit-"nki" float64 warning (one per op; the fixture resets it per
+# test). The tests that check it record warnings themselves.
+pytestmark = pytest.mark.filterwarnings("ignore:trnfft .*float64 input:UserWarning")
 
 _FP32 = {torch.float32}
 _FP32_HALF = {torch.float32, torch.bfloat16, torch.float16}
@@ -90,6 +99,8 @@ FLOAT_DTYPES = [torch.float64, torch.float32, torch.bfloat16, torch.float16]
 # Ops the stubs saw over the whole module (checked by the last test).
 SEEN: dict[str, set] = {}
 VIOLATIONS: list[str] = []
+# Kernel calls of the current test: (op, operand dtypes).
+CALLS: list[tuple[str, set]] = []
 
 
 class _StubOp:
@@ -103,6 +114,7 @@ class _StubOp:
     def __call__(self, *args):
         dts = {a.dtype for a in args if isinstance(a, torch.Tensor)}
         SEEN.setdefault(self.name, set()).update(dts)
+        CALLS.append((self.name, dts))
         bad = dts - ALLOWED.get(self.name, set())
         if bad:
             msg = f"{self.name} reached with {sorted(map(str, dts))}"
@@ -191,7 +203,9 @@ def native(monkeypatch):
 
             monkeypatch.setattr(mods[mod_name], attr, raw, raising=False)
     monkeypatch.setattr(dispatch, "_backend", "nki")
+    monkeypatch.setattr(dispatch, "_FP64_WARNED", set())
     VIOLATIONS.clear()
+    CALLS.clear()
     yield mod
     assert not VIOLATIONS, VIOLATIONS
     if had_attr:
@@ -359,16 +373,9 @@ def test_precision_modes(backend, monkeypatch, dtype, n, prec):
         pytest.skip("six-step is fast/kahan only")
     monkeypatch.setattr(precision, "_precision", prec)
     x = _rand((2, n), dtype)
-    if dtype in (torch.bfloat16, torch.float16) and prec in _LOWP and n <= fc._LOWP_GEMM_MAX:
-        # The BF16-GEMM modes return their FP32 PSUM; the pytorch backend
-        # returns the input dtype (needs-decision, trnfft#137).
-        y = trnfft.fft(x)
-        assert y.dtype == torch.float32
-        pytest.xfail("half input in a BF16-GEMM mode returns float32 (trnfft#137)")
+    # Half input in the BF16-GEMM modes returns the input dtype, as the
+    # pytorch backend does (trnfft#137 item 2).
     _same_outcome(trnfft.fft, x)
-
-
-_LOWP = ("bf16", "bf16_refined", "ozaki", "ozaki_hq")
 
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.bfloat16])
@@ -427,11 +434,16 @@ def test_complex_linear_integer_input_runs_in_torch(backend, dtype):
 
 
 def test_complex_linear_float64(backend):
-    """#131 / #132: float64 runs the fp32 kernel and returns float64."""
+    """#131 / #132 / #136: float64 returns float64; "nki" runs the fp32
+    kernel, "auto" computes in torch."""
     layer = ComplexLinear(6, 3).double()
     x = ComplexTensor(_rand((4, 6), torch.float64, 1), _rand((4, 6), torch.float64, 2))
     assert layer(x).real.dtype == torch.float64
-    assert SEEN["complex_linear"] - _FP32_HALF == set()
+    if backend == "nki":
+        assert [op for op, _ in CALLS] == ["complex_linear"]
+        assert CALLS[0][1] == {torch.float32}
+    else:
+        assert CALLS == []
 
 
 def _ct(shape, dtype, seed=0):
@@ -483,6 +495,186 @@ def test_mixed_float32_float64_linear(backend):
     w = _ct((3, 6), torch.float64, 2)
     y = dispatch.complex_linear(x, w.real, w.imag)
     assert y.real.dtype == torch.float64
+    if backend == "auto":
+        # torch at float64 on the promoted operands
+        xd = ComplexTensor(x.real.double(), x.imag.double())
+        want = _pytorch(dispatch.complex_linear, xd, w.real, w.imag)
+        assert torch.equal(y.real, want.real) and torch.equal(y.imag, want.imag)
+        assert CALLS == []
+    else:
+        assert CALLS and all(d == {torch.float32} for _, d in CALLS)
+
+
+# ── The float64 policy (trnfft#136): auto -> torch, nki -> cast + warn ───────
+
+
+def _fft_ref(x, inverse=False):
+    z = torch.complex(x.real, x.imag)
+    return torch.fft.ifft(z) if inverse else torch.fft.fft(z)
+
+
+def _x64(shape, seed=0):
+    return _ct(shape, torch.float64, seed)
+
+
+# (op name in the warning, call on float64 operands)
+FP64_CALLS = {
+    "fft-gemm": ("fft", lambda: trnfft.fft(_x64((3, 64)))),
+    "fft-bluestein": ("fft", lambda: trnfft.fft(_x64((3, 12)))),
+    "fft-four-step": ("fft", lambda: trnfft.fft(_x64((2, 2048)))),
+    "ifft": ("fft", lambda: trnfft.ifft(_x64((3, 64)))),
+    "rfft": ("fft", lambda: trnfft.rfft(_rand((3, 64), torch.float64))),
+    "complex128": ("fft", lambda: trnfft.fft(_rand((3, 64), torch.complex128))),
+    "complex_gemm": (
+        "complex_gemm",
+        lambda: dispatch.complex_gemm(_x64((4, 6)), _x64((6, 5), 2)),
+    ),
+    "complex_linear": (
+        "complex_linear",
+        lambda: dispatch.complex_linear(
+            _x64((4, 6)), _rand((3, 6), torch.float64, 2), _rand((3, 6), torch.float64, 3)
+        ),
+    ),
+    "ComplexLinear": (
+        "complex_linear",
+        lambda: _seeded_layer().double()(_x64((4, 6))),
+    ),
+    "complex_mask_apply": (
+        "complex_mask_apply",
+        lambda: dispatch.complex_mask_apply(_x64((2, 128)), _x64((2, 128), 2)),
+    ),
+    "complex_gemm_bf16": (
+        "complex_gemm_bf16",
+        lambda: dispatch.complex_gemm_bf16(_x64((4, 6)), _x64((6, 5), 2)),
+    ),
+}
+
+
+def _seeded_layer():
+    torch.manual_seed(0)
+    return ComplexLinear(6, 3)
+
+
+def _fp64_warnings(rec):
+    return [
+        w for w in rec if issubclass(w.category, UserWarning) and "float64 input" in str(w.message)
+    ]
+
+
+@pytest.mark.parametrize("case", sorted(FP64_CALLS))
+def test_float64_auto_computes_in_torch(native, monkeypatch, case):
+    """backend "auto": float64 never reaches a kernel, the result is the
+    pytorch backend's (bit for bit) and float64-accurate, and no warning."""
+    monkeypatch.setattr(dispatch, "_backend", "auto")
+    _, call = FP64_CALLS[case]
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        got = call()
+    assert CALLS == [], CALLS
+    assert not _fp64_warnings(rec)
+    ref = _pytorch(call)
+    assert got.real.dtype == ref.real.dtype
+    assert torch.equal(got.real, ref.real) and torch.equal(got.imag, ref.imag)
+    if case.startswith("fft"):
+        x = _x64({"fft-gemm": (3, 64), "fft-bluestein": (3, 12), "fft-four-step": (2, 2048)}[case])
+        want = _fft_ref(x)
+        err = (torch.complex(got.real, got.imag) - want).abs().max() / want.abs().max()
+        assert err < 1e-12, err
+
+
+@pytest.mark.parametrize("case", sorted(FP64_CALLS))
+def test_float64_nki_casts_and_warns_once(native, case):
+    """backend "nki": the kernel gets float32 operands, the result has the
+    pytorch backend's dtype, and exactly one UserWarning per op over repeated
+    calls."""
+    op, call = FP64_CALLS[case]
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        outs = [call() for _ in range(3)]
+    assert CALLS, "no kernel was called"
+    assert all(d <= {torch.float32} for _, d in CALLS), CALLS
+    ws = _fp64_warnings(rec)
+    assert len(ws) == 1, [str(w.message) for w in ws]
+    assert f"trnfft {op}:" in str(ws[0].message)
+    ref = _pytorch(call)
+    assert all(o.real.dtype == ref.real.dtype for o in outs)
+
+
+def test_float64_nki_warns_once_per_op(native):
+    """Each op warns once; a second op still gets its own warning."""
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        for _ in range(2):
+            for case in ("fft-gemm", "ifft", "complex_gemm", "complex_mask_apply"):
+                FP64_CALLS[case][1]()
+    ops = sorted(str(w.message).split(":")[0] for w in _fp64_warnings(rec))
+    assert ops == ["trnfft complex_gemm", "trnfft complex_mask_apply", "trnfft fft"]
+
+
+def test_float64_double_mode_unchanged(backend, monkeypatch):
+    """precision="double" keeps its host FP64 route on both backends: no
+    kernel, no warning, float64 accuracy."""
+    monkeypatch.setattr(precision, "_precision", "double")
+    for shape in ((3, 64), (3, 12), (2, 2048)):
+        x = _x64(shape)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            got = trnfft.fft(x)
+        assert not _fp64_warnings(rec)
+        want = _fft_ref(x)
+        err = (torch.complex(got.real, got.imag) - want).abs().max() / want.abs().max()
+        assert err < 1e-12, (shape, err)
+    assert CALLS == []
+
+
+# ── Result dtype == the pytorch backend's ────────────────────────────────────
+
+MIXED = [
+    (torch.float32, torch.float64),
+    (torch.float64, torch.float32),
+    (torch.bfloat16, torch.float64),
+    (torch.float16, torch.float64),
+    (torch.bfloat16, torch.float32),
+    (torch.float16, torch.bfloat16),
+]
+
+
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+@pytest.mark.parametrize(
+    "op", ["complex_gemm", "complex_linear", "complex_mask_apply", "complex_gemm_bf16"]
+)
+def test_result_dtype_same_dtype(backend, op, dtype):
+    a = _ct((4, 128) if op == "complex_mask_apply" else (4, 6), dtype)
+    b = _ct((4, 128) if op == "complex_mask_apply" else (6, 5), dtype, 2)
+    if op == "complex_linear":
+        b = _ct((3, 6), dtype, 2)
+        fn = lambda: dispatch.complex_linear(a, b.real, b.imag)  # noqa: E731
+    else:
+        fn = lambda: getattr(dispatch, op)(a, b)  # noqa: E731
+    got = _same_outcome(fn)
+    assert got is not None
+
+
+@pytest.mark.parametrize("dts", MIXED, ids=lambda d: f"{d[0]}-{d[1]}".replace("torch.", ""))
+def test_result_dtype_mixed(backend, dts):
+    """Mixed operands: elementwise ops match the pytorch backend (which
+    promotes); for the GEMMs, which raise on the pytorch backend for mixed
+    operands, a float64 mixture returns torch.promote_types and the other
+    mixtures raise as on the pytorch backend."""
+    da, db = dts
+    m, s = _ct((2, 128), da), _ct((2, 128), db, 2)
+    got = _same_outcome(lambda: dispatch.complex_mask_apply(m, s))
+    assert got.dtype == torch.promote_types(da, db)
+    a, b = _ct((4, 6), da), _ct((6, 5), db, 2)
+    w = _ct((3, 6), db, 2)
+    for fn in (
+        lambda: dispatch.complex_gemm(a, b),
+        lambda: dispatch.complex_linear(a, w.real, w.imag),
+    ):
+        if torch.float64 in dts:
+            assert fn().dtype == torch.promote_types(da, db)
+        else:
+            _same_outcome(fn)
 
 
 # ── TRNFFT_REQUIRE_NKI ───────────────────────────────────────────────────────
@@ -498,6 +690,8 @@ def require_nki(backend, monkeypatch):
     [
         lambda: trnfft.fft(_rand((2, 64), torch.float64)),
         lambda: trnfft.fft(_rand((2, 12), torch.float64)),
+        lambda: trnfft.ifft(_rand((2, 2048), torch.float64)),
+        lambda: trnfft.fft(_rand((2, 64), torch.complex128)),
         lambda: dispatch.complex_gemm(_ct((4, 6), torch.float64), _ct((6, 5), torch.float64)),
         lambda: dispatch.complex_gemm(_ct((4, 6), torch.int32), _ct((6, 5), torch.int32)),
         lambda: dispatch.complex_linear(
