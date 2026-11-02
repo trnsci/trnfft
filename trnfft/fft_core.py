@@ -42,6 +42,10 @@ def fft_core(
     n = x.shape[-1]
     if n == 1:
         return x.clone()
+    if x.real.numel() == 0:
+        # Zero-size batch: nothing to transform. Return on the host, before
+        # any kernel: NKI lowering rejects zero-size shapes (#130).
+        return x.clone()
 
     if plan is None:
         plan = create_plan(n, inverse=inverse)

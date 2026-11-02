@@ -105,7 +105,18 @@ def complex_linear(x: ComplexTensor, w_real: torch.Tensor, w_imag: torch.Tensor)
     (loaded once, streamed against W_real and W_imag).
     """
     if _use_nki():
-        return _nki_complex_linear(x, w_real, w_imag)
+        # The NKI kernel takes one 2-D (M, K) activation with M, K > 0 (#130).
+        # An empty batch returns on the host; other ranks flatten the leading
+        # dims to M and restore them on the output, as nn.Linear does.
+        xr, xi = x.real, x.imag
+        lead, k = xr.shape[:-1], xr.shape[-1]
+        if xr.numel() == 0 or w_real.numel() == 0:
+            out = (*lead, w_real.shape[0])
+            return ComplexTensor(xr.new_zeros(out), xi.new_zeros(out))
+        if xr.dim() == 2:
+            return _nki_complex_linear(x, w_real, w_imag)
+        y = _nki_complex_linear(ComplexTensor(xr.reshape(-1, k), xi.reshape(-1, k)), w_real, w_imag)
+        return ComplexTensor(y.real.reshape(*lead, -1), y.imag.reshape(*lead, -1))
     # PyTorch fallback: 4 real matmuls
     yr = torch.matmul(x.real, w_real.t()) - torch.matmul(x.imag, w_imag.t())
     yi = torch.matmul(x.real, w_imag.t()) + torch.matmul(x.imag, w_real.t())
