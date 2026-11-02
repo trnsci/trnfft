@@ -29,7 +29,6 @@ case fails loudly (XPASS) once the behaviour changes and the marker must go:
 - trnsci/trnfft#106 (decided, deprecated): ``stft``/``istft(window=None)``
   still use Hann and warn; they switch to torch's ones in the next minor
   release (trnsci/trnfft#145).
-- trnsci/trnfft#121: ``fftn``-family raise on a 0-size non-transformed dim.
 
 ``dim=``/``norm=`` (#123) are covered exhaustively by
 ``tests/test_torch_fft_parity.py``; this file runs a bounded cross-section of
@@ -40,6 +39,7 @@ from __future__ import annotations
 
 import warnings
 
+import numpy as np
 import pytest
 import torch
 from torch.autograd import gradcheck, gradgradcheck
@@ -423,7 +423,6 @@ def test_edge_1d(op, shape):
 
 
 EDGE_ND = [
-    pytest.param((0, 4, 4), marks=pytest.mark.xfail(strict=True, reason="trnsci/trnfft#121")),
     (1, 1),
     (4, 1),
     (1, 4),
@@ -439,6 +438,44 @@ def test_edge_nd_all_dims(op, shape):
         pytest.skip("torch raises for a default last size of 0")
     x = rand("r" if kind == "r" else "c", shape, seed=11)
     check(f(dev(x)), ref_empty_safe(ref, x))
+
+
+# trnsci/trnfft#121. The reference is numpy.fft, not torch.fft: oneMKL on
+# Linux rejects torch.fft plans on zero-size batches (trnsci/trnfft#138).
+_NP_ND = {
+    "fftn": (np.fft.fftn, "c"),
+    "ifftn": (np.fft.ifftn, "c"),
+    "rfftn": (np.fft.rfftn, "r"),
+    "irfftn": (np.fft.irfftn, "c"),
+}
+ZERO_BATCH_ND = [
+    ((0, 4, 4), (1, 2), None),
+    ((4, 0, 6), (0, 2), None),
+    ((2, 3, 0, 5), (0, 1, 3), None),
+    ((0, 0, 4, 6), (2, 3), None),
+    ((0, 4, 4), (1, 2), (8, 6)),
+    ((3, 0, 5), (0, 2), (2, 7)),
+]
+
+
+@pytest.mark.parametrize(("shape", "dims", "s"), ZERO_BATCH_ND, ids=str)
+@pytest.mark.parametrize("op", list(_NP_ND))
+def test_edge_nd_zero_size_untransformed_dim(op, shape, dims, s):
+    f = OPS_ND[op][0]
+    np_ref, kind = _NP_ND[op]
+    x = rand("r" if kind == "r" else "c", shape, seed=13)
+    ref = torch.from_numpy(np_ref(x.numpy(), s=s, axes=dims))
+    check(f(dev(x), s=s, dim=dims), ref, dtype=torch.float64)
+
+
+@pytest.mark.parametrize("op", list(_NP_ND))
+def test_edge_nd_zero_size_transformed_dim_raises(op):
+    # torch.fft and numpy.fft both reject a 0-point transform.
+    x = rand("r" if _NP_ND[op][1] == "r" else "c", (0, 4, 4), seed=14)
+    with pytest.raises(ValueError, match="Invalid number of FFT data points"):
+        _NP_ND[op][0](x.numpy())
+    with pytest.raises(RuntimeError, match=r"Invalid number of data points \(0\)"):
+        OPS_ND[op][0](dev(x))
 
 
 @pytest.mark.parametrize("shape", [(0, 4, 4), (1, 1), (4, 1), (1, 4), (3, 5, 1)], ids=str)
