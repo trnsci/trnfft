@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+
+- **A repeated `dim` in the n-D transforms (#127).** `fftn`, `ifftn`,
+  `rfftn`, `irfftn`, `hfftn`, `ihfftn` and the `*2` variants with an
+  explicit `dim` accept a repeated dim and transform along it once per
+  occurrence; `torch.fft` raises `RuntimeError("FFT dims must be unique")`.
+  They now emit a `DeprecationWarning`, and will raise in the next minor
+  release, as `torch.fft` does. The result is unchanged in this release.
+  Pass each dim once; to transform a dim twice, call the transform twice.
+- **The `window=None` default of `stft` and `istft` (#106).** It is a Hann
+  window of `win_length`, while `torch.stft`/`torch.istft` (whose signature
+  `stft` documents matching) use a rectangular window of ones. Both now emit
+  a `DeprecationWarning`. The default changes to torch's rectangular window
+  in the next minor release (#145), and `stft` and `istft` change together
+  so a default round trip stays consistent. The result is unchanged in this
+  release. To keep the Hann window, pass
+  `window=torch.hann_window(win_length)` explicitly. The example and
+  quickstart now do.
+
 ## [0.27.0] - 2026-11-02
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

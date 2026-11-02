@@ -26,8 +26,9 @@ a trnfft contract).
 Known open behaviour is ``xfail(strict=True)`` with its issue number, so the
 case fails loudly (XPASS) once the behaviour changes and the marker must go:
 
-- trnsci/trnfft#106 (needs decision): ``stft``/``istft(window=None)`` use
-  Hann; ``torch.stft``/``torch.istft`` use ones.
+- trnsci/trnfft#106 (decided, deprecated): ``stft``/``istft(window=None)``
+  still use Hann and warn; they switch to torch's ones in the next minor
+  release (trnsci/trnfft#145).
 - trnsci/trnfft#121: ``fftn``-family raise on a 0-size non-transformed dim.
 
 ``dim=``/``norm=`` (#123) are covered exhaustively by
@@ -566,8 +567,10 @@ def test_stft_noncontiguous_batch():
 
 @pytest.mark.xfail(
     strict=True,
-    reason="trnsci/trnfft#106 needs decision: stft(window=None) uses Hann, torch.stft uses ones",
+    reason="trnsci/trnfft#106: stft(window=None) is still Hann (deprecated); switches to "
+    "torch's ones in the next minor, trnsci/trnfft#145",
 )
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_stft_default_window_matches_torch():
     sig = torch.randn(2, 256, dtype=torch.float64, generator=gen(14))
     check(trnfft.stft(dev(sig), 64), torch.stft(sig, 64, return_complex=True))
@@ -575,8 +578,10 @@ def test_stft_default_window_matches_torch():
 
 @pytest.mark.xfail(
     strict=True,
-    reason="trnsci/trnfft#106 needs decision: istft(window=None) uses Hann, torch.istft uses ones",
+    reason="trnsci/trnfft#106: istft(window=None) is still Hann (deprecated); switches to "
+    "torch's ones in the next minor, trnsci/trnfft#145",
 )
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
 def test_istft_default_window_matches_torch():
     sig = torch.randn(256, dtype=torch.float64, generator=gen(15))
     # torch.stft with a rectangular window and hop n_fft//4 satisfies NOLA.
