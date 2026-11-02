@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import operator
+import sys
 import warnings
 
 import torch
@@ -771,9 +772,27 @@ def _canon_s_dim(shape, s: Sizes, dim: Dims) -> tuple[list[int], list[int | None
         dims = [_canon_dim(d, ndim) for d in dim]
         if s is not None and len(s) != len(dims):
             raise RuntimeError("When given, dim and shape arguments must have the same length")
+        if len(set(dims)) != len(dims):
+            # torch.fft raises "FFT dims must be unique"; trnfft has transformed
+            # once per occurrence. Deprecated; raises in the next minor (#127).
+            _warn_at_caller(
+                f"trnfft: repeated dim in dim={tuple(dim)} transforms that dim once per "
+                "occurrence. This is deprecated and will raise in the next minor "
+                "release, as torch.fft does ('FFT dims must be unique'). Pass each "
+                "dim once (#127).",
+                DeprecationWarning,
+            )
     if s is None:
         return dims, [None] * len(dims)
     return dims, [None if v == -1 else _check_n(v) for v in s]
+
+
+def _warn_at_caller(message: str, category: type[Warning]) -> None:
+    """``warnings.warn`` attributed to the first frame outside trnfft."""
+    frame, level = sys._getframe(1), 2
+    while frame is not None and frame.f_globals.get("__name__", "").startswith("trnfft"):
+        frame, level = frame.f_back, level + 1
+    warnings.warn(message, category, stacklevel=level)
 
 
 def _apply_norm(x, norm: str | None, n: int, inverse: bool):
