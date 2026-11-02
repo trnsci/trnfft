@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fftn`-family error on a 0-size transformed dim (#121).** In 0.1.0–0.26.0,
+  `fftn`, `ifftn`, `rfftn` and `irfftn` (and so `fft2`-style calls with an
+  explicit `dim`) raised `RuntimeError("cannot reshape tensor of 0 elements
+  into shape [-1, 0] ...")` when a 0-size dim was transformed, e.g. the
+  default all-dims `fftn(torch.randn(0, 4, 4))`. `torch.fft` raises there
+  too, but with `Invalid number of data points (0) specified`; 0.27.0
+  already raises torch's error (#123). A 0-size dim that is *not*
+  transformed returns an empty result of torch's shape. Both cases are now
+  pinned by conformance tests against `numpy.fft`, and the conformance
+  suite's `(0, 4, 4)` all-dims xfail, which expected an empty result where
+  torch raises, is removed.
+
 ### Deprecated
 
 - **A repeated `dim` in the n-D transforms (#127).** `fftn`, `ifftn`,
