@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-11-02
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended.** Integer inputs were computed in the integer dtype (#113); `stft` dropped the batch dim of a (1, L) input (#114); `ComplexModReLU` applied its bias on the wrong axis (#115); `fftn(dim=())` aliased its input (#116); float64 `ComplexLinear` on the NKI path returned inf/NaN (#131). New: full `torch.fft` `n`/`s`/`dim`/`norm` parity plus `ifft2`, `hfft2`/`ihfft2`, `hfftn`/`ihfftn`, `fftshift`, `fftfreq`/`rfftfreq` (#128), and zero-size / N-D input host guards (#135).
+
 ### Fixed
 
 - **`ComplexLinear` / `complex_linear` with float64 host tensors on the NKI
@@ -15,6 +21,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and comes back float64, as `complex_gemm` already did. Affects 0.25.0
   through 0.26.0 on Trainium with `set_backend("nki")`. Found by the round-3
   device harness on Trn2 (trnsci/trnsci#35).
+
+
+- **NKI backend raised on zero-size batches and on non-2-D `ComplexLinear`
+  input** (loud, not silent). Affects the NKI path (`set_backend("nki")`,
+  or `"auto"` on a Neuron host): zero-size batches in every release
+  (0.1.0–0.26.0), and N-D / 1-D / empty `ComplexLinear` input in 0.6.0–0.26.0.
+  A zero-size batch (`fft` of `(0, 8)`, `fft2` of `(0, 4, 4)`, `rfft`, `ihfft`)
+  reached the kernels and failed lowering ("shape must be a
+  tuple of positive integers"); it now returns an empty result on the host.
+  `ComplexLinear` on `(B, T, K)` or `(K,)` input failed to unpack its shape
+  in the 2-D kernel; the leading dims are now flattened for the kernel and
+  restored, as `nn.Linear` does, and an empty batch returns on the host.
+  Found on Trn2 (#130). fp16/bf16 real input (#133) and the `ComplexConv1d`
+  fp64 compile error (#134) are separate.
+
+- **Integer inputs gave wrong FFTs** (silent). Affects **every release
+  (0.1.0–0.26.0)**, on every backend. `fft` / `ifft` / `rfft` / `ihfft` /
+  `fft2` / `fftn` / `rfft2` / `rfftn` (and `irfft` / `irfftn` on an integer
+  `ComplexTensor`) computed in the integer dtype. Power-of-2 lengths
+  truncated each butterfly and returned an integer tensor (40–60 % off);
+  Bluestein lengths cast the chirp to 0/±1 (~100 % off). Integer and bool
+  inputs are now promoted to the default float dtype, as `torch.fft` does
+  (#113).
+
+- **`stft` dropped the batch dim of a `(1, L)` input** (silent shape
+  change). Affects **every release (0.1.0–0.26.0)**, on every backend, with
+  `center=True` (the default). The reflect-pad path squeezed any leading
+  size-1 dim, so `(1, L)` gave `(F, T)` instead of `(1, F, T)` as
+  `torch.stft` returns, and `istft` of it gave `(L,)`. 1-D, batch > 1 and
+  `center=False` callers are unchanged (#114).
+
+- **`nn.ComplexModReLU` applied its bias along the wrong axis for
+  `(B, C, L)` inputs** (silent when `C == L`, a shape error otherwise).
+  Affects **every release (0.1.0–0.26.0)**, on every backend. The `(F,)`
+  bias was broadcast over the last dim instead of the feature dim (dim 1).
+  1-D and 2-D inputs are unchanged (#115).
+
+- **`fftn` / `ifftn` with `dim=()` returned a view of the input** (silent
+  aliasing: writing to the result changed the caller's tensor). Affects
+  **every release since 0.2.0**, on every backend. The values were right;
+  a copy is now returned, as `torch.fft.fftn` does (#116).
+
+
+- **Negative sizes, `s=-1`, and `hfft` of a real tensor** (#123). A
+  negative `n` / `s` entry sliced the input (`n=-1` dropped the last sample
+  and returned a transform one shorter, silently), so `fftn(x, s=(-1, 8))`
+  truncated where `torch.fft` keeps the size. `s[i] == -1` now keeps the
+  size, and other sizes below 1 raise `RuntimeError`, as in `torch.fft`.
+  `hfft` / `hfftn` now accept a real `torch.Tensor` (it raised
+  `TypeError`). `rfft*` / `ihfft*` given a complex input now raise
+  `TypeError`, as `torch.fft` does: a `ComplexTensor` raised
+  `AttributeError` / `AssertionError`, and `rfft` / `ihfft` of a torch
+  complex tensor returned the first `n // 2 + 1` bins of its full complex
+  FFT, which is not a real-input transform. An `s` / `dim` length mismatch
+  raises `RuntimeError` rather than an `assert`.
 
 ### Added
 
@@ -43,65 +104,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where `torch.fft` raises (needs a decision, #127).
   `tests/test_torch_fft_parity.py` compares every function with
   `torch.fft` over dim / norm / n / s / real and complex inputs.
-### Fixed
-
-- **NKI backend raised on zero-size batches and on non-2-D `ComplexLinear`
-  input** (loud, not silent). Affects the NKI path (`set_backend("nki")`,
-  or `"auto"` on a Neuron host): zero-size batches in every release
-  (0.1.0–0.26.0), and N-D / 1-D / empty `ComplexLinear` input in 0.6.0–0.26.0.
-  A zero-size batch (`fft` of `(0, 8)`, `fft2` of `(0, 4, 4)`, `rfft`, `ihfft`)
-  reached the kernels and failed lowering ("shape must be a
-  tuple of positive integers"); it now returns an empty result on the host.
-  `ComplexLinear` on `(B, T, K)` or `(K,)` input failed to unpack its shape
-  in the 2-D kernel; the leading dims are now flattened for the kernel and
-  restored, as `nn.Linear` does, and an empty batch returns on the host.
-  Found on Trn2 (#130). fp16/bf16 real input (#133) and the `ComplexConv1d`
-  fp64 compile error (#134) are separate.
-
-- **Integer inputs gave wrong FFTs** (silent). Affects **every release
-  (0.1.0–0.26.0)**, on every backend. `fft` / `ifft` / `rfft` / `ihfft` /
-  `fft2` / `fftn` / `rfft2` / `rfftn` (and `irfft` / `irfftn` on an integer
-  `ComplexTensor`) computed in the integer dtype. Power-of-2 lengths
-  truncated each butterfly and returned an integer tensor (40–60 % off);
-  Bluestein lengths cast the chirp to 0/±1 (~100 % off). Integer and bool
-  inputs are now promoted to the default float dtype, as `torch.fft` does
-  (#113).
-### Fixed
-
-- **`stft` dropped the batch dim of a `(1, L)` input** (silent shape
-  change). Affects **every release (0.1.0–0.26.0)**, on every backend, with
-  `center=True` (the default). The reflect-pad path squeezed any leading
-  size-1 dim, so `(1, L)` gave `(F, T)` instead of `(1, F, T)` as
-  `torch.stft` returns, and `istft` of it gave `(L,)`. 1-D, batch > 1 and
-  `center=False` callers are unchanged (#114).
-### Fixed
-
-- **`nn.ComplexModReLU` applied its bias along the wrong axis for
-  `(B, C, L)` inputs** (silent when `C == L`, a shape error otherwise).
-  Affects **every release (0.1.0–0.26.0)**, on every backend. The `(F,)`
-  bias was broadcast over the last dim instead of the feature dim (dim 1).
-  1-D and 2-D inputs are unchanged (#115).
-### Fixed
-
-- **`fftn` / `ifftn` with `dim=()` returned a view of the input** (silent
-  aliasing: writing to the result changed the caller's tensor). Affects
-  **every release since 0.2.0**, on every backend. The values were right;
-  a copy is now returned, as `torch.fft.fftn` does (#116).
-
-### Fixed
-
-- **Negative sizes, `s=-1`, and `hfft` of a real tensor** (#123). A
-  negative `n` / `s` entry sliced the input (`n=-1` dropped the last sample
-  and returned a transform one shorter, silently), so `fftn(x, s=(-1, 8))`
-  truncated where `torch.fft` keeps the size. `s[i] == -1` now keeps the
-  size, and other sizes below 1 raise `RuntimeError`, as in `torch.fft`.
-  `hfft` / `hfftn` now accept a real `torch.Tensor` (it raised
-  `TypeError`). `rfft*` / `ihfft*` given a complex input now raise
-  `TypeError`, as `torch.fft` does: a `ComplexTensor` raised
-  `AttributeError` / `AssertionError`, and `rfft` / `ihfft` of a torch
-  complex tensor returned the first `n // 2 + 1` bins of its full complex
-  FFT, which is not a real-input transform. An `s` / `dim` length mismatch
-  raises `RuntimeError` rather than an `assert`.
 
 ## [0.26.0] - 2026-11-01
 
