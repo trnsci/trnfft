@@ -69,6 +69,30 @@ def _four_step_inputs(b, n):
     )
 
 
+def _sht_inputs(lmax, nfields, direction, punch=False, chunk=None):
+    # Shapes as trnfft.sht passes them: the full (n_alm, H) table and the full
+    # packed operand; ``plan`` carries the static polar-tile mask. ``punch``
+    # clears every other live tile of the mask (as polar skipping does at large
+    # L) so the skipped-tile and all-skipped-output paths are traced too.
+    from trnfft.nki.sht import chunk_plan
+    from trnfft.sht import SHT, encode_plan
+
+    s = SHT(lmax, fft="torch")
+    plan = s.plan
+    if punch:
+        mask = s.tile_mask.copy()
+        live = np.argwhere(mask)
+        mask[tuple(live[::2].T)] = False
+        plan = encode_plan(lmax, s.H, mask)
+    if chunk is not None:
+        plan = chunk_plan(plan, *chunk)
+    table = s.table.numpy()
+    if direction == "forward":
+        data = _f32(2 * (lmax + 1) * s.H, 2 * nfields)
+        return (table, data), {"plan": plan}
+    return (table, _f32(s.n_alm, 2 * nfields)), {"plan": plan}
+
+
 # case id -> (module, kernel name, input factory returning (args, kwargs))
 _CASES = {
     "butterfly-s0": ("butterfly", "butterfly_stage_kernel", lambda: _butterfly_inputs(8, 16, 0)),
@@ -218,6 +242,39 @@ _CASES = {
         "dispatch",
         "_complex_mul_kernel",
         lambda: ((_f32(128, 4), _f32(128, 4), _f32(128, 4), _f32(128, 4)), {}),
+    ),
+    # trnfft#148: SHT latitude stage. Tails in K (degrees), H (latitudes: 21,
+    # 151) and columns (66, 1200 = 2 x 600 per program at lnc=2), polar-tile
+    # masks, a launch chunk that starts mid-range, and nlat odd (L = 40).
+    "sht-forward-tails": (
+        "sht",
+        "sht_legendre_forward_kernel",
+        lambda: _sht_inputs(40, 33, "forward"),
+    ),
+    "sht-inverse-tails": (
+        "sht",
+        "sht_legendre_inverse_kernel",
+        lambda: _sht_inputs(40, 33, "inverse"),
+    ),
+    "sht-forward-masked": (
+        "sht",
+        "sht_legendre_forward_kernel",
+        lambda: _sht_inputs(300, 600, "forward", punch=True),
+    ),
+    "sht-inverse-masked": (
+        "sht",
+        "sht_legendre_inverse_kernel",
+        lambda: _sht_inputs(300, 600, "inverse", punch=True),
+    ),
+    "sht-forward-chunk": (
+        "sht",
+        "sht_legendre_forward_kernel",
+        lambda: _sht_inputs(255, 64, "forward", chunk=(100, 256)),
+    ),
+    "sht-inverse-chunk": (
+        "sht",
+        "sht_legendre_inverse_kernel",
+        lambda: _sht_inputs(255, 64, "inverse", chunk=(100, 256)),
     ),
 }
 

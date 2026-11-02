@@ -39,6 +39,7 @@ from . import autograd as _ag
 from . import butterfly as _bfly
 from . import dispatch as _d
 from . import four_step as _fs
+from . import sht as _sht
 from . import stockham as _st
 
 Pair = tuple[torch.Tensor, torch.Tensor]
@@ -273,6 +274,34 @@ def four_step_fft(
     return _fs.four_step_fft_kernel(x_re, x_im, w1_blk, t_re, t_im, w2_re, w2_im)
 
 
+# ── Spherical harmonic transform, latitude stage (trnfft#148) ─────────────────
+# ``plan`` is a static string argument: it carries the polar-tile mask, so the
+# mask is part of the trace-cache key (aws-neuron-sdk#1454).
+
+
+def _sht_rows(plan: str) -> tuple[int, int]:
+    L, H, m0, m1, _ = _sht._decode_plan(plan)
+    return _sht._m_offset(L, m1) - _sht._m_offset(L, m0), 2 * (m1 - m0) * H
+
+
+@nki_op(
+    "trnfft::sht_legendre_forward",
+    mutates_args={},
+    fake_fn=lambda table, x, plan: x.new_empty((_sht_rows(plan)[0], x.shape[1])),
+)
+def sht_legendre_forward(table: torch.Tensor, x: torch.Tensor, plan: str) -> torch.Tensor:
+    return _sht.sht_legendre_forward_kernel(table, x, plan)
+
+
+@nki_op(
+    "trnfft::sht_legendre_inverse",
+    mutates_args={},
+    fake_fn=lambda table, alm, plan: alm.new_empty((_sht_rows(plan)[1], alm.shape[1])),
+)
+def sht_legendre_inverse(table: torch.Tensor, alm: torch.Tensor, plan: str) -> torch.Tensor:
+    return _sht.sht_legendre_inverse_kernel(table, alm, plan)
+
+
 # ── Composite FFT (carries the FFT-level adjoint) ────────────────────────────
 
 
@@ -335,4 +364,6 @@ OPS = {
     "stockham_radix8_w8_t2d": stockham_radix8_w8_t2d,
     "four_step_fft": four_step_fft,
     "fft": fft,
+    "sht_legendre_forward": sht_legendre_forward,
+    "sht_legendre_inverse": sht_legendre_inverse,
 }

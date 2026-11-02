@@ -44,7 +44,12 @@ EXPECTED_NKI_OPS = {
     "stockham_radix8_w8",
     "stockham_radix8_w8_t2d",
     "four_step_fft",
+    "sht_legendre_forward",
+    "sht_legendre_inverse",
 }
+# SHT latitude kernels (#148): two tensors and the static plan string in, one
+# tensor out.
+SHT_OPS = {"trnfft::sht_legendre_forward", "trnfft::sht_legendre_inverse"}
 # Plus the composite FFT op (torch.library.custom_op) that carries the adjoint.
 EXPECTED_OPS = EXPECTED_NKI_OPS | {"fft"}
 
@@ -441,6 +446,11 @@ class TestLazyRegistration:
         assert set(recorded) == {f"trnfft::{n}" for n in EXPECTED_NKI_OPS}
         for name, (fn, mutates, _) in recorded.items():
             schema = torch.library.infer_schema(fn, mutates_args=mutates)
+            if name in SHT_OPS:
+                assert schema.endswith("-> Tensor"), (name, schema)
+                assert schema.split("->")[0].count("Tensor") == 2, (name, schema)
+                assert "str plan" in schema, (name, schema)
+                continue
             assert schema.endswith("-> (Tensor, Tensor)"), (name, schema)
             n_in = 7 if name == "trnfft::four_step_fft" else 4
             assert schema.split("->")[0].count("Tensor") == n_in, (name, schema)

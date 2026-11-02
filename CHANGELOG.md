@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Spherical harmonic transforms, `trnfft.sht` (#148, trnsci/trnsci#111
+  milestone 1).** `SHT(lmax, grid="gauss"|"equiangular")` gives forward
+  (analysis) and inverse (synthesis) scalar transforms of `(..., nlat, nlon)`
+  real fields. Coefficients are orthonormal with the Condon-Shortley phase, in
+  ducc0's triangular m-major order. The longitude stage uses `trnfft.rfft` /
+  `trnfft.irfft`. The latitude stage is a per-m GEMM against
+  parity-split Legendre tables, which are computed on the host in fp64
+  (log-space start, so high m does not underflow) and stored as fp32.
+  - **NKI kernels.** `trnfft/nki/sht.py` runs every per-m problem in one
+    launch (three at L = 1023). Each table tile stays stationary in SBUF
+    while all 2F field columns stream into fp32 PSUM.
+  - **Polar tiles.** All-zero 128 x 128 table tiles are skipped through a
+    static mask, passed in the kernel's `plan` argument (aws-neuron-sdk#1454).
+  - **Kernel rules.** Plain `nl.load` with `nisa.nc_transpose`, never
+    `load_transpose2d`. Both LNC=2 cores split the columns by `program_id`.
+    Tail tiles are handled in every dimension.
+  - **Accuracy.** fp32 is within 1e-6 (spectral l2) of fp64 ducc0: measured
+    2.6e-7 at L = 511 and 3.6e-7 at L = 1023.
+  - **Tests.** Validated against ducc0, SHTns and a direct
+    `scipy.special.sph_harm_y` quadrature. The kernels are tested under
+    `nki.simulate` at 1 and 2 programs and pass the MLIR verifier at lnc=1
+    and lnc=2.
+  - **Benchmark.** `scripts/bench_sht.py`, with `--device` rows. See
+    `docs/api/sht.md`.
+
 ### Deprecated
 
 - **A repeated `dim` in the n-D transforms (#127).** `fftn`, `ifftn`,

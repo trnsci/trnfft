@@ -25,6 +25,7 @@ nav:
       - ComplexTensor: api/complex.md
       - Neural Network Layers: api/nn.md
       - NKI Backend: api/nki.md
+      - Spherical Harmonic Transforms: api/sht.md
   - Architecture: architecture.md
   - Benchmarks: benchmarks.md
   - Deployment:
