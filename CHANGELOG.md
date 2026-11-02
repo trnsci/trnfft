@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **float16 / bfloat16 input on the NKI path failed to lower (#133).** In
+  0.13.0–0.27.0 on NKI 0.7 (observed on 0.26.0 and 0.27.0), half-precision
+  input to `fft`, `ifft`, `rfft`, `ihfft`, `stft` and the other transforms
+  raised `RuntimeError: [NkiDispatch] Python lower_func failed ...
+  AttributeError: module 'nki.language' has no attribute 'cast'` under
+  `set_backend("nki")` and `"auto"`; direct half `complex_gemm` calls did
+  too. Two changes:
+  - The transforms now run half input on float32 copies and round the result
+    once to the input dtype, the dtype torch.fft returns. Measured on Trn2
+    with the kernel cast fixed, the native half path was 0.3 ms faster at
+    N <= 1024 but up to 3x less accurate (fp16 N=12: 4.9e-4 vs 2.2e-4;
+    bf16 N=129: 6.6e-3 vs 1.9e-3), and from N=2048 the fp32 route was faster
+    (four-step 1.7 ms vs 0.96 ms) and more accurate. At N=16384, 65536 and
+    Bluestein N=3001 the half stage kernels failed MLIR verification.
+    The low-precision modes (`bf16`, `bf16_refined`, `ozaki`, `ozaki_hq`)
+    keep their own handling inside their GEMM ranges (#137).
+  - The four kernels that rounded their FP32 PSUM to a half output
+    (`complex_gemm`, `complex_gemm_t2d`, `complex_gemm_tn`, the radix-8
+    Stockham stages) now convert in the PSUM -> SBUF `tensor_copy` instead of
+    calling `nl.cast`. float32 bits are unchanged.
+
 - **`fftn`-family error on a 0-size transformed dim (#121).** In 0.1.0–0.26.0,
   `fftn`, `ifftn`, `rfftn` and `irfftn` (and so `fft2`-style calls with an
   explicit `dim`) raised `RuntimeError("cannot reshape tensor of 0 elements
