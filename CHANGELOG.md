@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ComplexLinear` / `complex_linear` with float64 host tensors on the NKI
+  backend returned inf/NaN** (silent, #131). The native `complex_linear` op
+  received float64 operands as is. float64 now runs through the fp32 kernel
+  and comes back float64, as `complex_gemm` already did. Affects 0.25.0
+  through 0.26.0 on Trainium with `set_backend("nki")`. Found by the round-3
+  device harness on Trn2 (trnsci/trnsci#35).
+
 ### Added
 
 - **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),

@@ -611,6 +611,26 @@ class TestNativeAutogradCPU:
         self._check_grads(complex_linear_autograd, _linear_ref, inputs)
         assert native_cpu["linear"] == 1
 
+    def test_complex_linear_float64_runs_in_fp32(self, native_cpu, monkeypatch):
+        """float64 operands reached the fp32 kernel as is (inf/NaN on Trn2, #131)."""
+        from trnfft import ComplexTensor
+        from trnfft.nki.dispatch import complex_linear
+
+        def fp32_only(x_re, x_im, w_re, w_im):
+            for t in (x_re, x_im, w_re, w_im):
+                assert t.dtype == torch.float32, t.dtype
+            return _linear_ref(x_re, x_im, w_re, w_im)
+
+        monkeypatch.setattr(dispatch, "_complex_linear_kernel", fp32_only, raising=False)
+        g = torch.Generator().manual_seed(3)
+        xr, xi = (torch.randn(4, 6, generator=g, dtype=torch.float64) for _ in range(2))
+        wr, wi = (torch.randn(3, 6, generator=g, dtype=torch.float64) for _ in range(2))
+        y = complex_linear(ComplexTensor(xr, xi), wr, wi)
+        assert y.real.dtype == y.imag.dtype == torch.float64
+        ref = torch.complex(xr, xi) @ torch.complex(wr, wi).t()
+        torch.testing.assert_close(y.real, ref.real, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(y.imag, ref.imag, rtol=1e-5, atol=1e-5)
+
     def test_complex_mul(self, native_cpu):
         from trnfft.nki.autograd import complex_mul_autograd
 

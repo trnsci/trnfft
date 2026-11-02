@@ -888,6 +888,13 @@ def _nki_complex_linear(
         raise RuntimeError("NKI not available")
     from .autograd import complex_linear_autograd
 
+    # The kernel is fp32. float64 host tensors reached it as is and came back
+    # inf/NaN (#131): run it in fp32 and return float64, as complex_gemm does.
+    out_dtype = torch.promote_types(x.real.dtype, w_real.dtype)
+    if out_dtype == torch.float64:
+        xr, xi, wr, wi = (t.float() for t in (x.real, x.imag, w_real, w_imag))
+        y_real, y_imag = complex_linear_autograd(xr, xi, wr, wi)
+        return ComplexTensor(y_real.to(out_dtype), y_imag.to(out_dtype))
     y_real, y_imag = complex_linear_autograd(x.real, x.imag, w_real, w_imag)
     return ComplexTensor(y_real, y_imag)
 
