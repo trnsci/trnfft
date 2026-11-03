@@ -154,6 +154,14 @@ class _Composite:
 
 def _fake_torch_neuronx():
     mod = types.ModuleType("torch_neuronx")
+    real = sys.modules.get("torch_neuronx")
+    if real is not None:
+        # On a Neuron host the real runtime keeps reading module state from
+        # `sys.modules["torch_neuronx"]` while the stand-in is installed (e.g.
+        # `torch.manual_seed` -> `torch_neuronx._is_in_bad_fork`), so the
+        # stand-in starts as a copy of the real module; `__spec__`, `nki_op`
+        # and `device_count` are replaced below.
+        mod.__dict__.update({k: v for k, v in vars(real).items() if not k.startswith("__")})
     mod.__spec__ = importlib.machinery.ModuleSpec("torch_neuronx", None)
 
     def nki_op(name, fn=None, mutates_args={}, fake_fn=None):  # noqa: B006
@@ -175,6 +183,9 @@ def _raw_kernel(*a, **k):
 def native(monkeypatch):
     """`_native` imported fresh with stub ops; native dispatch forced on CPU."""
     monkeypatch.setitem(sys.modules, "torch_neuronx", _fake_torch_neuronx())
+    # Record the real state first, so teardown removes the stub-backed `_native`
+    # imported below (a later test in the session would otherwise get stub ops).
+    monkeypatch.setitem(sys.modules, "trnfft.nki._native", None)
     monkeypatch.delitem(sys.modules, "trnfft.nki._native", raising=False)
     had_attr = hasattr(trnfft_nki, "_native")
     old_attr = getattr(trnfft_nki, "_native", None)
@@ -189,6 +200,10 @@ def native(monkeypatch):
     monkeypatch.setattr(dispatch, "HAS_NKI", True)
     monkeypatch.setattr(dispatch, "_dispatch_path", "native")
     monkeypatch.setattr(dispatch, "_native_ops", mod.OPS)
+    # The eager-handle fast path (#140) calls the real kernel through a cached
+    # torch_neuronx handle and skips the op layer, so on a Neuron host it would
+    # bypass the stub ops (and fail on the stand-in torch_neuronx module).
+    monkeypatch.setattr(dispatch, "_EAGER_HANDLE_ENABLED", False)
     monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "cpu")
     monkeypatch.setattr(dispatch, "_USE_SIMULATOR", False)
     monkeypatch.setitem(sys.modules, "torch_xla", None)  # any import raises

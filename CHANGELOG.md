@@ -53,8 +53,8 @@ Lands in the next release (0.28.0). Needs device validation on Trn2.
   low-precision modes (`bf16`, `bf16_refined`, `ozaki`, `ozaki_hq`) with a
   bfloat16 or float16 input now return the input dtype, not the BF16 GEMM's
   float32 PSUM (#137 item 2). float32 and float64 input are unchanged.
-  Whether half operands should run natively on the kernels or be upcast to
-  float32 is still open (#137 item 1); half operands run as before.
+  Outside those modes, half input to the transforms runs on float32 copies
+  and is rounded to the input dtype (#133, under Fixed).
 
 ### Fixed
 
@@ -88,6 +88,39 @@ Lands in the next release (0.28.0). Needs device validation on Trn2.
   - `complex_mask_apply` sizes that are not a multiple of 128 keep their
     float64 torch route.
 
+- **float16 / bfloat16 input on the NKI path failed to lower (#133).** In
+  0.13.0–0.27.0 on NKI 0.7 (observed on 0.26.0 and 0.27.0), half-precision
+  input to `fft`, `ifft`, `rfft`, `ihfft`, `stft` and the other transforms
+  raised `RuntimeError: [NkiDispatch] Python lower_func failed ...
+  AttributeError: module 'nki.language' has no attribute 'cast'` under
+  `set_backend("nki")` and `"auto"`; direct half `complex_gemm` calls did
+  too. Two changes:
+  - The transforms now run half input on float32 copies and round the result
+    once to the input dtype, the dtype torch.fft returns. Measured on Trn2
+    with the kernel cast fixed, the native half path was 0.3 ms faster at
+    N <= 1024 but up to 3x less accurate (fp16 N=12: 4.9e-4 vs 2.2e-4;
+    bf16 N=129: 6.6e-3 vs 1.9e-3), and from N=2048 the fp32 route was faster
+    (four-step 1.7 ms vs 0.96 ms) and more accurate. At N=16384, 65536 and
+    Bluestein N=3001 the half stage kernels failed MLIR verification.
+    The low-precision modes (`bf16`, `bf16_refined`, `ozaki`, `ozaki_hq`)
+    keep their own handling inside their GEMM ranges (#137).
+  - The four kernels that rounded their FP32 PSUM to a half output
+    (`complex_gemm`, `complex_gemm_t2d`, `complex_gemm_tn`, the radix-8
+    Stockham stages) now convert in the PSUM -> SBUF `tensor_copy` instead of
+    calling `nl.cast`. float32 bits are unchanged.
+
+- **`fftn`-family error on a 0-size transformed dim (#121).** In 0.1.0–0.26.0,
+  `fftn`, `ifftn`, `rfftn` and `irfftn` (and so `fft2`-style calls with an
+  explicit `dim`) raised `RuntimeError("cannot reshape tensor of 0 elements
+  into shape [-1, 0] ...")` when a 0-size dim was transformed, e.g. the
+  default all-dims `fftn(torch.randn(0, 4, 4))`. `torch.fft` raises there
+  too, but with `Invalid number of data points (0) specified`; 0.27.0
+  already raises torch's error (#123). A 0-size dim that is *not*
+  transformed returns an empty result of torch's shape. Both cases are now
+  pinned by conformance tests against `numpy.fft`, and the conformance
+  suite's `(0, 4, 4)` all-dims xfail, which expected an empty result where
+  torch raises, is removed.
+
 ### Added
 
 - **`TRNFFT_REQUIRE_NKI=1`** (read per call): an operand dtype a kernel does
@@ -110,6 +143,15 @@ Lands in the next release (0.28.0). Needs device validation on Trn2.
   They now emit a `DeprecationWarning`, and will raise in the next minor
   release, as `torch.fft` does. The result is unchanged in this release.
   Pass each dim once; to transform a dim twice, call the transform twice.
+- **The `window=None` default of `stft` and `istft` (#106).** It is a Hann
+  window of `win_length`, while `torch.stft`/`torch.istft` (whose signature
+  `stft` documents matching) use a rectangular window of ones. Both now emit
+  a `DeprecationWarning`. The default changes to torch's rectangular window
+  in the next minor release (#145), and `stft` and `istft` change together
+  so a default round trip stays consistent. The result is unchanged in this
+  release. To keep the Hann window, pass
+  `window=torch.hann_window(win_length)` explicitly. The example and
+  quickstart now do.
 
 ## [0.27.0] - 2026-11-02
 
@@ -180,6 +222,23 @@ Headline: **correctness fixes — upgrade recommended.** Integer inputs were com
   complex tensor returned the first `n // 2 + 1` bins of its full complex
   FFT, which is not a real-input transform. An `s` / `dim` length mismatch
   raises `RuntimeError` rather than an `assert`.
+### Performance
+
+- **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
+  layer (same fix as trnblas#92).** On the native path a `trnfft::` custom-op
+  call cost about 0.1 ms of host time before the kernel was queued, against
+  0.016 ms for aten. Most of it went to nki's `Kernel.__call__`, which
+  rebuilds the torch handle on every call, plus the `torch.library` layer.
+  `dispatch._launch` now calls a `torch_neuronx.wrap_nki` handle built once
+  per kernel for ops whose body is one kernel call (`_native.KERNELS`); the
+  butterfly `n` / `stage` ints pass through unchanged. On trn2 (LNC=2),
+  `complex_gemm` 128x128x128 issue drops from 0.144 to 0.053 ms (e2e 0.197 to
+  0.124 ms), a `butterfly_stage` launch from 0.183 to 0.073 ms, and a
+  device-resident `trnfft.fft` of 128x1024 from 0.336 to 0.223 ms e2e.
+  Results are bit-identical. `torch.compile`, requires-grad, int64 and
+  tensor-subclass inputs, and the composite `trnfft::fft` op keep the custom
+  op. `TRNFFT_NKI_EAGER_HANDLE=0` turns this off;
+  `scripts/bench_eager_handle.py` measures it.
 
 ### Added
 
