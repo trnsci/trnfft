@@ -233,13 +233,12 @@ if HAS_NKI:
             nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=w8_i, accumulate=True)
             nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=w8_r, accumulate=True)
 
-            cr_sbuf = nl.ndarray((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
-            ci_sbuf = nl.ndarray((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+            # PSUM (FP32) -> SBUF in the output dtype: tensor_copy converts on the
+            # way (NKI 0.7 has no nl.cast; trnfft#133).
+            cr_sbuf = nl.ndarray((groups_chunk, TILE_N), dtype=a_re.dtype, buffer=nl.sbuf)
+            ci_sbuf = nl.ndarray((groups_chunk, TILE_N), dtype=a_re.dtype, buffer=nl.sbuf)
             nisa.tensor_copy(dst=cr_sbuf, src=psum_cr)
             nisa.tensor_copy(dst=ci_sbuf, src=psum_ci)
-            if a_re.dtype != nl.float32:
-                cr_sbuf = nl.cast(cr_sbuf, dtype=a_re.dtype)
-                ci_sbuf = nl.cast(ci_sbuf, dtype=a_re.dtype)
             nl.store(out_re[m_off : m_off + groups_chunk, :], value=cr_sbuf)
             nl.store(out_im[m_off : m_off + groups_chunk, :], value=ci_sbuf)
 
@@ -298,13 +297,12 @@ if HAS_NKI:
             nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=w8_i, accumulate=True)
             nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=w8_r, accumulate=True)
 
-            cr_sbuf = nl.ndarray((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
-            ci_sbuf = nl.ndarray((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+            # PSUM (FP32) -> SBUF in the output dtype: tensor_copy converts on the
+            # way (NKI 0.7 has no nl.cast; trnfft#133).
+            cr_sbuf = nl.ndarray((groups_chunk, TILE_N), dtype=a_re.dtype, buffer=nl.sbuf)
+            ci_sbuf = nl.ndarray((groups_chunk, TILE_N), dtype=a_re.dtype, buffer=nl.sbuf)
             nisa.tensor_copy(dst=cr_sbuf, src=psum_cr)
             nisa.tensor_copy(dst=ci_sbuf, src=psum_ci)
-            if a_re.dtype != nl.float32:
-                cr_sbuf = nl.cast(cr_sbuf, dtype=a_re.dtype)
-                ci_sbuf = nl.cast(ci_sbuf, dtype=a_re.dtype)
             nl.store(out_re[m_off : m_off + groups_chunk, :], value=cr_sbuf)
             nl.store(out_im[m_off : m_off + groups_chunk, :], value=ci_sbuf)
 

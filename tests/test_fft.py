@@ -1204,11 +1204,17 @@ class TestFourStepBatchFused(TestFourStepDispatch):
         assert (a.real - b.real).abs().max() / scale < 1e-5
         assert (a.imag - b.imag).abs().max() / scale < 1e-5
 
+    @pytest.mark.filterwarnings("ignore:trnfft fft. float64 input:UserWarning")
     def test_float64_runs_fp32_fused(self, monkeypatch):
-        """Float64 is cast to FP32 before any kernel path (#108): on Trn2 the
-        unfused four-step this test used to expect returned non-finite values
-        for float64. It now takes the fused FP32 kernel and returns float64."""
+        """Float64 on backend "nki" is cast to FP32 before any kernel path
+        (#108, #136): on Trn2 the unfused four-step this test used to expect
+        returned non-finite values for float64. It now takes the fused FP32
+        kernel and returns float64. (Backend "auto" computes float64 in torch;
+        ``TestFloat64OnKernelPath``.)"""
+        from trnfft.nki import dispatch
+
         calls = self._install_fakes(monkeypatch, batch_fused=True)
+        monkeypatch.setattr(dispatch, "_backend", "nki")
         x = ComplexTensor(torch.randn(4, 2048).double(), torch.randn(4, 2048).double())
         from trnfft import fft_core as fc
 
@@ -1933,7 +1939,9 @@ class TestPETransposeSelection:
 
 class TestFloat64OnKernelPath:
     """Float64 must not reach the FP32-only NKI kernels (#108): "double" goes to
-    the host in FP64, other modes run the kernels in FP32 and return float64."""
+    the host in FP64; other modes follow the float64 policy (#136): backend
+    "auto" computes in torch at float64 accuracy, "nki" runs the kernels in
+    FP32 and returns float64."""
 
     @pytest.fixture
     def fake_kernels(self, monkeypatch):
@@ -1956,11 +1964,15 @@ class TestFloat64OnKernelPath:
         monkeypatch.setattr(fft_core, "_fft_via_four_step_fused", fake_fused)
         return seen
 
+    @pytest.mark.parametrize("backend", ["nki", "auto"])
     @pytest.mark.parametrize("inverse", [False, True])
     @pytest.mark.parametrize("precision", ["fast", "kahan", "double"])
-    def test_float64_input(self, fake_kernels, precision, inverse):
+    @pytest.mark.filterwarnings("ignore:trnfft fft. float64 input:UserWarning")
+    def test_float64_input(self, fake_kernels, monkeypatch, precision, inverse, backend):
         from trnfft.fft_core import _cooley_tukey_nki_nograd
+        from trnfft.nki import dispatch
 
+        monkeypatch.setattr(dispatch, "_backend", backend)
         g = torch.Generator().manual_seed(0)
         z = torch.complex(
             torch.randn(3, 2048, generator=g, dtype=torch.float64),
@@ -1970,8 +1982,8 @@ class TestFloat64OnKernelPath:
         want = torch.fft.ifft(z) if inverse else torch.fft.fft(z)
         assert y.real.dtype == torch.float64
         err = (torch.complex(y.real, y.imag) - want).abs().max() / want.abs().max()
-        if precision == "double":
-            assert fake_kernels == []  # host FP64, no kernel
+        if precision == "double" or backend == "auto":
+            assert fake_kernels == []  # host FP64 / torch, no kernel
             assert err < 1e-12
         else:
             assert fake_kernels == [torch.float32]
