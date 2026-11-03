@@ -12,6 +12,7 @@ Backend selection:
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import math
 import os
@@ -73,7 +74,15 @@ def get_backend() -> str:
     return _backend
 
 
+# Per-thread "compute this call in torch" override: the float64 route under
+# backend "auto" (``_torch_route``) runs a whole call as the pytorch backend
+# would, without touching the global backend.
+_TORCH_ROUTE = threading.local()
+
+
 def _use_nki() -> bool:
+    if getattr(_TORCH_ROUTE, "on", False):
+        return False
     if _backend == "nki":
         return True
     if _backend == "pytorch":
@@ -81,6 +90,324 @@ def _use_nki() -> bool:
     return HAS_NKI
 
 
+class _torch_route:
+    """Context manager: ``_use_nki()`` is False in this thread until exit."""
+
+    def __enter__(self):
+        self._prev = getattr(_TORCH_ROUTE, "on", False)
+        _TORCH_ROUTE.on = True
+        return self
+
+    def __exit__(self, *exc):
+        _TORCH_ROUTE.on = self._prev
+        return False
+
+
+# ── Kernel operand dtypes: one guard at the NKI boundary (trnsci#35) ─────────
+#
+# float64, integer, bool and complex tensors reached the FP32 kernels as is and
+# came back inf/NaN, garbage or in the wrong dtype (#108, #131, and the same
+# class in trnblas#68, trntensor#87, trnsolver#83, trnsparse#78/#79). Each fix
+# was local. Two layers close the class here:
+#
+# * ``_launch`` and ``_simulate_kernel`` (every kernel launch: native op, XLA
+#   direct call, simulator) check each tensor operand against
+#   ``KERNEL_DTYPES[op]`` and raise ``TypeError`` if it is not listed, so no
+#   kernel can be reached with an unsupported dtype even when a wrapper forgets
+#   the guard.
+# * The public wrappers (``complex_gemm``, ``complex_linear``,
+#   ``complex_mask_apply``, ``complex_gemm_bf16``) and the FFT driver call
+#   ``_kernel_operands`` first. float64 follows the suite policy (trnfft#136,
+#   ``_float64_route``): under backend "auto" it computes in torch (the
+#   pytorch backend's path) at float64 accuracy; under an explicit "nki" the
+#   kernel runs in float32 with a one-time ``UserWarning`` per op and the
+#   result is cast back to the pytorch backend's dtype. Any other unsupported
+#   dtype (integer, bool, complex, mixed) runs the PyTorch backend, so the
+#   result is exactly what ``set_backend("pytorch")`` returns. Under
+#   ``TRNFFT_REQUIRE_NKI=1`` all of these raise ``NotImplementedError``
+#   instead (the trnblas#69 convention).
+#
+# The kernels allocate their outputs in the input dtype and accumulate in an
+# FP32 PSUM, so BF16 / FP16 operands are passed through as before.
+# ``four_step_fft`` and ``complex_gemm_tn`` are FP32-only: their drivers only
+# launch them for float32 (the four-step kernel stores its FP32 SBUF tiles
+# without a cast).
+_FP32 = frozenset({torch.float32})
+_FP32_HALF = frozenset({torch.float32, torch.bfloat16, torch.float16})
+
+KERNEL_DTYPES: dict[str, frozenset] = {
+    "complex_gemm": _FP32_HALF,
+    "complex_gemm_t2d": _FP32_HALF,
+    "complex_gemm_tn": _FP32,
+    "complex_gemm_bf16": _FP32_HALF,
+    "complex_gemm_bf16_t2d": _FP32_HALF,
+    "complex_linear": _FP32_HALF,
+    "complex_linear_t2d": _FP32_HALF,
+    "complex_mul": _FP32_HALF,
+    "butterfly_stage": _FP32_HALF,
+    "butterfly_stage_kahan": _FP32_HALF,
+    "stockham_radix4_stage": _FP32_HALF,
+    "stockham_radix8_w8": _FP32_HALF,
+    "stockham_radix8_w8_t2d": _FP32_HALF,
+    "four_step_fft": _FP32,
+    # The composite ``trnfft::fft`` op is host code, not a kernel: its driver
+    # (``fft_core._cooley_tukey_nki_nograd``) handles float64 itself and every
+    # stage kernel it launches is checked against its own entry.
+    "fft": _FP32_HALF | {torch.float64},
+}
+
+# (module, attribute) of each kernel, for ``_simulate_kernel`` callers that
+# pass only the kernel object.
+_KERNEL_ATTRS: dict[str, tuple[str, str]] = {
+    "complex_gemm": ("dispatch", "_complex_gemm_kernel"),
+    "complex_gemm_t2d": ("dispatch", "_complex_gemm_t2d_kernel"),
+    "complex_gemm_tn": ("dispatch", "_complex_gemm_tn_kernel"),
+    "complex_gemm_bf16": ("dispatch", "_complex_gemm_kernel_bf16"),
+    "complex_gemm_bf16_t2d": ("dispatch", "_complex_gemm_bf16_t2d_kernel"),
+    "complex_linear": ("dispatch", "_complex_linear_kernel"),
+    "complex_linear_t2d": ("dispatch", "_complex_linear_t2d_kernel"),
+    "complex_mul": ("dispatch", "_complex_mul_kernel"),
+    "butterfly_stage": ("butterfly", "butterfly_stage_kernel"),
+    "butterfly_stage_kahan": ("butterfly", "butterfly_stage_kernel_kahan"),
+    "stockham_radix4_stage": ("stockham", "stockham_radix4_stage_kernel"),
+    "stockham_radix8_w8": ("stockham", "stockham_radix8_w8_kernel"),
+    "stockham_radix8_w8_t2d": ("stockham", "stockham_radix8_w8_t2d_kernel"),
+    "four_step_fft": ("four_step", "four_step_fft_kernel"),
+}
+
+
+def _require_nki() -> bool:
+    """``TRNFFT_REQUIRE_NKI=1`` (read per call): refuse dtypes the kernels do not
+    take instead of casting float64 to float32 or computing in torch."""
+    return os.environ.get("TRNFFT_REQUIRE_NKI", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dtype_names(dtypes) -> list[str]:
+    return sorted(str(d).removeprefix("torch.") for d in dtypes)
+
+
+def _check_kernel_dtypes(op_name: str, tensors) -> None:
+    """Raise ``TypeError`` unless every tensor operand of ``op_name`` has a dtype
+    listed in ``KERNEL_DTYPES``. Called by every kernel launch."""
+    allowed = KERNEL_DTYPES.get(op_name)
+    if allowed is None:
+        raise TypeError(f"trnfft: kernel op {op_name!r} has no KERNEL_DTYPES entry")
+    dts = {t.dtype for t in tensors if isinstance(t, torch.Tensor)}
+    if not dts <= allowed:
+        raise TypeError(
+            f"trnfft: kernel {op_name!r} takes {_dtype_names(allowed)} operands, got "
+            f"{_dtype_names(dts)}. The caller must go through _kernel_operands "
+            "(float64 is cast to float32, other dtypes run in torch)."
+        )
+
+
+def _no_kernel_for_dtype(what: str, op_name: str, dtypes) -> None:
+    """Under TRNFFT_REQUIRE_NKI, refuse a dtype the kernel does not take.
+
+    Without it float64 follows ``_float64_route`` and other dtypes run in
+    torch. Before this guard they reached the FP32 kernels as is (#108, #131,
+    trnsci#35).
+    """
+    if _require_nki():
+        raise NotImplementedError(
+            f"trnfft {what}: the NKI kernel {op_name!r} takes "
+            f"{_dtype_names(KERNEL_DTYPES[op_name])}, got {_dtype_names(dtypes)}. "
+            "Unset TRNFFT_REQUIRE_NKI to compute float64 in torch (backend 'auto') "
+            "or in float32 on the kernel (backend 'nki'), and other dtypes in torch."
+        )
+
+
+# Ops that already warned about the explicit-"nki" float64 cast (one warning
+# per op per process).
+_FP64_WARNED: set[str] = set()
+
+
+def _float64_route(what: str, op_name: str, dtypes) -> str:
+    """The float64 policy (trnfft#136, the trnsci suite policy). Returns
+    ``"torch"`` or ``"cast"``.
+
+    * ``TRNFFT_REQUIRE_NKI=1``: ``NotImplementedError`` (no kernel takes
+      float64), whatever the backend;
+    * backend ``"auto"``: ``"torch"``, compute as the pytorch backend does, at
+      float64 accuracy;
+    * backend ``"nki"``: ``"cast"``, run the kernel in float32 and cast the
+      result back; a ``UserWarning`` the first time each op does this.
+    """
+    _no_kernel_for_dtype(what, op_name, dtypes)
+    if _backend != "nki":
+        return "torch"
+    if what not in _FP64_WARNED:
+        _FP64_WARNED.add(what)
+        warnings.warn(
+            f"trnfft {what}: float64 input on backend 'nki' runs the kernel in "
+            "float32, so precision is reduced to float32 (the result dtype is "
+            "the pytorch backend's). Use backend 'auto' for float64 accuracy in "
+            "torch, or TRNFFT_REQUIRE_NKI=1 to raise instead. Warned once per op.",
+            UserWarning,
+            stacklevel=3,
+        )
+    return "cast"
+
+
+# ── float64 already on the neuron device (trnfft#136 amendment) ─────────────
+#
+# "torch at float64 accuracy" under backend "auto" means host torch: on
+# Trainium, device aten computes float64 at FP32 precision (measured on Trn2),
+# so a float64 / complex128 operand already on the neuron device would get
+# FP32 accuracy from the torch route. ``_fp64_host_guard`` wraps every public
+# entry point: under "auto" it copies the neuron-resident operands to the
+# host, runs the op there (host float64 then takes the host-torch route) and
+# returns the result on the original device in its float64 / complex128
+# dtype, with one ``UserWarning`` per op. ``TRNFFT_FP64_ON_DEVICE=1`` (read
+# per call) keeps device aten (FP32 precision) instead.
+# ``TRNFFT_REQUIRE_NKI=1`` keeps raising (the guard steps aside), and backends
+# "nki" / "pytorch" are unchanged.
+_FP64_HOST_WARNED: set[str] = set()
+_FP64_DTYPES = (torch.float64, torch.complex128)
+_FP64_HOST_ROUTE = threading.local()  # set while a guarded op runs on the host
+
+
+def _fp64_on_device() -> bool:
+    """``TRNFFT_FP64_ON_DEVICE=1`` (read per call): keep device-resident float64
+    on device aten (FP32 precision) instead of the host route."""
+    return os.environ.get("TRNFFT_FP64_ON_DEVICE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _on_neuron_device(t: torch.Tensor) -> bool:
+    """True when ``t`` lives on the neuron device (patched in CPU tests)."""
+    return t.device.type == _NEURON_DEVICE
+
+
+def _walk_tensors(obj):
+    """Every tensor in ``obj`` (tensors, ComplexTensors, tuples, lists, dicts)."""
+    if isinstance(obj, torch.Tensor):
+        yield obj
+    elif isinstance(obj, ComplexTensor):
+        yield obj.real
+        yield obj.imag
+    elif isinstance(obj, (tuple, list)):
+        for o in obj:
+            yield from _walk_tensors(o)
+    elif isinstance(obj, dict):
+        for o in obj.values():
+            yield from _walk_tensors(o)
+
+
+def _map_tensors(obj, f):
+    """``obj`` with ``f`` applied to every tensor (structure kept)."""
+    if isinstance(obj, torch.Tensor):
+        return f(obj)
+    if isinstance(obj, ComplexTensor):
+        return ComplexTensor(f(obj.real), f(obj.imag))
+    if isinstance(obj, tuple) and hasattr(obj, "_fields"):  # namedtuple
+        return type(obj)(*(_map_tensors(o, f) for o in obj))
+    if isinstance(obj, (tuple, list)):
+        return type(obj)(_map_tensors(o, f) for o in obj)
+    if isinstance(obj, dict):
+        return {k: _map_tensors(v, f) for k, v in obj.items()}
+    return obj
+
+
+def _fp64_device_operand(args, kwargs):
+    """The device of the first float64 / complex128 operand on the neuron
+    device, or None."""
+    for t in _walk_tensors((args, kwargs)):
+        if t.dtype in _FP64_DTYPES and _on_neuron_device(t):
+            return t.device
+    return None
+
+
+def _fp64_to_host(t: torch.Tensor) -> torch.Tensor:
+    """Device -> host copy for the float64 host route (differentiable)."""
+    return t.to("cpu")
+
+
+def _fp64_to_device(t: torch.Tensor, device) -> torch.Tensor:
+    """Host -> ``device`` copy of a host-route result (differentiable)."""
+    return t.to(device)
+
+
+def _fp64_host_guard(op: str):
+    """Decorator for public entry point ``op``: under backend "auto", float64 /
+    complex128 operands on the neuron device compute on the host at float64
+    accuracy and the result returns to their device (see the block above)."""
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if (
+                _backend != "auto"
+                or getattr(_FP64_HOST_ROUTE, "on", False)  # nested op, already on host
+                or _require_nki()
+                or _fp64_on_device()
+            ):
+                return fn(*args, **kwargs)
+            device = _fp64_device_operand(args, kwargs)
+            if device is None:
+                return fn(*args, **kwargs)
+            if op not in _FP64_HOST_WARNED:
+                _FP64_HOST_WARNED.add(op)
+                warnings.warn(
+                    f"trnfft {op}: float64 on the neuron device is computed on the "
+                    "host for float64 accuracy (device arithmetic is fp32); pass "
+                    "float32 to stay on device, or set TRNFFT_FP64_ON_DEVICE=1 to "
+                    "keep device aten at fp32 precision. Warned once per op.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+            def to_host(t):
+                return _fp64_to_host(t) if _on_neuron_device(t) else t
+
+            _FP64_HOST_ROUTE.on = True
+            try:
+                out = fn(*_map_tensors(args, to_host), **_map_tensors(kwargs, to_host))
+            finally:
+                _FP64_HOST_ROUTE.on = False
+            return _map_tensors(out, lambda t: _fp64_to_device(t, device))
+
+        return wrapper
+
+    return deco
+
+
+def _kernel_operands(*tensors: torch.Tensor, op: str, what: str):
+    """Operands for kernel ``op`` from the caller's tensors.
+
+    Returns ``(operands, out_dtype, on_kernel)``. With ``on_kernel`` the
+    caller launches the kernel on ``operands`` and casts the result to
+    ``out_dtype`` (None: keep the kernel's); otherwise it computes in torch
+    (the PyTorch backend) on ``operands``.
+
+    * every operand one dtype the kernel takes: unchanged, kernel;
+    * floating operands including float64 (``_float64_route``): under
+      "auto", torch on the operands promoted to their common dtype (float64);
+      under "nki", the kernel on float32 copies with ``out_dtype`` the
+      promoted dtype;
+    * anything else (integer, bool, complex, mixed half/fp32): torch, as is.
+
+    Under ``TRNFFT_REQUIRE_NKI=1`` the last two raise ``NotImplementedError``.
+    """
+    allowed = KERNEL_DTYPES[op]
+    dts = {t.dtype for t in tensors}
+    if len(dts) == 1 and dts <= allowed:
+        return tensors, None, True
+    _no_kernel_for_dtype(what, op, dts)
+    if torch.float64 in dts and all(t.is_floating_point() for t in tensors):
+        out_dtype = functools.reduce(torch.promote_types, dts)
+        if _float64_route(what, op, dts) == "torch":
+            return tuple(t.to(out_dtype) for t in tensors), out_dtype, False
+        return tuple(t.float() for t in tensors), out_dtype, True
+    return tensors, None, False
+
+
+def _cast_result(c: ComplexTensor, out_dtype) -> ComplexTensor:
+    if out_dtype is None:
+        return c
+    return ComplexTensor(c.real.to(out_dtype), c.imag.to(out_dtype))
+
+
+@_fp64_host_guard("complex_gemm")
 def complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     """Complex matrix multiply with backend dispatch.
 
@@ -88,9 +415,19 @@ def complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     - Phase 1: A_real stationary, stream B_real and B_imag
     - Phase 2: A_imag stationary, stream -B_imag and B_real
     - 4 SBUF loads instead of 8, PSUM accumulation
+
+    float64 computes in torch under backend "auto" and runs the kernel in
+    float32 under "nki" (one-time warning); integer, bool and complex operands
+    compute in torch (``TRNFFT_REQUIRE_NKI=1``: all raise).
     """
     if _use_nki():
-        return _nki_complex_gemm(a, b)
+        (ar, ai, br, bi), out_dtype, on_kernel = _kernel_operands(
+            a.real, a.imag, b.real, b.imag, op=_gemm_kernel_names()[1], what="complex_gemm"
+        )
+        if on_kernel:
+            c = _nki_complex_gemm(ComplexTensor(ar, ai), ComplexTensor(br, bi))
+            return _cast_result(c, out_dtype)
+        a, b = ComplexTensor(ar, ai), ComplexTensor(br, bi)
     return complex_matmul(a, b)
 
 
@@ -98,6 +435,7 @@ def complex_gemm(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
 # because it references _complex_gemm_kernel_bf16 which only exists when HAS_NKI.
 
 
+@_fp64_host_guard("complex_linear")
 def complex_linear(x: ComplexTensor, w_real: torch.Tensor, w_imag: torch.Tensor) -> ComplexTensor:
     """Complex linear forward: y = x @ W^T (complex) with backend dispatch.
 
@@ -113,24 +451,42 @@ def complex_linear(x: ComplexTensor, w_real: torch.Tensor, w_imag: torch.Tensor)
         if xr.numel() == 0 or w_real.numel() == 0:
             out = (*lead, w_real.shape[0])
             return ComplexTensor(xr.new_zeros(out), xi.new_zeros(out))
-        if xr.dim() == 2:
-            return _nki_complex_linear(x, w_real, w_imag)
-        y = _nki_complex_linear(ComplexTensor(xr.reshape(-1, k), xi.reshape(-1, k)), w_real, w_imag)
-        return ComplexTensor(y.real.reshape(*lead, -1), y.imag.reshape(*lead, -1))
+        # float64 (#131, #136): torch under "auto", the kernel in float32
+        # under "nki"; integer, bool, complex and mixed operands take the
+        # PyTorch fallback below.
+        (xr, xi, wr, wi), out_dtype, on_kernel = _kernel_operands(
+            xr, xi, w_real, w_imag, op=_linear_kernel_names()[1], what="complex_linear"
+        )
+        x, w_real, w_imag = ComplexTensor(xr, xi), wr, wi
+        if on_kernel:
+            if xr.dim() == 2:
+                return _cast_result(_nki_complex_linear(ComplexTensor(xr, xi), wr, wi), out_dtype)
+            y = _nki_complex_linear(ComplexTensor(xr.reshape(-1, k), xi.reshape(-1, k)), wr, wi)
+            y = ComplexTensor(y.real.reshape(*lead, -1), y.imag.reshape(*lead, -1))
+            return _cast_result(y, out_dtype)
     # PyTorch fallback: 4 real matmuls
     yr = torch.matmul(x.real, w_real.t()) - torch.matmul(x.imag, w_imag.t())
     yi = torch.matmul(x.real, w_imag.t()) + torch.matmul(x.imag, w_real.t())
     return ComplexTensor(yr, yi)
 
 
+@_fp64_host_guard("complex_mask_apply")
 def complex_mask_apply(mask: ComplexTensor, spec: ComplexTensor) -> ComplexTensor:
     """Apply complex mask to spectrogram with backend dispatch.
 
     NKI kernel fuses all 6 element-wise ops into single kernel invocation,
     avoiding 6 HBM round-trips.
     """
-    if _use_nki():
-        return _nki_complex_mask(mask, spec)
+    # Sizes the kernel cannot take (not a multiple of 128 elements) run in
+    # torch at the caller's dtype before the dtype guard: that route is already
+    # full precision, so float64 must not be cast for it.
+    if _use_nki() and mask.real.numel() % 128 == 0:
+        (mr, mi, sr, si), out_dtype, on_kernel = _kernel_operands(
+            mask.real, mask.imag, spec.real, spec.imag, op="complex_mul", what="complex_mask_apply"
+        )
+        if on_kernel:
+            c = _nki_complex_mask(ComplexTensor(mr, mi), ComplexTensor(sr, si))
+            return _cast_result(c, out_dtype)
     return mask * spec
 
 
@@ -881,6 +1237,9 @@ def _launch(kernel, op_name: str, *args):
     there between stages) are not copied, and the result stays there.
     """
     tensors = [a for a in args if isinstance(a, torch.Tensor)]
+    # Structural dtype guard (trnsci#35): no kernel runs with an operand dtype
+    # it does not take, whichever wrapper launched it.
+    _check_kernel_dtypes(op_name, tensors)
     if _is_native():
         orig = tensors[0].device
         # A tensor already on ``neuron:k`` stays there (``.to("neuron")`` is a
@@ -899,7 +1258,18 @@ def _launch(kernel, op_name: str, *args):
     return _to_host(out, orig)
 
 
-def _simulate_kernel(kernel, *tensors):
+def _kernel_op_name(kernel) -> str:
+    """The ``KERNEL_DTYPES`` key of a kernel object (``TypeError`` if unknown)."""
+    mods = {"dispatch": sys.modules[__name__]}
+    for name in ("butterfly", "stockham", "four_step"):
+        mods[name] = sys.modules.get(f"{__package__}.{name}")
+    for op, (mod, attr) in _KERNEL_ATTRS.items():
+        if mods[mod] is not None and getattr(mods[mod], attr, None) is kernel:
+            return op
+    raise TypeError(f"trnfft: {kernel!r} is not a known kernel; pass op= to _simulate_kernel")
+
+
+def _simulate_kernel(kernel, *tensors, op: str | None = None):
     """Route a kernel call through `nki.simulate` on CPU.
 
     Converts each input tensor to numpy, calls the simulator, and marshals
@@ -910,7 +1280,11 @@ def _simulate_kernel(kernel, *tensors):
     Used by the dispatch wrappers when ``TRNFFT_USE_SIMULATOR=1`` is set
     in the environment. Bypasses torch_xla and NEFF compile entirely —
     correctness iteration only; hardware still owns perf numbers.
+
+    ``op`` is the kernel's ``KERNEL_DTYPES`` key (looked up from ``kernel``
+    when omitted); operand dtypes are checked as in ``_launch``.
     """
+    _check_kernel_dtypes(op if op is not None else _kernel_op_name(kernel), tensors)
     orig_device = tensors[0].device
     # numpy has no BF16 dtype — cast to FP32 before simulation (simulator
     # uses the kernel's declared dtype, not the numpy input dtype).
@@ -942,19 +1316,25 @@ def complex_gemm_bf16(a: ComplexTensor, b: ComplexTensor) -> ComplexTensor:
     On CPU (no NKI): falls back to ``complex_matmul`` with whatever dtype
     the inputs carry (correctness path; no throughput benefit on CPU).
     """
-    if _use_nki() and not _use_simulator():
-        # Move inputs to the device, then move results back to the caller's
-        # device (like the autograd wrappers). Returning device tensors here
-        # made _fft_via_ozaki_hq mix device and CPU tensors (trnfft#80).
+    if _use_nki() or _use_simulator():
         kernel_name, op_name = _bf16_kernel_names()
-        c_real, c_imag = _launch(
-            globals().get(kernel_name), op_name, a.real, a.imag, b.real, b.imag
+        # The result is FP32 on every route (as the fallback below, which is
+        # the pytorch backend). float64: the fallback under "auto", the kernel
+        # in float32 under "nki" (one-time warning); integer, bool and complex
+        # operands take the fallback (TRNFFT_REQUIRE_NKI=1: raise).
+        (ar, ai, br, bi), _, on_kernel = _kernel_operands(
+            a.real, a.imag, b.real, b.imag, op=op_name, what="complex_gemm_bf16"
         )
-        return ComplexTensor(c_real, c_imag)
-    if _use_simulator():
-        kernel = globals()[_bf16_kernel_names()[0]]
-        c_real, c_imag = _simulate_kernel(kernel, a.real, a.imag, b.real, b.imag)
-        return ComplexTensor(c_real, c_imag)
+        if on_kernel:
+            if _use_simulator():
+                kernel = globals()[kernel_name]
+                c_real, c_imag = _simulate_kernel(kernel, ar, ai, br, bi, op=op_name)
+                return ComplexTensor(c_real, c_imag)
+            # Move inputs to the device, then move results back to the caller's
+            # device (like the autograd wrappers). Returning device tensors here
+            # made _fft_via_ozaki_hq mix device and CPU tensors (trnfft#80).
+            c_real, c_imag = _launch(globals().get(kernel_name), op_name, ar, ai, br, bi)
+            return ComplexTensor(c_real, c_imag)
     # CPU fallback: simulate FP32 PSUM behaviour by casting BF16 inputs to
     # FP32 before the matmul. On hardware, nc_matmul accumulates BF16 products
     # into a FP32 PSUM; on CPU torch.matmul accumulates in BF16 without the
@@ -981,13 +1361,8 @@ def _nki_complex_linear(
         raise RuntimeError("NKI not available")
     from .autograd import complex_linear_autograd
 
-    # The kernel is fp32. float64 host tensors reached it as is and came back
-    # inf/NaN (#131): run it in fp32 and return float64, as complex_gemm does.
-    out_dtype = torch.promote_types(x.real.dtype, w_real.dtype)
-    if out_dtype == torch.float64:
-        xr, xi, wr, wi = (t.float() for t in (x.real, x.imag, w_real, w_imag))
-        y_real, y_imag = complex_linear_autograd(xr, xi, wr, wi)
-        return ComplexTensor(y_real.to(out_dtype), y_imag.to(out_dtype))
+    # float64 (#131) is cast by ``complex_linear`` through ``_kernel_operands``
+    # before this point; ``_launch`` refuses any dtype the kernel does not take.
     y_real, y_imag = complex_linear_autograd(x.real, x.imag, w_real, w_imag)
     return ComplexTensor(y_real, y_imag)
 

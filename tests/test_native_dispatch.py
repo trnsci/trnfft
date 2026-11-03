@@ -331,7 +331,7 @@ class TestLaunchRouting:
             seen["args"] = (a, b, n, stage)
             return a + b, a - b
 
-        monkeypatch.setattr(dispatch, "_native_ops", {"fake": op})
+        monkeypatch.setattr(dispatch, "_native_ops", {"butterfly_stage": op})
 
         def no_xla(*t):
             raise AssertionError("_to_xla must not run on the native path")
@@ -340,7 +340,9 @@ class TestLaunchRouting:
             raise AssertionError("raw kernel must not be called on the native path")
 
         monkeypatch.setattr(dispatch, "_to_xla", no_xla)
-        out = dispatch._launch(no_kernel, "fake", torch.ones(2, 1), torch.ones(2, 1), 16, 3)
+        out = dispatch._launch(
+            no_kernel, "butterfly_stage", torch.ones(2, 1), torch.ones(2, 1), 16, 3
+        )
         assert isinstance(out, tuple) and len(out) == 2
         assert torch.equal(out[0], torch.full((2, 1), 2.0))
         assert out[0].device.type == "cpu"
@@ -362,7 +364,7 @@ class TestLaunchRouting:
 
         monkeypatch.setattr(dispatch, "_get_native_ops", no_ops)
         out = dispatch._launch(
-            lambda x, y, n: (x * n, y), "unused", torch.ones(4, 1), torch.ones(4, 1), 3
+            lambda x, y, n: (x * n, y), "butterfly_stage", torch.ones(4, 1), torch.ones(4, 1), 3
         )
         assert moved == [2]
         assert torch.equal(out[0], torch.full((4, 1), 3.0))
@@ -373,7 +375,7 @@ class TestLaunchRouting:
         monkeypatch.setattr(dispatch, "_dispatch_path", "cpu")
         monkeypatch.setitem(sys.modules, "torch_xla", None)
         with pytest.raises(ImportError):
-            dispatch._launch(lambda x: x, "unused", torch.ones(1, 1))
+            dispatch._launch(lambda x: x, "complex_mul", torch.ones(1, 1))
 
     def test_kernel_device(self, monkeypatch):
         monkeypatch.setattr(dispatch, "_dispatch_path", "native")
@@ -455,8 +457,10 @@ class TestEagerHandle:
             return args[0] + args[1], args[0] - args[1]
 
         monkeypatch.setattr(dispatch, "_wrap_nki", lambda kernel: handle)
+        # A real op name: the dtype guard at the launch refuses unknown ops.
+        eager[1]["butterfly_stage"] = _FakeKernel()
         a, b = torch.ones(2, 1), torch.zeros(2, 1)
-        out = dispatch._launch(None, "k", a, b, 16, 3)
+        out = dispatch._launch(None, "butterfly_stage", a, b, 16, 3)
         assert seen[0][2:] == (16, 3)
         assert torch.equal(out[0], a) and torch.equal(out[1], a)
 

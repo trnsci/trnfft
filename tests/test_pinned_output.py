@@ -120,7 +120,7 @@ class TestLaunch:
     def test_launch_results_through_to_host(self, monkeypatch):
         monkeypatch.setattr(dispatch, "_dispatch_path", "native")
         monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "cpu")
-        monkeypatch.setattr(dispatch, "_native_ops", {"fake": lambda a, b: (a + b, a - b)})
+        monkeypatch.setattr(dispatch, "_native_ops", {"complex_mul": lambda a, b: (a + b, a - b)})
         seen = []
 
         def rec(t, device="cpu"):
@@ -129,7 +129,7 @@ class TestLaunch:
 
         monkeypatch.setattr(dispatch, "_to_host", rec)
         a, b = torch.ones(2, 3), torch.ones(2, 3)
-        out = dispatch._launch(None, "fake", a, b)
+        out = dispatch._launch(None, "complex_mul", a, b)
         assert seen == ["cpu", "cpu"] and torch.equal(out[0], a + b)
 
 

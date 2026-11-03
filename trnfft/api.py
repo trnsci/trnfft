@@ -20,6 +20,7 @@ import torch
 
 from .complex import ComplexTensor
 from .fft_core import fft_core
+from .nki.dispatch import _fp64_host_guard
 
 # --- torch.fft argument conventions ---
 #
@@ -42,6 +43,7 @@ Dims = int | tuple[int, ...] | list[int] | None
 Sizes = tuple[int, ...] | list[int] | torch.Size | None
 
 
+@_fp64_host_guard("fft")
 def fft(
     input: torch.Tensor | ComplexTensor,
     n: int | None = None,
@@ -57,6 +59,7 @@ def fft(
     return _c2c(input, n, dim, norm, inverse=False)
 
 
+@_fp64_host_guard("ifft")
 def ifft(
     input: torch.Tensor | ComplexTensor,
     n: int | None = None,
@@ -71,6 +74,7 @@ def ifft(
     return _c2c(input, n, dim, norm, inverse=True)
 
 
+@_fp64_host_guard("rfft")
 def rfft(
     input: torch.Tensor,
     n: int | None = None,
@@ -94,6 +98,7 @@ def rfft(
     return _swap_last(_apply_norm(y, norm, n, inverse=False), d)
 
 
+@_fp64_host_guard("irfft")
 def irfft(
     input: torch.Tensor | ComplexTensor,
     n: int | None = None,
@@ -139,6 +144,7 @@ def irfft(
     return _swap_last(_apply_norm(result.real, norm, n, inverse=True), d)
 
 
+@_fp64_host_guard("hfft")
 def hfft(
     input: torch.Tensor | ComplexTensor,
     n: int | None = None,
@@ -159,6 +165,7 @@ def hfft(
     return irfft(_to_complex(input).conj(), n=n, dim=dim, norm=_SWAPPED_NORM[norm])
 
 
+@_fp64_host_guard("ihfft")
 def ihfft(
     input: torch.Tensor,
     n: int | None = None,
@@ -178,6 +185,7 @@ def ihfft(
     return rfft(x, n=n, dim=dim, norm=_SWAPPED_NORM[norm]).conj()
 
 
+@_fp64_host_guard("fft2")
 def fft2(
     input: torch.Tensor | ComplexTensor,
     s: Sizes = None,
@@ -188,6 +196,7 @@ def fft2(
     return fftn(input, s=s, dim=dim, norm=norm)
 
 
+@_fp64_host_guard("ifft2")
 def ifft2(
     input: torch.Tensor | ComplexTensor,
     s: Sizes = None,
@@ -198,6 +207,7 @@ def ifft2(
     return ifftn(input, s=s, dim=dim, norm=norm)
 
 
+@_fp64_host_guard("fftn")
 def fftn(
     input: torch.Tensor | ComplexTensor,
     s: Sizes = None,
@@ -212,6 +222,7 @@ def fftn(
     return _c2cn(input, s, dim, norm, inverse=False)
 
 
+@_fp64_host_guard("ifftn")
 def ifftn(
     input: torch.Tensor | ComplexTensor,
     s: Sizes = None,
@@ -222,6 +233,7 @@ def ifftn(
     return _c2cn(input, s, dim, norm, inverse=True)
 
 
+@_fp64_host_guard("rfft2")
 def rfft2(
     input: torch.Tensor,
     s: Sizes = None,
@@ -236,6 +248,7 @@ def rfft2(
     return rfftn(input, s=s, dim=dim, norm=norm)
 
 
+@_fp64_host_guard("irfft2")
 def irfft2(
     input: torch.Tensor | ComplexTensor,
     s: Sizes = None,
@@ -246,6 +259,7 @@ def irfft2(
     return irfftn(input, s=s, dim=dim, norm=norm)
 
 
+@_fp64_host_guard("rfftn")
 def rfftn(
     input: torch.Tensor,
     s: Sizes = None,
@@ -279,6 +293,7 @@ def rfftn(
     return _apply_norm(y, norm, n_total, inverse=False)
 
 
+@_fp64_host_guard("irfftn")
 def irfftn(
     input: torch.Tensor | ComplexTensor,
     s: Sizes = None,
@@ -314,6 +329,7 @@ def irfftn(
     return _apply_norm(y, norm, n_total, inverse=True)
 
 
+@_fp64_host_guard("hfft2")
 def hfft2(
     input: torch.Tensor | ComplexTensor,
     s: Sizes = None,
@@ -324,6 +340,7 @@ def hfft2(
     return hfftn(input, s=s, dim=dim, norm=norm)
 
 
+@_fp64_host_guard("ihfft2")
 def ihfft2(
     input: torch.Tensor,
     s: Sizes = None,
@@ -334,6 +351,7 @@ def ihfft2(
     return ihfftn(input, s=s, dim=dim, norm=norm)
 
 
+@_fp64_host_guard("hfftn")
 def hfftn(
     input: torch.Tensor | ComplexTensor,
     s: Sizes = None,
@@ -349,6 +367,7 @@ def hfftn(
     return irfftn(_to_complex(input).conj(), s=s, dim=dim, norm=_SWAPPED_NORM[norm])
 
 
+@_fp64_host_guard("ihfftn")
 def ihfftn(
     input: torch.Tensor,
     s: Sizes = None,
@@ -416,6 +435,7 @@ def rfftfreq(
     return out.requires_grad_(requires_grad)
 
 
+@_fp64_host_guard("stft")
 def stft(
     input: torch.Tensor,
     n_fft: int,
@@ -516,10 +536,11 @@ def _warn_default_window(name: str) -> None:
         "Pass window= explicitly; window=torch.hann_window(win_length) keeps the "
         "Hann window (#106).",
         DeprecationWarning,
-        stacklevel=3,
+        stacklevel=4,  # _warn_default_window <- stft/istft <- _fp64_host_guard <- caller
     )
 
 
+@_fp64_host_guard("istft")
 def istft(
     input: ComplexTensor,
     n_fft: int,

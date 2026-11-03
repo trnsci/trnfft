@@ -19,9 +19,18 @@ The same cases run on a Trainium box through the conftest options::
     pytest tests/test_conformance.py --backend nki --conformance-device neuron
     pytest tests/test_conformance.py --backend auto --conformance-device cpu
 
-On a non-pytorch backend the tolerances are floored at FP32 level, and on a
-non-CPU device the fp64 gradchecks are skipped (fp64 autograd on device is not
-a trnfft contract).
+On a non-pytorch backend the tolerances are floored at FP32 level, except for
+float64 results under ``--backend auto``: the float64 policy (trnfft#136)
+computes float64 in host torch there, so those keep the FP64 tolerance. On
+CPU that is every float64 case. On the neuron device it is every case whose
+result came back from the device-resident float64 host route (the transforms,
+``complex_gemm`` / ``complex_linear`` / ``complex_mask_apply`` and
+``ComplexLinear``; ``dispatch._fp64_host_guard``), unless
+``TRNFFT_FP64_ON_DEVICE=1`` keeps it on device aten. Plain torch ops on the
+device (``complex_matmul``, the other ``nn`` layers) and float64 under
+``--backend nki`` (the FP32 kernels, one warning per op) keep the FP32 floor:
+Trainium computes float64 at FP32 precision. On a non-CPU device the fp64
+gradchecks are skipped (fp64 autograd on device is not a trnfft contract).
 
 Known open behaviour is ``xfail(strict=True)`` with its issue number, so the
 case fails loudly (XPASS) once the behaviour changes and the marker must go:
@@ -45,6 +54,7 @@ import torch
 from torch.autograd import gradcheck, gradgradcheck
 
 import trnfft
+import trnfft.nki.dispatch as dispatch
 from trnfft import ComplexTensor as CT
 from trnfft.nn import ComplexBatchNorm1d, ComplexConv1d, ComplexLinear, ComplexModReLU
 
@@ -68,7 +78,16 @@ def _conformance_backend(request):
     _STATE["backend"], _STATE["device"] = backend, device
     if device.type != "cpu":
         torch.empty(1, device=device)  # fail fast without the device
+    # Count results returned by the device-resident float64 host route.
+    to_device = dispatch._fp64_to_device
+
+    def counting_to_device(t, d):
+        _HOST_ROUTE["n"] += 1
+        return to_device(t, d)
+
+    dispatch._fp64_to_device = counting_to_device
     yield
+    dispatch._fp64_to_device = to_device
     trnfft.set_backend(old_backend)
     trnfft.set_precision(old_precision)
     _STATE["backend"], _STATE["device"] = "pytorch", torch.device("cpu")
@@ -76,6 +95,23 @@ def _conformance_backend(request):
 
 def on_reference_path() -> bool:
     return _STATE["backend"] == "pytorch" and _STATE["device"].type == "cpu"
+
+
+# Results returned by the device-resident float64 host route since the last
+# ``check`` (``dispatch._fp64_to_device`` calls).
+_HOST_ROUTE = {"n": 0}
+
+
+def fp64_accurate(dtype, host_route: bool = False) -> bool:
+    """float64 results computed at float64 accuracy: the reference path, and
+    float64 under backend "auto", which computes in host torch (#136): on CPU
+    always, on the neuron device when the result came back from the float64
+    host route (``host_route``)."""
+    if on_reference_path():
+        return True
+    if dtype != torch.float64 or _STATE["backend"] != "auto":
+        return False
+    return _STATE["device"].type == "cpu" or host_route
 
 
 def dev(t):
@@ -106,6 +142,7 @@ def out_dtype(o):
 
 def check(ours, ref, dtype=None, tol=None):
     """Assert ``ours`` matches ``ref`` in shape, dtype and value (rel. max error)."""
+    host_route, _HOST_ROUTE["n"] = _HOST_ROUTE["n"] > 0, 0
     a, b = c128(ours), c128(ref)
     assert tuple(a.shape) == tuple(b.shape), f"shape {tuple(a.shape)} != ref {tuple(b.shape)}"
     if dtype is not None:
@@ -114,7 +151,7 @@ def check(ours, ref, dtype=None, tol=None):
         return
     assert torch.isfinite(a).all(), "non-finite output"
     t = tol if tol is not None else TOL.get(out_dtype(ours), 2e-4)
-    if not on_reference_path():
+    if not fp64_accurate(out_dtype(ours), host_route):
         t = max(t, 2e-3)
     scale = b.abs().max().item() or 1.0
     rel = (a - b).abs().max().item() / scale
