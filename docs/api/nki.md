@@ -47,16 +47,23 @@ policy (#136) for float64 operands on the NKI path, in every transform,
 computes float64 at FP32 precision (measured on Trn2), so under `auto` the
 torch route for a float64 or complex128 operand that is already on the neuron
 device runs on the host: every transform (`fft` … `ihfftn`, `stft`, `istft`),
-`complex_gemm`, `complex_linear`, `complex_mask_apply` and `ComplexLinear`
-copy their neuron-resident operands to the host, compute in float64 and return
+`complex_gemm`, `complex_linear`, `complex_mask_apply`, `ComplexLinear` and
+`ComplexConv1d` copy their neuron-resident operands to the host, compute in float64 and return
 the result on the original device in float64 / complex128. The copies are
 differentiable. Each op emits one `UserWarning`: "float64 on the neuron device
 is computed on the host for float64 accuracy (device arithmetic is fp32); pass
 float32 to stay on device". Set `TRNFFT_FP64_ON_DEVICE=1` to keep these on
 device aten instead (faster, FP32 precision, no warning). `set_backend("nki")`,
 `set_backend("pytorch")` and `TRNFFT_REQUIRE_NKI=1` are unaffected.
-`complex_gemm_bf16` (FP32 by design), `complex_matmul` and the other `nn`
-layers are plain torch on the operands' device.
+`complex_gemm_bf16` (FP32 by design), `complex_matmul`, `ComplexBatchNorm1d`
+and `ComplexModReLU` are plain torch on the operands' device.
+
+`ComplexConv1d` has no kernel, and a float64 `aten::convolution` does not
+compile on the neuron device (#134). So float64 that stays on the device
+(`set_backend("nki")`, or `TRNFFT_FP64_ON_DEVICE=1`) is convolved in float32
+there and returned as float64; `"nki"` warns once. `TRNFFT_REQUIRE_NKI=1`
+raises `NotImplementedError` for it, and `set_backend("pytorch")` runs plain
+torch (the compile error).
 
 The result dtype is always what the pytorch backend returns for the same
 inputs: float64 in gives float64 out; bfloat16/float16 in gives the input

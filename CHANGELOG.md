@@ -58,6 +58,16 @@ Lands in the next release (0.28.0). Needs device validation on Trn2.
 
 ### Fixed
 
+- **float64 `ComplexConv1d` on a Neuron device failed to compile (#134).**
+  In every release through 0.27.0, `ComplexConv1d(...).double()` with
+  neuron-resident operands sent a float64 `aten::convolution` to the Neuron
+  compiler, which has no fp64 datapath (`Compilation error ...
+  aten::convolution`). It now follows the float64 policy above: under
+  `auto` it computes on the host in float64 (one `UserWarning`) and returns
+  to the device; under `nki`, or with `TRNFFT_FP64_ON_DEVICE=1`, it convolves
+  in float32 on the device and returns float64; `TRNFFT_REQUIRE_NKI=1`
+  raises `NotImplementedError`. float32 and half modules are unchanged.
+
 - **One dtype guard at the NKI kernel boundary: float64, integer, bool and
   complex operands no longer reach a kernel that does not take them**
   (trnsci/trnsci#35; the class of #108, #131, #113). `dispatch.KERNEL_DTYPES`

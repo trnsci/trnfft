@@ -720,7 +720,31 @@ FP64_HOST_CALLS = {
         lambda: _seeded_layer().double()(_x64((4, 6))),
         lambda: _layer_ref(_seeded_layer().double(), _x64((4, 6))),
     ),
+    # No kernel: on the device a float64 aten::convolution fails to compile (#134).
+    "ComplexConv1d": (
+        lambda: _seeded_conv().double()(_x64((2, 4, 16))),
+        lambda: _conv_ref(_seeded_conv().double(), _x64((2, 4, 16))),
+    ),
 }
+
+
+def _seeded_conv():
+    from trnfft.nn import ComplexConv1d
+
+    torch.manual_seed(0)
+    conv = ComplexConv1d(4, 2, 3, stride=2, padding=1)
+    with torch.no_grad():
+        conv.bias_re.normal_()
+        conv.bias_im.normal_()
+    return conv
+
+
+def _conv_ref(conv, x):
+    """Complex conv1d in complex128 (an independent formula: one complex conv)."""
+    w = torch.complex(conv.conv_re.weight, conv.conv_im.weight).detach()
+    b = torch.complex(conv.bias_re, conv.bias_im).detach()
+    y = torch.nn.functional.conv1d(_c(x), w, None, stride=2, padding=1)
+    return y + b[:, None]
 
 
 def _layer_ref(layer, x):
@@ -977,3 +1001,86 @@ def test_zz_every_kernel_op_was_exercised():
     if not SEEN:
         pytest.skip("run with the rest of this module")
     assert set(SEEN) == set(ALLOWED), sorted(set(ALLOWED) - set(SEEN))
+
+
+# ── ComplexConv1d with float64 left on the device (#134) ─────────────────────
+
+
+def _spy_conv(monkeypatch):
+    seen = []
+    real = torch.nn.functional.conv1d
+
+    def spy(x, w, *a, **k):
+        seen.append((x.dtype, w.dtype))
+        return real(x, w, *a, **k)
+
+    monkeypatch.setattr(torch.nn.functional, "conv1d", spy)
+    return seen
+
+
+def _conv_call():
+    return FP64_HOST_CALLS["ComplexConv1d"][0](), FP64_HOST_CALLS["ComplexConv1d"][1]()
+
+
+def test_conv1d_fp64_nki_runs_fp32_on_device(host_spy, monkeypatch):
+    """Backend "nki": no host copy; the four convolutions run in float32 on
+    the device (no fp64 aten::convolution), the result is float64, and one
+    warning is emitted over repeated calls."""
+    monkeypatch.setattr(dispatch, "_backend", "nki")
+    seen = _spy_conv(monkeypatch)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        got, want = _conv_call()
+        _conv_call()
+    assert host_spy == {"to_host": [], "to_device": []}
+    calls = seen[: len(seen) // 2]  # the second half is the complex reference
+    assert {d for pair in calls[:4] for d in pair} == {torch.float32}
+    assert got.real.dtype == got.imag.dtype == torch.float64
+    assert _relerr(got, want) < 1e-5
+    ws = [w for w in rec if "ComplexConv1d" in str(w.message)]
+    assert len(ws) == 1 and "reduced to float32" in str(ws[0].message)
+
+
+def test_conv1d_fp64_on_device_override(host_spy, monkeypatch):
+    """TRNFFT_FP64_ON_DEVICE=1 under "auto": stays on the device, in float32
+    (there is no device fp64 convolution), float64 result, no warning."""
+    monkeypatch.setenv("TRNFFT_FP64_ON_DEVICE", "1")
+    seen = _spy_conv(monkeypatch)
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        got = FP64_HOST_CALLS["ComplexConv1d"][0]()
+    assert host_spy == {"to_host": [], "to_device": []}
+    assert seen and all(pair == (torch.float32, torch.float32) for pair in seen)
+    assert got.real.dtype == torch.float64
+    assert not [w for w in rec if "ComplexConv1d" in str(w.message)]
+
+
+@pytest.mark.parametrize("bk", ["auto", "nki"])
+def test_conv1d_fp64_require_nki_raises(host_spy, monkeypatch, bk):
+    monkeypatch.setattr(dispatch, "_backend", bk)
+    monkeypatch.setenv("TRNFFT_REQUIRE_NKI", "1")
+    with pytest.raises(NotImplementedError, match="ComplexConv1d"):
+        FP64_HOST_CALLS["ComplexConv1d"][0]()
+    assert host_spy == {"to_host": [], "to_device": []}
+
+
+def test_conv1d_fp64_pytorch_backend_unchanged(host_spy, monkeypatch):
+    """Backend "pytorch": plain torch where the data lives, in float64."""
+    monkeypatch.setattr(dispatch, "_backend", "pytorch")
+    seen = _spy_conv(monkeypatch)
+    got, want = _conv_call()
+    assert host_spy == {"to_host": [], "to_device": []}
+    assert seen[0] == (torch.float64, torch.float64)
+    assert _relerr(got, want) < 1e-12
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_conv1d_non_fp64_untouched(host_spy, monkeypatch, dtype):
+    """Non-float64 modules: no host copy, no cast; the module dtype is kept."""
+    seen = _spy_conv(monkeypatch)
+    conv = _seeded_conv().to(dtype)
+    x = _ct((2, 4, 16), dtype)
+    y = conv(x)
+    assert host_spy == {"to_host": [], "to_device": []}
+    assert all(pair == (dtype, dtype) for pair in seen)
+    assert y.real.dtype == dtype
