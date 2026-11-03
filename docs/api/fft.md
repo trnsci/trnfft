@@ -76,13 +76,13 @@ Sample frequencies of an `n`-point `fft` (`[0, 1, ..., (n-1)//2, -(n//2), ..., -
 
 Short-time Fourier Transform. Takes `torch.stft`'s arguments except `return_complex` (the result is always a `ComplexTensor`).
 
-- **window**: Default `None` means a **Hann** window of `win_length`. `torch.stft` uses a rectangular window (ones) there, so pass `window` explicitly to match it.
+- **window**: Default `None` means a **Hann** window of `win_length`. `torch.stft` uses a rectangular window (ones) there, so pass `window` explicitly to match it. **Deprecated (#106):** `window=None` emits a `DeprecationWarning`, and the default changes to torch's rectangular window in the next minor release. Pass `window=` explicitly; `window=torch.hann_window(win_length)` keeps the Hann window.
 
 - **Returns**: `ComplexTensor` with shape `(..., freq_bins, num_frames)`
 
 ### `istft(input, n_fft, hop_length=None, win_length=None, window=None, center=True, normalized=False, onesided=True, length=None)`
 
-Inverse STFT via overlap-add reconstruction. `window=None` is a Hann window, as in `stft`; pass the window used for the forward transform.
+Inverse STFT via overlap-add reconstruction. `window=None` is a Hann window, as in `stft`; pass the window used for the forward transform. The `window=None` default is deprecated with `stft`'s and changes to ones in the next minor release (#106).
 
 - **length**: Exact output length (truncates or pads).
 - **Returns**: `torch.Tensor` (real-valued)

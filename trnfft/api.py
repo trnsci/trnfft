@@ -6,13 +6,15 @@ Usage:
 
     X = trnfft.fft(x)
     x = trnfft.ifft(X)
-    S = trnfft.stft(waveform, n_fft=512, hop_length=256)
+    S = trnfft.stft(waveform, n_fft=512, hop_length=256, window=torch.hann_window(512))
 """
 
 from __future__ import annotations
 
 import math
 import operator
+import sys
+import warnings
 
 import torch
 
@@ -432,12 +434,18 @@ def stft(
     ``window=None`` uses a Hann window of ``win_length``. ``torch.stft`` uses
     a rectangular window (ones) there, so pass ``window`` explicitly to match
     it; with an explicit window the results agree to FP32 tolerance.
+
+    .. deprecated::
+        The ``window=None`` default changes to torch's rectangular window in
+        the next minor release (#106). Pass ``window=`` explicitly; use
+        ``torch.hann_window(win_length)`` to keep today's result.
     """
     if hop_length is None:
         hop_length = n_fft // 4
     if win_length is None:
         win_length = n_fft
     if window is None:
+        _warn_default_window("stft")
         window = torch.hann_window(win_length, dtype=input.dtype, device=input.device)
 
     if center:
@@ -501,6 +509,17 @@ def stft(
     return ComplexTensor(result_re, result_im)
 
 
+def _warn_default_window(name: str) -> None:
+    warnings.warn(
+        f"trnfft.{name}(window=None) uses a Hann window, but the default will change "
+        f"to torch.{name}'s rectangular window (ones) in the next minor release. "
+        "Pass window= explicitly; window=torch.hann_window(win_length) keeps the "
+        "Hann window (#106).",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+
+
 def istft(
     input: ComplexTensor,
     n_fft: int,
@@ -516,12 +535,17 @@ def istft(
 
     ``window=None`` uses a Hann window of ``win_length``, as :func:`stft` does
     (``torch.istft`` uses ones). Pass the window used for the forward STFT.
+
+    .. deprecated::
+        The ``window=None`` default changes to torch's rectangular window in
+        the next minor release, together with :func:`stft` (#106).
     """
     if hop_length is None:
         hop_length = n_fft // 4
     if win_length is None:
         win_length = n_fft
     if window is None:
+        _warn_default_window("istft")
         window = torch.hann_window(win_length, dtype=input.dtype, device=input.device)
 
     # Undo normalization
@@ -748,9 +772,27 @@ def _canon_s_dim(shape, s: Sizes, dim: Dims) -> tuple[list[int], list[int | None
         dims = [_canon_dim(d, ndim) for d in dim]
         if s is not None and len(s) != len(dims):
             raise RuntimeError("When given, dim and shape arguments must have the same length")
+        if len(set(dims)) != len(dims):
+            # torch.fft raises "FFT dims must be unique"; trnfft has transformed
+            # once per occurrence. Deprecated; raises in the next minor (#127).
+            _warn_at_caller(
+                f"trnfft: repeated dim in dim={tuple(dim)} transforms that dim once per "
+                "occurrence. This is deprecated and will raise in the next minor "
+                "release, as torch.fft does ('FFT dims must be unique'). Pass each "
+                "dim once (#127).",
+                DeprecationWarning,
+            )
     if s is None:
         return dims, [None] * len(dims)
     return dims, [None if v == -1 else _check_n(v) for v in s]
+
+
+def _warn_at_caller(message: str, category: type[Warning]) -> None:
+    """``warnings.warn`` attributed to the first frame outside trnfft."""
+    frame, level = sys._getframe(1), 2
+    while frame is not None and frame.f_globals.get("__name__", "").startswith("trnfft"):
+        frame, level = frame.f_back, level + 1
+    warnings.warn(message, category, stacklevel=level)
 
 
 def _apply_norm(x, norm: str | None, n: int, inverse: bool):
