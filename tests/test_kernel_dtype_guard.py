@@ -200,6 +200,10 @@ def native(monkeypatch):
     monkeypatch.setattr(dispatch, "HAS_NKI", True)
     monkeypatch.setattr(dispatch, "_dispatch_path", "native")
     monkeypatch.setattr(dispatch, "_native_ops", mod.OPS)
+    # The eager-handle fast path (#140) calls the real kernel through a cached
+    # torch_neuronx handle and skips the op layer, so on a Neuron host it would
+    # bypass the stub ops (and fail on the stand-in torch_neuronx module).
+    monkeypatch.setattr(dispatch, "_EAGER_HANDLE_ENABLED", False)
     monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "cpu")
     monkeypatch.setattr(dispatch, "_USE_SIMULATOR", False)
     monkeypatch.setitem(sys.modules, "torch_xla", None)  # any import raises
