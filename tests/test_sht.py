@@ -24,15 +24,18 @@ from trnfft import ComplexTensor
 from trnfft.sht import (
     SHT,
     TILE,
+    PaddedLegendre,
     encode_plan,
     equiangular_grid,
     gauss_legendre_grid,
+    legendre_buckets,
     legendre_forward_torch,
     legendre_inverse_torch,
     lm_index,
     m_offset,
     n_alm,
     parity_rows,
+    problem_rows,
 )
 
 try:
@@ -441,6 +444,7 @@ def test_flops_and_tile_counts():
         {"lmax": 8, "legendre": "cuda"},
         {"lmax": 8, "fft": "fftw"},
         {"lmax": 8, "dtype": torch.float16},
+        {"lmax": 8, "legendre": "torch-padded", "buckets": 0},
     ],
 )
 def test_bad_arguments(kwargs):
@@ -451,6 +455,82 @@ def test_bad_arguments(kwargs):
 def test_legendre_torch_backend_is_default_on_cpu():
     s = SHT(8, fft="torch")
     assert not s._use_nki_legendre() or __import__("trnfft").HAS_NKI
+
+
+# ── Padded latitude stage (the device-aten-pad baseline) ────────────────────
+
+
+@pytest.mark.parametrize("lmax", [0, 1, 2, 7, 40, 127, 300])
+@pytest.mark.parametrize("buckets", [1, 3, 10, "pow2"])
+def test_buckets_cover_live_problems_in_order(lmax, buckets):
+    K = problem_rows(lmax)
+    assert np.all(np.diff(K) <= 0)  # non-increasing: buckets are p ranges
+    bk = legendre_buckets(lmax, buckets)
+    live = int((K > 0).sum())
+    assert bk[0][0] == 0 and bk[-1][1] == live
+    for (p0, p1, kb), nxt in zip(bk, bk[1:] + [(live, None, None)], strict=True):
+        assert p0 < p1 == nxt[0]
+        assert kb == K[p0] if buckets != "pow2" else kb >= K[p0]
+    if buckets != "pow2":
+        assert len(bk) == min(buckets, len(set(K[:live].tolist())))
+
+
+def test_optimal_buckets_beat_pow2_and_shrink_with_b():
+    K = problem_rows(511)
+
+    def cost(bk):
+        return sum((p1 - p0) * kb for p0, p1, kb in bk) / K.sum()
+
+    c = [cost(legendre_buckets(511, b)) for b in (4, 8, 10, 12)]
+    assert all(a > b for a, b in zip(c, c[1:], strict=False))
+    assert c[2] < 1.10 < cost(legendre_buckets(511, "pow2"))
+
+
+@pytest.mark.parametrize(
+    "lmax,nlat,grid",
+    [
+        (0, None, "gauss"),
+        (7, None, "gauss"),
+        (40, 43, "gauss"),
+        (63, None, "equiangular"),
+        (127, None, "gauss"),
+    ],
+)
+@pytest.mark.parametrize("buckets", [1, 10, "pow2"])
+def test_padded_latitude_stage_equals_per_m_loop(lmax, nlat, grid, buckets):
+    s = SHT(lmax, nlat=nlat, grid=grid, dtype=torch.float64, fft="torch")
+    pad = PaddedLegendre(s.table, lmax, s.H, buckets)
+    g = torch.Generator().manual_seed(3)
+    x = torch.randn(2 * (lmax + 1) * s.H, 6, dtype=torch.float64, generator=g)
+    a = torch.randn(s.n_alm, 6, dtype=torch.float64, generator=g)
+    ref_a = legendre_forward_torch(s.table, x, lmax, s.H)
+    ref_y = legendre_inverse_torch(s.table, a, lmax, s.H)
+    assert torch.allclose(pad.forward(x), ref_a, rtol=0, atol=1e-12 * ref_a.abs().max())
+    assert torch.allclose(pad.inverse(a), ref_y, rtol=0, atol=1e-12 * ref_y.abs().max())
+    assert pad.flops(1) >= sum(2 * k * s.H * 2 for k in problem_rows(lmax))
+
+
+@pytest.mark.skipif(ducc0 is None, reason="ducc0 not installed")
+@pytest.mark.parametrize(
+    "lmax,nfields",
+    [(31, 8), (127, 4), pytest.param(511, 2, marks=pytest.mark.slow)],
+)
+@pytest.mark.parametrize("buckets", [10, "pow2"])
+def test_padded_fp32_within_tolerance_of_ducc0(lmax, nfields, buckets):
+    """legendre="torch-padded" in fp32: within 1e-6 of fp64 ducc0 and within
+    fp32 summation-order noise of the per-m loop."""
+    s = SHT(lmax, fft="torch", legendre="torch-padded", buckets=buckets)
+    u = SHT(lmax, fft="torch", legendre="torch")
+    alm = _random_alm(lmax, nfields, seed=2)
+    ref_f = _ducc_synthesis(alm, lmax, "GL", s.nlat, s.nlon)
+    f32 = torch.from_numpy(ref_f).float()
+    a = _np(s.forward(f32))
+    assert _rel(a, alm) < FP32_TOL
+    assert _rel(a, _np(u.forward(f32))) < FP32_TOL / 4
+    f = s.inverse(_ct(alm, torch.float32)).double().numpy()
+    assert _rel(f, ref_f) < FP32_TOL
+    assert _rel(f, u.inverse(_ct(alm, torch.float32)).double().numpy()) < FP32_TOL / 4
+    assert _rel(_np(s.forward(s.inverse(_ct(alm, torch.float32)))), alm) < 2 * FP32_TOL
 
 
 # ── On hardware ──────────────────────────────────────────────────────────────

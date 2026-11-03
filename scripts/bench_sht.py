@@ -11,9 +11,25 @@ Rows (``--rows``, comma-separated):
   longitude, the per-m torch GEMM loop), once per ``--threads`` entry.
 * ``ducc0`` / ``shtns``: the reference packages on the same box, fp64, at the
   same thread counts (``nthreads``), one field per call.
-* ``device-aten`` (``--device``): on the Neuron device, trnfft FFTs and the
-  per-m aten GEMM loop (2(L+1) matmuls) for the latitude stage.
+* ``cpu-pad``: as ``cpu`` with the padded latitude stage (``legendre=
+  "torch-padded"``), for checking it on the host.
+* ``device-aten-pad`` (``--device``): the fair plain-PyTorch device baseline.
+  The latitude stage is ``SHT(legendre="torch-padded")``: the per-m problems
+  zero-padded into ``--buckets`` size classes, one ``torch.bmm`` per class, so
+  about 2B matmul shapes per (L, F) instead of O(L). Longitude stage:
+  ``--aten-fft`` (``trnfft``, the same FFTs as ``device-nki``, or ``torch``
+  for ``torch.fft`` on the device).
+* ``device-aten`` (``--device --allow-unpadded-aten``): the per-m aten GEMM
+  loop (2(L+1) matmul calls per direction). It compiles O(L) programs (over
+  19 min cold at L = 511), so it is off unless asked for; ``--count-shapes``
+  quotes its shape count without running it.
 * ``device-nki`` (``--device``): trnfft FFTs and the NKI latitude kernels.
+
+``--count-shapes`` runs nothing on a device: for each L and F it traces the
+latitude stage on ``meta`` tensors under a dispatch recorder and prints, for
+the per-m loop and each padded strategy, the distinct matmul shapes, the
+distinct non-view (op, input shapes) signatures, and the padding overhead in
+flops.
 
 ``--threads 2,all`` gives the two CPU baselines of trnsci/trnsci#112 (2
 pinned threads, all vCPUs). ``--field-chunk`` runs F in chunks (the device
@@ -193,6 +209,84 @@ def _stage_split(s, f, a, reps, device):
     return out
 
 
+def _latitude_signatures(s, nfields):
+    """Distinct matmul shapes and non-view (op, input shapes) signatures of one
+    forward + one inverse latitude stage, traced on ``meta`` tensors."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_flatten
+
+    class _Rec(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.sigs, self.mm, self.calls = set(), set(), 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            leaves = tree_flatten((args, kwargs))[0]
+            shp = tuple(tuple(a.shape) if isinstance(a, torch.Tensor) else repr(a) for a in leaves)
+            name = func.overloadpacket.__name__
+            if not func.is_view:
+                self.sigs.add((name, shp))
+            if name in ("mm", "bmm", "addmm", "matmul"):
+                self.mm.add(shp)
+                self.calls += 1
+            return func(*args, **kwargs)
+
+    import copy
+
+    s = copy.copy(s)  # meta copies of the tables; the caller's plan keeps its data
+    s.table = s.table.to("meta")
+    if s.padded is not None:
+        s.padded = copy.copy(s.padded).to("meta")
+    x = torch.empty((2 * (s.lmax + 1) * s.H, 2 * nfields), device="meta")
+    a = torch.empty((s.n_alm, 2 * nfields), device="meta")
+    with _Rec() as r:
+        s.legendre_forward(x)
+        s.legendre_inverse(a)
+    return len(r.mm), len(r.sigs), r.calls
+
+
+def count_shapes(args) -> int:
+    """``--count-shapes``: shape counts and padding overhead, no device."""
+    import copy
+
+    from trnfft.sht import SHT, PaddedLegendre, problem_rows
+
+    strategies = [b.strip() for b in args.buckets.split(",")] if "," in args.buckets else []
+    strategies = strategies or ["pow2", "8", "10", "12"]
+    print(
+        "| L | F | latitude stage | buckets | matmul calls (fwd+inv) | distinct matmul shapes | "
+        "distinct non-view op signatures | flops executed / per-m loop | / NKI (polar tiles skipped) |"
+    )
+    print("|---|---|---|---|---|---|---|---|---|")
+    for L in (int(v) for v in args.lmax.split(",")):
+        s = SHT(L, fft="torch", legendre="torch")
+        H = s.H
+        dense = int(sum(2 * k * H * 2 for k in problem_rows(L)))  # per field
+        nki = s.flops(1)
+        table = s.table
+        for F in (int(v) for v in args.fields.split(",")):
+            n_mm, n_sig, calls = _latitude_signatures(s, F)
+            print(
+                f"| {L} | {F} | per-m loop (`torch`) | - | {calls} | {n_mm} | {n_sig} | "
+                f"1.000 | {dense / nki:.3f} |",
+                flush=True,
+            )
+            for strat in strategies:
+                b = strat if strat == "pow2" else int(strat)
+                sp = copy.copy(s)
+                sp.legendre = "torch-padded"
+                sp.padded = PaddedLegendre(table, L, H, b)
+                ex = sp.padded.flops(1)
+                n_mm, n_sig, calls = _latitude_signatures(sp, F)
+                print(
+                    f"| {L} | {F} | padded (`torch-padded`) | {strat} ({len(sp.padded.buckets)}) | "
+                    f"{calls} | {n_mm} | {n_sig} | {ex / dense:.3f} | {ex / nki:.3f} |",
+                    flush=True,
+                )
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--lmax", default="127,511")
@@ -205,7 +299,20 @@ def main() -> int:
     ap.add_argument("--stages", action="store_true", help="also time the stage split")
     ap.add_argument("--check-fields", type=int, default=2, help="fields checked against fp64")
     ap.add_argument("--json", default="", help="append JSON lines here")
+    ap.add_argument("--buckets", default="10", help="torch-padded size classes: an int or pow2")
+    ap.add_argument("--aten-fft", default="trnfft", choices=("trnfft", "torch"))
+    ap.add_argument(
+        "--allow-unpadded-aten",
+        action="store_true",
+        help="allow the device-aten row (per-m loop, O(L) compiles)",
+    )
+    ap.add_argument(
+        "--count-shapes", action="store_true", help="print shape counts (meta, no device) and exit"
+    )
     args = ap.parse_args()
+    if args.count_shapes:
+        return count_shapes(args)
+    buckets = args.buckets if args.buckets == "pow2" else int(args.buckets)
 
     import trnfft
     from trnfft import ComplexTensor
@@ -214,6 +321,13 @@ def main() -> int:
     rows = [r.strip() for r in args.rows.split(",") if r.strip()]
     if any(r.startswith("device") for r in rows) and not args.device:
         print("device rows need --device", file=sys.stderr)
+        return 2
+    if "device-aten" in rows and not args.allow_unpadded_aten:
+        print(
+            "device-aten (the per-m loop) compiles O(L) programs; use device-aten-pad, "
+            "or pass --allow-unpadded-aten",
+            file=sys.stderr,
+        )
         return 2
     threads = _threads(args.threads)
     print(
@@ -240,7 +354,7 @@ def main() -> int:
         for F in (int(v) for v in args.fields.split(",")):
             alm = _random_alm(L, F, seed=1)
             for row in rows:
-                for nt in threads if row in ("cpu", "ducc0", "shtns") else [None]:
+                for nt in threads if row in ("cpu", "cpu-pad", "ducc0", "shtns") else [None]:
                     rec = {"row": row, "threads": nt, "lmax": L, "fields": F}
                     if row in ("ducc0", "shtns"):
                         try:
@@ -256,28 +370,41 @@ def main() -> int:
                         e_i = _rel(synth(check_alm), check_f)
                         flops_note = ""
                     else:
-                        device = "cpu" if row == "cpu" else "neuron"
-                        if row == "cpu":
+                        device = "cpu" if row.startswith("cpu") else "neuron"
+                        if device == "cpu":
                             torch.set_num_threads(nt)
                             trnfft.set_backend("pytorch")
-                            key = ("cpu",)
+                            leg = "torch-padded" if row == "cpu-pad" else "torch"
+                            key = ("cpu", leg)
                             if key not in plans:
-                                plans[key] = SHT(L, fft="torch", legendre="torch")
+                                plans[key] = SHT(L, fft="torch", legendre=leg, buckets=buckets)
                         else:
                             trnfft.set_backend("nki")
-                            leg = "nki" if row == "device-nki" else "torch"
-                            key = ("dev", leg)
+                            leg = {
+                                "device-nki": "nki",
+                                "device-aten": "torch",
+                                "device-aten-pad": "torch-padded",
+                            }[row]
+                            fft = args.aten_fft if leg == "torch-padded" else "trnfft"
+                            key = ("dev", leg, fft)
                             if key not in plans:
-                                plans[key] = SHT(L, legendre=leg, device="neuron")
+                                plans[key] = SHT(
+                                    L, legendre=leg, fft=fft, buckets=buckets, device="neuron"
+                                )
                         s = plans[key]
                         run = _Chunked(s, args.field_chunk)
                         a_ct = ComplexTensor(
                             torch.from_numpy(alm.real.copy()).float().to(device),
                             torch.from_numpy(alm.imag.copy()).float().to(device),
                         )
+                        # The first inverse is the cold one (it makes the forward's input).
+                        _sync(device)
+                        t0 = time.perf_counter()
                         f_t = run.inverse(a_ct)
+                        _sync(device)
+                        c_i = time.perf_counter() - t0
                         c_f, t_f = _median(lambda: run.forward(f_t), args.reps, device)
-                        c_i, t_i = _median(lambda: run.inverse(a_ct), args.reps, device)
+                        t_i = _median(lambda: run.inverse(a_ct), args.reps, device)[1]
                         cf = torch.from_numpy(check_f).float().to(device)
                         ca = s.forward(cf)
                         e_f = _rel(
@@ -307,6 +434,10 @@ def main() -> int:
                         lat = s.flops(F) / 1e12
                         rec["latitude_tflop"] = lat
                         rec["tiles"] = s.tile_counts
+                        if s.padded is not None:
+                            rec["executed_tflop"] = s.padded.flops(F) / 1e12
+                            rec["buckets"] = len(s.padded.buckets)
+                            rec["fft"] = s.fft
                         flops_note = ""
                         if "stages_ms" in rec:
                             sf = rec["stages_ms"]["fwd_legendre"] / 1e3 * (F / rec["stage_fields"])

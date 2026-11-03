@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Padded aten baseline for the SHT latitude stage (#157,
+  trnsci/trnsci#111).** `SHT(legendre="torch-padded", buckets=10)`
+  (`PaddedLegendre`) zero-pads the per-m problems into `buckets` size
+  classes, one `torch.bmm` each: 19 matmul shapes instead of 1023 at
+  L = 1023, for 9.8 % more flops. Float64 plans follow the same host route
+  as the per-m loop. It is the `device-aten-pad` row of
+  `scripts/bench_sht.py`; the unpadded `device-aten` row needs
+  `--allow-unpadded-aten`, and `--count-shapes` prints both shape counts.
+
+### Fixed
+
+- **`scripts/bench_sht.py` reported a warm time as `inv cold s`.** The first
+  inverse call (which makes the forward's input) ran before the timed one; it
+  is now the cold measurement.
+
 ## [0.28.1] - 2026-11-04
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

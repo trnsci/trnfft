@@ -74,8 +74,10 @@ TILE = 128  # Tensor Engine partition tile, for both l and latitude
 
 __all__ = [
     "SHT",
+    "PaddedLegendre",
     "gauss_legendre_grid",
     "equiangular_grid",
+    "legendre_buckets",
     "legendre_table",
     "lm_index",
     "n_alm",
@@ -262,10 +264,16 @@ class SHT:
             of their ``m`` are dropped; all-zero 128 x 128 tiles are skipped.
             ``0`` keeps every entry (no polar skipping beyond exact zeros).
         legendre: ``"auto"`` (NKI kernel when the trnfft backend selects NKI,
-            else torch), ``"torch"`` (per-m aten GEMM loop), or ``"nki"``.
+            else torch), ``"torch"`` (per-m aten GEMM loop, 2(L+1) matmul
+            shapes), ``"torch-padded"`` (the same problems zero-padded into
+            ``buckets`` size classes, one ``bmm`` per class; see
+            :class:`PaddedLegendre`), or ``"nki"``.
         fft: ``"trnfft"`` (default: ``trnfft.rfft`` / ``trnfft.irfft``, NKI
             on device) or ``"torch"`` (``torch.fft``, for CPU baselines).
         device: device the tables live on (uploaded once).
+        buckets: for ``legendre="torch-padded"``: an int B (B size classes
+            with flop-optimal boundaries) or ``"pow2"`` (K padded to the next
+            power of two).
 
     The tables are built at construction (a few seconds at L = 1023) and kept
     on ``device``. ``forward(f)`` takes ``(..., nlat, nlon)`` real fields and
@@ -284,13 +292,16 @@ class SHT:
         legendre: str = "auto",
         fft: str = "trnfft",
         device: torch.device | str | None = None,
+        buckets: int | str = 10,
     ):
         if lmax < 0:
             raise ValueError("lmax must be >= 0")
         if grid not in ("gauss", "equiangular"):
             raise ValueError(f"grid must be 'gauss' or 'equiangular', got {grid!r}")
-        if legendre not in ("auto", "torch", "nki"):
-            raise ValueError(f"legendre must be 'auto', 'torch' or 'nki', got {legendre!r}")
+        if legendre not in ("auto", "torch", "torch-padded", "nki"):
+            raise ValueError(
+                f"legendre must be 'auto', 'torch', 'torch-padded' or 'nki', got {legendre!r}"
+            )
         if fft not in ("trnfft", "torch"):
             raise ValueError(f"fft must be 'trnfft' or 'torch', got {fft!r}")
         if dtype not in (torch.float32, torch.float64):
@@ -337,6 +348,9 @@ class SHT:
             wq[H - 1] *= 0.5
         self._wq = torch.from_numpy(wq).to(dtype=dtype, device=self.device)
         self.plan = encode_plan(L, H, mask)
+        self.padded = (
+            PaddedLegendre(self.table, L, H, buckets) if legendre == "torch-padded" else None
+        )
 
     # ── static mask ──────────────────────────────────────────────────────
 
@@ -395,6 +409,8 @@ class SHT:
         self.device = torch.device(device)
         self.table = self.table.to(self.device)
         self._wq = self._wq.to(self.device)
+        if self.padded is not None:
+            self.padded.to(self.device)
         return self
 
     # ── transforms ───────────────────────────────────────────────────────
@@ -498,7 +514,7 @@ class SHT:
         return torch.stack((re, im), dim=0).permute(2, 0, 1).reshape(self.n_alm, -1).contiguous()
 
     def _use_nki_legendre(self) -> bool:
-        if self.legendre == "torch":
+        if self.legendre in ("torch", "torch-padded"):
             return False
         if self.legendre == "nki":
             return True
@@ -514,7 +530,8 @@ class SHT:
         float64 under backend "auto", the kernel on float32 copies (result
         cast back, one warning) under "nki", ``NotImplementedError`` under
         ``TRNFFT_REQUIRE_NKI=1``. The torch stage moves float64 operands on
-        the neuron device to the host under "auto" (``_fp64_host_guard``).
+        the neuron device to the host under "auto" (``_fp64_host_guard``),
+        and so does the padded stage (``legendre="torch-padded"``).
         """
         torch_fn = legendre_forward_torch if direction == "forward" else legendre_inverse_torch
         table = self.table
@@ -529,6 +546,8 @@ class SHT:
                 nki_fn = getattr(_nki_sht, f"legendre_{direction}_nki")
                 out = nki_fn(table, data, self.lmax, self.H, self.plan)
                 return out if out_dtype is None else out.to(out_dtype)
+        if self.padded is not None:
+            return getattr(self.padded, direction)(data)
         return torch_fn(table, data, self.lmax, self.H)
 
     def legendre_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -576,6 +595,188 @@ def legendre_inverse_torch(table: torch.Tensor, a: torch.Tensor, lmax: int, H: i
             t = table[o + r0 : o + r0 + k]
             out[p * H : (p + 1) * H] = t.T @ a[o + q : o + q + 2 * k - 1 : 2]
     return out
+
+
+# ── PyTorch latitude stage, padded into size buckets (one bmm per bucket) ───
+
+
+def problem_rows(lmax: int) -> np.ndarray:
+    """``K_p`` for every problem ``p = 2m + q``, ``0 <= p < 2(L+1)``.
+
+    Non-increasing in ``p``: ``K_{2m} = (L-m)//2 + 1 >= K_{2m+1} = (L-m-1)//2 + 1
+    = K_{2m+2}``. So a size bucket (all problems with ``K`` in a range) is a
+    contiguous range of ``p``, and its slice of the packed operand ``X`` is a
+    view."""
+    return np.array([parity_rows(lmax, p // 2, p % 2) for p in range(2 * (lmax + 1))])
+
+
+def legendre_buckets(lmax: int, buckets: int | str = 10) -> list[tuple[int, int, int]]:
+    """Group the live problems into size classes: ``[(p0, p1, K_b), ...]``.
+
+    Every problem ``p0 <= p < p1`` is zero-padded to ``K_b = K_{p0}`` rows (the
+    largest in the bucket, since ``K_p`` is non-increasing).
+
+    ``buckets="pow2"`` pads each ``K_p`` to the next power of two
+    (``ceil(log2 K_max) + 1`` buckets). An int ``B`` picks the ``B`` contiguous
+    groups that minimise the padded flops ``sum_b n_b K_b`` (an exact dynamic
+    program over the distinct ``K`` values); fewer if there are fewer distinct
+    ``K``.
+    """
+    K = problem_rows(lmax)
+    live = int((K > 0).sum())  # K is non-increasing, so the live problems are a prefix
+    K = K[:live]
+    if live == 0:
+        return []
+    if buckets == "pow2":
+        cls = [1 << int(math.ceil(math.log2(k))) for k in K]
+        out, p0 = [], 0
+        for p in range(1, live + 1):
+            if p == live or cls[p] != cls[p0]:
+                out.append((p0, p, cls[p0]))
+                p0 = p
+        return out
+    B = int(buckets)
+    if B < 1:
+        raise ValueError(f"buckets must be >= 1 or 'pow2', got {buckets!r}")
+    # Distinct K values in p order (descending) and where each run starts.
+    starts = [0] + [p for p in range(1, live) if K[p] != K[p - 1]]
+    D = len(starts)
+    B = min(B, D)
+    st = np.array(starts + [live], dtype=np.int64)
+    kv = K[st[:-1]].astype(np.float64)  # K of each run (descending)
+    # cost(i, j): runs i..j-1 in one bucket = (st[j] - st[i]) * kv[i]
+    INF = float("inf")
+    dp = np.full(D + 1, INF)
+    dp[0] = 0.0
+    arg = np.zeros((B + 1, D + 1), dtype=np.int64)
+    for b in range(1, B + 1):
+        new = np.full(D + 1, INF)
+        for j in range(1, D + 1):
+            i = np.arange(0, j)
+            c = dp[i] + (st[j] - st[i]) * kv[i]
+            k = int(np.argmin(c))
+            new[j], arg[b, j] = c[k], k
+        dp = new
+    out, j = [], D
+    for b in range(B, 0, -1):
+        i = int(arg[b, j])
+        out.append((int(st[i]), int(st[j]), int(K[st[i]])))
+        j = i
+    return out[::-1]
+
+
+class PaddedLegendre:
+    """The latitude stage as a few ``bmm`` calls, one per size bucket.
+
+    The baseline a PyTorch-on-Trainium user would write instead of the per-m
+    loop: the per-m loop has ``2(L+1)`` matmul shapes, so on a shape-specialising
+    device runtime it compiles ``O(L)`` programs. Here every problem of a bucket
+    (:func:`legendre_buckets`) is zero-padded to the bucket's ``K_b`` rows and
+    the bucket is one ``torch.bmm`` of ``(n_b, K_b, H) x (n_b, H, 2F)``. The
+    padded tables are built once; the coefficient re-ordering is one
+    ``index_select`` (forward) or one per bucket (inverse), all at static
+    shapes. Padding rows are exact zeros, so results equal the per-m loop up to
+    fp32 summation order.
+    """
+
+    def __init__(self, table: torch.Tensor, lmax: int, H: int, buckets: int | str = 10):
+        L = lmax
+        self.lmax, self.H = L, H
+        self.n_problems = 2 * (L + 1)
+        self.buckets = legendre_buckets(L, buckets)
+        self.live = self.buckets[-1][1] if self.buckets else 0
+        na = n_alm(L)
+        T = table.detach().cpu()
+        Kp = problem_rows(L)
+        tabs, inv_idx = [], []
+        fwd_idx = np.empty(na, dtype=np.int64)
+        base = 0
+        for p0, p1, kb in self.buckets:
+            nb = p1 - p0
+            tb = torch.zeros((nb, kb, H), dtype=T.dtype)
+            ib = np.full((nb, kb), na, dtype=np.int64)  # na = the appended zero row
+            for i, p in enumerate(range(p0, p1)):
+                m, q = divmod(p, 2)
+                o = m_offset(L, m)
+                k = int(Kp[p])
+                r0 = 0 if q == 0 else parity_rows(L, m, 0)
+                tb[i, :k] = T[o + r0 : o + r0 + k]
+                rows = o + q + 2 * np.arange(k)  # triangular rows l = m + q + 2j
+                ib[i, :k] = rows
+                fwd_idx[rows] = base + i * kb + np.arange(k)
+            tabs.append(tb)
+            inv_idx.append(torch.from_numpy(ib.reshape(-1)))
+            base += nb * kb
+        self.padded_rows = base
+        self.tables = tabs
+        self.fwd_index = torch.from_numpy(fwd_idx)
+        self.inv_index = inv_idx
+        self.to(table.device)
+
+    def to(self, device) -> PaddedLegendre:
+        """Move to ``device``. Off the CPU the inverse also keeps contiguous
+        transposed tables (``(n_b, H, K_b)``), so a device that materialises a
+        transposed ``bmm`` operand does not copy the tables on every call."""
+        device = torch.device(device)
+        self.tables = [t.to(device) for t in self.tables]
+        self.tables_t = (
+            None
+            if device.type in ("cpu", "meta")
+            else [t.transpose(1, 2).contiguous() for t in self.tables]
+        )
+        self.fwd_index = self.fwd_index.to(device)
+        self.inv_index = [i.to(device) for i in self.inv_index]
+        return self
+
+    def flops(self, nfields: int) -> int:
+        """Real flops executed per direction, padding included."""
+        return sum(2 * (p1 - p0) * kb * self.H * 2 * nfields for p0, p1, kb in self.buckets)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``X (2(L+1) H, 2F)`` -> ``a (n_alm, 2F)``."""
+        return legendre_forward_padded(
+            self.tables, self.fwd_index, x, self.buckets, self.n_problems, self.H
+        )
+
+    def inverse(self, a: torch.Tensor) -> torch.Tensor:
+        """``a (n_alm, 2F)`` -> ``Y (2(L+1) H, 2F)``."""
+        tt = self.tables_t or [t.transpose(1, 2) for t in self.tables]
+        return legendre_inverse_padded(
+            tt, self.inv_index, a, self.buckets, self.n_problems, self.live, self.H
+        )
+
+
+# The padded stage follows the same float64 policy as the per-m loop: under
+# "auto", float64 tables / operands on the neuron device compute on the host
+# (``_fp64_host_guard`` moves every tensor argument, tables and index lists
+# included, and returns the result to the device).
+
+
+@_fp64_host_guard("SHT.legendre_forward_padded")
+def legendre_forward_padded(tables, fwd_index, x, buckets, n_problems: int, H: int):
+    """One ``bmm`` per bucket, then one ``index_select`` into the triangular layout."""
+    C = x.shape[1]
+    x3 = x.view(n_problems, H, C)
+    ys = [
+        torch.bmm(t, x3[p0:p1]).reshape(-1, C)
+        for t, (p0, p1, _) in zip(tables, buckets, strict=True)
+    ]
+    return torch.cat(ys).index_select(0, fwd_index)
+
+
+@_fp64_host_guard("SHT.legendre_inverse_padded")
+def legendre_inverse_padded(tables_t, inv_index, a, buckets, n_problems: int, live: int, H: int):
+    """One gather and one ``bmm`` per bucket (``tables_t`` are ``(n_b, H, K_b)``)."""
+    C = a.shape[1]
+    a_ext = torch.cat((a, a.new_zeros((1, C))))
+    gs = [
+        torch.bmm(t, a_ext.index_select(0, idx).view(p1 - p0, kb, C))
+        for t, idx, (p0, p1, kb) in zip(tables_t, inv_index, buckets, strict=True)
+    ]
+    dead = n_problems - live  # problems with K_p = 0 (p = 2L + 1)
+    if dead:
+        gs.append(a.new_zeros((dead, H, C)))
+    return torch.cat(gs).reshape(n_problems * H, C)
 
 
 # ── Static plan string (kernel argument) ─────────────────────────────────────

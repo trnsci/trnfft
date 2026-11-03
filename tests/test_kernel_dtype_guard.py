@@ -988,16 +988,18 @@ def test_sht_latitude_stage(backend, monkeypatch, dtype, legendre):
         assert not sht_calls
 
 
-def test_sht_float64_on_device_latitude_on_host(host_spy):
+@pytest.mark.parametrize("legendre,name", [("torch", "torch"), ("torch-padded", "padded")])
+def test_sht_float64_on_device_latitude_on_host(host_spy, legendre, name):
     """A float64 plan whose tables sit on the neuron device runs its torch
-    latitude stage on the host under "auto" (one warning per stage)."""
+    latitude stage (per-m loop or padded) on the host under "auto" (one
+    warning per stage)."""
     with warnings.catch_warnings(record=True) as rec:
         warnings.simplefilter("always")
-        alm, f = _sht_roundtrip(torch.float64, legendre="torch")
+        alm, f = _sht_roundtrip(torch.float64, legendre=legendre)
     assert alm.real.dtype == torch.float64 and f.dtype == torch.float64
     assert host_spy["to_host"] and host_spy["to_device"]
     ops = sorted(str(w.message).split(":")[0] for w in _host_warnings(rec))
-    assert ops == ["trnfft SHT.legendre_forward_torch", "trnfft SHT.legendre_inverse_torch"]
+    assert ops == [f"trnfft SHT.legendre_forward_{name}", f"trnfft SHT.legendre_inverse_{name}"]
 
 
 def test_sht_float64_require_nki_raises(backend, monkeypatch):

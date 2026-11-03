@@ -97,6 +97,28 @@ problem: the per-m aten loop of trnsci/trnsci#111, 2(L + 1) launches. It is
 kept as the CPU path and as the device comparison row. trnsci/trnblas#98
 (grouped GEMM) is the general-purpose form of what the kernels do here.
 
+`legendre="torch-padded"` is the fair plain-PyTorch device baseline
+(`device-aten-pad` in `scripts/bench_sht.py`). On a runtime that compiles one
+program per op shape, the per-m loop compiles O(L) programs: at L = 511 it
+makes 1023 matmul calls per direction with 511 distinct matmul shapes over
+both directions. `PaddedLegendre` needs no sort: K_p is non-increasing in p,
+so a size class is a contiguous range of problems and its slice of X is a
+view. Each class is zero-padded to its largest K and run as one `torch.bmm`;
+the coefficient reordering is one `index_select` forward and one per class
+inverse. `buckets=B` picks the B classes that minimise the padded flops (an
+exact dynamic program); `buckets="pow2"` pads K to powers of two.
+
+| L | per-m loop: matmul shapes | B = 10: matmul shapes | B = 10 flops / per-m loop | pow2: classes, flops / per-m loop |
+|---|---|---|---|---|
+| 127 | 127 | 19 | 1.084 | 7, 1.315 |
+| 511 | 511 | 19 | 1.096 | 9, 1.329 |
+| 1023 | 1023 | 19 | 1.098 | 10, 1.331 |
+
+Shapes are counted over one forward and one inverse at a fixed F, by
+`scripts/bench_sht.py --count-shapes` on `meta` tensors. Padding rows are
+exact zeros, so the result matches the per-m loop to fp32 summation order
+(1e-9 relative).
+
 ## Sizes
 
 | L | grid | tables (fp32) | latitude flops per transform, F = 1024 (after skipping) |
