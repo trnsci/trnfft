@@ -183,6 +183,9 @@ def _raw_kernel(*a, **k):
 def native(monkeypatch):
     """`_native` imported fresh with stub ops; native dispatch forced on CPU."""
     monkeypatch.setitem(sys.modules, "torch_neuronx", _fake_torch_neuronx())
+    # Record the real state first, so teardown removes the stub-backed `_native`
+    # imported below (a later test in the session would otherwise get stub ops).
+    monkeypatch.setitem(sys.modules, "trnfft.nki._native", None)
     monkeypatch.delitem(sys.modules, "trnfft.nki._native", raising=False)
     had_attr = hasattr(trnfft_nki, "_native")
     old_attr = getattr(trnfft_nki, "_native", None)
