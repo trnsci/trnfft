@@ -325,15 +325,13 @@ if HAS_NKI:
                 _acc(k_full * TILE_K, k_tail, k_full)
 
             # NKI 0.3.0: nl.copy returns a view; PSUM->SBUF goes through
-            # nisa.tensor_copy into a pre-allocated SBUF tile. Cast after, when
-            # the output is not FP32 (the BF16 kernel keeps the FP32 PSUM).
-            cr_sbuf = nl.ndarray((tm, tn), dtype=nl.float32, buffer=nl.sbuf)
-            ci_sbuf = nl.ndarray((tm, tn), dtype=nl.float32, buffer=nl.sbuf)
+            # nisa.tensor_copy into a pre-allocated SBUF tile in the output
+            # dtype (the BF16 kernel keeps the FP32 PSUM). tensor_copy converts
+            # on the way; NKI 0.7 has no nl.cast (trnfft#133).
+            cr_sbuf = nl.ndarray((tm, tn), dtype=out_dtype, buffer=nl.sbuf)
+            ci_sbuf = nl.ndarray((tm, tn), dtype=out_dtype, buffer=nl.sbuf)
             nisa.tensor_copy(dst=cr_sbuf, src=psum_cr)
             nisa.tensor_copy(dst=ci_sbuf, src=psum_ci)
-            if out_dtype != nl.float32:
-                cr_sbuf = nl.cast(cr_sbuf, dtype=out_dtype)
-                ci_sbuf = nl.cast(ci_sbuf, dtype=out_dtype)
             nl.store(c_real[m_off : m_off + tm, n_off : n_off + tn], value=cr_sbuf)
             nl.store(c_imag[m_off : m_off + tm, n_off : n_off + tn], value=ci_sbuf)
 
@@ -445,13 +443,12 @@ if HAS_NKI:
                         nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=bi, accumulate=True)
                         nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=br, accumulate=True)
 
-                    cr_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
-                    ci_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.sbuf)
+                    # PSUM (FP32) -> SBUF in the output dtype: tensor_copy converts on the
+                    # way (NKI 0.7 has no nl.cast; trnfft#133).
+                    cr_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=at_real.dtype, buffer=nl.sbuf)
+                    ci_sbuf = nl.ndarray((TILE_M, TILE_N), dtype=at_real.dtype, buffer=nl.sbuf)
                     nisa.tensor_copy(dst=cr_sbuf, src=psum_cr)
                     nisa.tensor_copy(dst=ci_sbuf, src=psum_ci)
-                    if at_real.dtype != nl.float32:
-                        cr_sbuf = nl.cast(cr_sbuf, dtype=at_real.dtype)
-                        ci_sbuf = nl.cast(ci_sbuf, dtype=at_real.dtype)
                     nl.store(c_real[c_off : c_off + TILE_M, n_off : n_off + TILE_N], value=cr_sbuf)
                     nl.store(c_imag[c_off : c_off + TILE_M, n_off : n_off + TILE_N], value=ci_sbuf)
 
