@@ -93,7 +93,19 @@ F = trnfft.fft2(image)
 # STFT (torch.stft's arguments; window=None means Hann here, ones in torch.stft)
 waveform = torch.randn(16000)
 S = trnfft.stft(waveform, n_fft=512, hop_length=256, window=torch.hann_window(512))
+
+# Spherical harmonic transforms (Gauss grid 512 x 1024), batched over fields
+from trnfft.sht import SHT
+
+sht = SHT(lmax=511)
+alm = sht.forward(torch.randn(128, sht.nlat, sht.nlon))  # ComplexTensor (128, 131328)
+fields = sht.inverse(alm)
 ```
+
+`trnfft.sht` runs the latitude (Legendre) stage as one NKI kernel launch. In
+that launch the fp32 tables stay stationary in SBUF while every field streams
+through the Tensor Engine, and all-zero polar tiles are skipped. The result is
+within 1e-6 of fp64 ducc0. See [docs/api/sht.md](docs/api/sht.md).
 
 ## Complex Neural Network Layers
 
@@ -158,7 +170,7 @@ NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https
 **v0.26.0** — validated on Trn2 (Neuron SDK 2.33, native TorchNeuron). Correctness releases, upgrade recommended: 0.25.0 fixed GEMM tail tiles that ≤ 0.24.0 dropped silently (small-N DFT-GEMM, bf16 precision modes, `nn.ComplexLinear`, `complex_gemm`); 0.26.0 fixed `irfft` / `hfft` / `irfft2` / `irfftn` using every bin instead of the first `n//2+1` (#105) and float64 FFTs on the NKI path returning inf/NaN (#109). See the [CHANGELOG](CHANGELOG.md).
 
 **API coverage** (24 `torch.fft` functions):
-`fft`, `ifft`, `rfft`, `irfft`, `hfft`, `ihfft`, `fft2`, `ifft2`, `rfft2`, `irfft2`, `hfft2`, `ihfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `hfftn`, `ihfftn`, `fftshift`, `ifftshift`, `fftfreq`, `rfftfreq`, `stft`, `istft`. Every transform takes `torch.fft`'s `n` / `s`, `dim` and `norm` arguments with the same meaning (#123).
+`fft`, `ifft`, `rfft`, `irfft`, `hfft`, `ihfft`, `fft2`, `ifft2`, `rfft2`, `irfft2`, `hfft2`, `ihfft2`, `fftn`, `ifftn`, `rfftn`, `irfftn`, `hfftn`, `ihfftn`, `fftshift`, `ifftshift`, `fftfreq`, `rfftfreq`, `stft`, `istft`. Every transform takes `torch.fft`'s `n` / `s`, `dim` and `norm` arguments with the same meaning (#123). Beyond `torch.fft`: scalar spherical harmonic transforms, `trnfft.sht.SHT` (#148).
 
 **Roadmap**
 - NKI `ComplexConv1d` / `ComplexModReLU` kernels (today both fall back to PyTorch on NKI)

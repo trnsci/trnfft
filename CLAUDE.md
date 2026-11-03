@@ -46,6 +46,7 @@ trnfft/
 │   ├── fft_core.py          # Cooley-Tukey + Bluestein algorithms
 │   ├── nn.py                # ComplexLinear, ComplexConv1d, ComplexBatchNorm1d, ComplexModReLU
 │   ├── plan.py              # FFTPlan with caching
+│   ├── sht.py               # Spherical harmonic transforms: grids, fp64 Legendre tables, SHT plan
 │   ├── nki/
 │   │   ├── __init__.py
 │   │   ├── dispatch.py      # PyTorch ↔ NKI auto-dispatch, GEMM/mask kernels, native/XLA launch path
@@ -53,6 +54,7 @@ trnfft/
 │   │   ├── autograd.py      # Analytic adjoints; autograd.Function wrappers for the XLA path
 │   │   ├── stockham.py      # Stockham radix-4 / radix-8 stage kernels
 │   │   ├── four_step.py     # Batch-fused four-step FFT kernel (one launch per batch)
+│   │   ├── sht.py           # SHT latitude-stage kernels (SBUF-stationary tables, polar mask)
 │   │   └── butterfly.py     # NKI butterfly kernel stubs (validate on hardware)
 ├── tests/
 │   ├── conftest.py          # Fixtures, hardware detection

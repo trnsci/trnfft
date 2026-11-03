@@ -69,6 +69,8 @@ ALLOWED = {
     "stockham_radix8_w8": _FP32_HALF,
     "stockham_radix8_w8_t2d": _FP32_HALF,
     "four_step_fft": _FP32,
+    "sht_legendre_forward": _FP32,
+    "sht_legendre_inverse": _FP32,
 }
 
 # Where each kernel object lives (the drivers import them by name).
@@ -87,6 +89,8 @@ KERNEL_ATTRS = {
     "stockham_radix8_w8": ("stockham", "stockham_radix8_w8_kernel"),
     "stockham_radix8_w8_t2d": ("stockham", "stockham_radix8_w8_t2d_kernel"),
     "four_step_fft": ("four_step", "four_step_fft_kernel"),
+    "sht_legendre_forward": ("sht", "sht_legendre_forward_kernel"),
+    "sht_legendre_inverse": ("sht", "sht_legendre_inverse_kernel"),
 }
 
 DTYPES = [
@@ -126,6 +130,8 @@ class _StubOp:
             VIOLATIONS.append(msg)
             raise AssertionError(msg)
         outs = self.fake_fn(*args)
+        if isinstance(outs, torch.Tensor):  # single-output ops (the SHT stages)
+            return torch.zeros(outs.shape, dtype=outs.dtype, device=outs.device)
         return tuple(torch.zeros(o.shape, dtype=o.dtype, device=o.device) for o in outs)
 
     def register_autograd(self, *a, **k):
@@ -211,10 +217,11 @@ def native(monkeypatch):
     monkeypatch.delenv("TRNFFT_REQUIRE_NKI", raising=False)
     monkeypatch.delenv("TRNFFT_PE_TRANSPOSE", raising=False)
     # Off-NKI the kernel objects are undefined; the drivers import them.
-    from trnfft.nki import butterfly, four_step, stockham
+    from trnfft.nki import butterfly, four_step, sht, stockham
 
     mods = {"dispatch": dispatch, "butterfly": butterfly, "stockham": stockham}
     mods["four_step"] = four_step
+    mods["sht"] = sht
     for mod_name, attr in KERNEL_ATTRS.values():
         if getattr(mods[mod_name], attr, None) is None:
             # One distinct object per kernel (_simulate_kernel looks them up).
@@ -296,10 +303,12 @@ def test_table_matches_ops(native):
 def test_op_bodies_refuse_float64(native, op):
     """A direct `torch.ops.trnfft.<op>` call checks dtypes before the kernel."""
     stub = native.OPS[op]
-    n_tensors = 7 if op == "four_step_fft" else 4
-    args = [torch.ones(4, 4, dtype=torch.float64) for _ in range(n_tensors)]
+    n_tensors = {"four_step_fft": 7, "sht_legendre_forward": 2, "sht_legendre_inverse": 2}
+    args = [torch.ones(4, 4, dtype=torch.float64) for _ in range(n_tensors.get(op, 4))]
     if op.startswith("butterfly"):
         args += [4, 0]
+    if op.startswith("sht_"):
+        args += ["0:1:0:1:1,"]  # plan string
     with pytest.raises(TypeError, match=op):
         stub.fn(*args)
 
@@ -949,6 +958,55 @@ def test_result_dtype_mixed(backend, dts):
             assert fn().dtype == torch.promote_types(da, db)
         else:
             _same_outcome(fn)
+
+
+# ── SHT latitude stage (trnfft#148) ──────────────────────────────────────────
+
+
+def _sht_roundtrip(dtype, legendre="auto"):
+    from trnfft.sht import SHT
+
+    s = SHT(6, dtype=dtype, fft="torch", legendre=legendre)
+    alm = s.forward(_rand((2, s.nlat, s.nlon), torch.float64))
+    return alm, s.inverse(alm)
+
+
+@pytest.mark.parametrize("legendre", ["auto", "nki"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_sht_latitude_stage(backend, monkeypatch, dtype, legendre):
+    """float32 plans run the kernels; float64 plans follow the float64 policy:
+    torch under "auto", the kernel on float32 copies under "nki"."""
+    from trnfft.nki import sht as nki_sht
+
+    monkeypatch.setattr(nki_sht, "HAS_NKI", True)
+    alm, f = _sht_roundtrip(dtype, legendre)
+    assert alm.real.dtype == dtype and f.dtype == dtype
+    sht_calls = [dts for op, dts in CALLS if op.startswith("sht_")]
+    if dtype == torch.float32 or backend == "nki":
+        assert len(sht_calls) == 2 and all(d == {torch.float32} for d in sht_calls)
+    else:
+        assert not sht_calls
+
+
+def test_sht_float64_on_device_latitude_on_host(host_spy):
+    """A float64 plan whose tables sit on the neuron device runs its torch
+    latitude stage on the host under "auto" (one warning per stage)."""
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        alm, f = _sht_roundtrip(torch.float64, legendre="torch")
+    assert alm.real.dtype == torch.float64 and f.dtype == torch.float64
+    assert host_spy["to_host"] and host_spy["to_device"]
+    ops = sorted(str(w.message).split(":")[0] for w in _host_warnings(rec))
+    assert ops == ["trnfft SHT.legendre_forward_torch", "trnfft SHT.legendre_inverse_torch"]
+
+
+def test_sht_float64_require_nki_raises(backend, monkeypatch):
+    from trnfft.nki import sht as nki_sht
+
+    monkeypatch.setattr(nki_sht, "HAS_NKI", True)
+    monkeypatch.setenv("TRNFFT_REQUIRE_NKI", "1")
+    with pytest.raises(NotImplementedError, match="TRNFFT_REQUIRE_NKI"):
+        _sht_roundtrip(torch.float64)
 
 
 # ── TRNFFT_REQUIRE_NKI ───────────────────────────────────────────────────────

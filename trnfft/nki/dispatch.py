@@ -150,6 +150,9 @@ KERNEL_DTYPES: dict[str, frozenset] = {
     "stockham_radix8_w8": _FP32_HALF,
     "stockham_radix8_w8_t2d": _FP32_HALF,
     "four_step_fft": _FP32,
+    # SHT latitude stage (trnfft#148): FP32 tables and fields, FP32 PSUM.
+    "sht_legendre_forward": _FP32,
+    "sht_legendre_inverse": _FP32,
     # The composite ``trnfft::fft`` op is host code, not a kernel: its driver
     # (``fft_core._cooley_tukey_nki_nograd``) handles float64 itself and every
     # stage kernel it launches is checked against its own entry.
@@ -173,6 +176,8 @@ _KERNEL_ATTRS: dict[str, tuple[str, str]] = {
     "stockham_radix8_w8": ("stockham", "stockham_radix8_w8_kernel"),
     "stockham_radix8_w8_t2d": ("stockham", "stockham_radix8_w8_t2d_kernel"),
     "four_step_fft": ("four_step", "four_step_fft_kernel"),
+    "sht_legendre_forward": ("sht", "sht_legendre_forward_kernel"),
+    "sht_legendre_inverse": ("sht", "sht_legendre_inverse_kernel"),
 }
 
 
@@ -1261,7 +1266,7 @@ def _launch(kernel, op_name: str, *args):
 def _kernel_op_name(kernel) -> str:
     """The ``KERNEL_DTYPES`` key of a kernel object (``TypeError`` if unknown)."""
     mods = {"dispatch": sys.modules[__name__]}
-    for name in ("butterfly", "stockham", "four_step"):
+    for name in ("butterfly", "stockham", "four_step", "sht"):
         mods[name] = sys.modules.get(f"{__package__}.{name}")
     for op, (mod, attr) in _KERNEL_ATTRS.items():
         if mods[mod] is not None and getattr(mods[mod], attr, None) is kernel:

@@ -123,6 +123,40 @@ Lands in the next release (0.28.0). Needs device validation on Trn2.
 
 ### Added
 
+- **Spherical harmonic transforms, `trnfft.sht` (#148, trnsci/trnsci#111
+  milestone 1).** `SHT(lmax, grid="gauss"|"equiangular")` gives forward
+  (analysis) and inverse (synthesis) scalar transforms of `(..., nlat, nlon)`
+  real fields. Coefficients are orthonormal with the Condon-Shortley phase, in
+  ducc0's triangular m-major order. The longitude stage uses `trnfft.rfft` /
+  `trnfft.irfft`. The latitude stage is a per-m GEMM against
+  parity-split Legendre tables, which are computed on the host in fp64
+  (log-space start, so high m does not underflow) and stored as fp32.
+  - **NKI kernels.** `trnfft/nki/sht.py` runs every per-m problem in one
+    launch (three at L = 1023). Each table tile stays stationary in SBUF
+    while all 2F field columns stream into fp32 PSUM.
+  - **Polar tiles.** All-zero 128 x 128 table tiles are skipped through a
+    static mask, passed in the kernel's `plan` argument (aws-neuron-sdk#1454).
+  - **Kernel rules.** Plain `nl.load` with `nisa.nc_transpose`, never
+    `load_transpose2d`. Both LNC=2 cores split the columns by `program_id`.
+    Tail tiles are handled in every dimension.
+  - **Accuracy.** fp32 is within 1e-6 (spectral l2) of fp64 ducc0: measured
+    2.6e-7 at L = 511 and 3.6e-7 at L = 1023.
+  - **Tests.** Validated against ducc0, SHTns and a direct
+    `scipy.special.sph_harm_y` quadrature. The kernels are tested under
+    `nki.simulate` at 1 and 2 programs and pass the MLIR verifier at lnc=1
+    and lnc=2.
+  - **Benchmark.** `scripts/bench_sht.py`, with `--device` rows. See
+    `docs/api/sht.md`.
+  - **dtypes.** The kernels take float32 only (`KERNEL_DTYPES` entries
+    `sht_legendre_forward` / `sht_legendre_inverse`, checked on every launch
+    route and in the op bodies). A float64 plan (`SHT(dtype=torch.float64)`)
+    follows the float64 policy: torch at float64 under `set_backend("auto")`
+    (also with `legendre="nki"`), the kernel on float32 copies with a
+    one-time warning under `"nki"`, `NotImplementedError` under
+    `TRNFFT_REQUIRE_NKI=1`; float64 tables on the neuron device run the
+    torch latitude stage on the host under `"auto"`. The SHT ops are not on
+    the eager-handle fast path (they take the static `plan` string) and keep
+    the `trnfft::` op.
 - **`TRNFFT_REQUIRE_NKI=1`** (read per call): an operand dtype a kernel does
   not take raises `NotImplementedError` instead of being cast to float32 or
   computed in torch, as `TRNBLAS_REQUIRE_NKI` does (trnblas#69).

@@ -41,6 +41,7 @@ from .fft_core import set_ozaki_product_precision_verified
 from .nki import HAS_NKI, get_backend, set_backend
 from .plan import FFTPlan, clear_plan_cache, create_plan
 from .precision import get_precision, set_precision
+from .sht import SHT
 
 __all__ = [
     # FFT operations
@@ -83,4 +84,6 @@ __all__ = [
     "set_precision",
     "set_ozaki_product_precision_verified",
     "get_precision",
+    # Spherical harmonic transforms (trnfft.sht)
+    "SHT",
 ]
