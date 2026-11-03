@@ -298,6 +298,89 @@ class TestNativeFFT:
             torch.testing.assert_close(t.grad.cpu().double(), r.grad, rtol=1e-3, atol=1e-2)
 
 
+class TestEagerHandle:
+    """Eager calls take the cached handle; results match the custom op bit for bit."""
+
+    @pytest.fixture
+    def handles(self, monkeypatch):
+        from trnfft.nki import dispatch as D
+
+        monkeypatch.setattr(D, "_eager_handles", {})
+        return D
+
+    def test_complex_gemm_handle_matches_op_and_is_cached(self, handles):
+        D = handles
+        args = _dev(_rand(127, 129, seed=0), _rand(127, 129, seed=1))
+        args += _dev(_rand(129, 257, seed=2), _rand(129, 257, seed=3))
+        op = [o.cpu() for o in _ops()["complex_gemm"](*args)]
+        for _ in range(3):
+            out = D._native_call("complex_gemm", args)
+            assert out[0].device.type == "neuron"
+            for g, r in zip(out, op, strict=True):
+                assert torch.equal(g.cpu(), r)
+        assert list(D._eager_handles) == [id(D._complex_gemm_kernel)]
+
+    @pytest.mark.parametrize("stage", [0, 3])
+    def test_butterfly_static_ints_pass_through(self, handles, stage):
+        from trnfft.nki import butterfly
+
+        D = handles
+        b, n = 8, 16
+        m = 1 << (stage + 1)
+        rows, half = b * (n // m), m >> 1
+        args = _dev(_rand(b, n, seed=1), _rand(b, n, seed=2))
+        args += _dev(_rand(rows, half, seed=3), _rand(rows, half, seed=4))
+        op = [o.cpu() for o in _ops()["butterfly_stage"](*args, n, stage)]
+        out = D._native_call("butterfly_stage", [*args, n, stage])
+        for g, r in zip(out, op, strict=True):
+            assert torch.equal(g.cpu(), r)
+        assert list(D._eager_handles) == [id(butterfly.butterfly_stage_kernel)]
+
+    def test_public_fft_uses_handles_and_matches_op(self, handles, monkeypatch, nki_backend):
+        D = handles
+        x = ComplexTensor(_rand(4, 1024, seed=1), _rand(4, 1024, seed=2))
+        xd = ComplexTensor(x.real.to("neuron"), x.imag.to("neuron"))
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", False)
+        ref = trnfft.fft(xd)
+        ref = (ref.real.cpu(), ref.imag.cpu())
+        assert D._eager_handles == {}
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", True)
+        y = trnfft.fft(xd)
+        assert D._eager_handles, "no kernel went through the handle"
+        assert torch.equal(y.real.cpu(), ref[0]) and torch.equal(y.imag.cpu(), ref[1])
+        assert _rel(_np_complex(y), np.fft.fft(_np_complex(x))) < 1e-5
+
+    def test_flag_off_uses_op(self, handles, monkeypatch):
+        D = handles
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", False)
+        args = [_rand(128, 512, seed=i) for i in range(4)]
+        out = D._native_call("complex_mul", _dev(*args))
+        assert D._eager_handles == {}
+        ar, ai, br, bi = args
+        _assert_pair_close(out, (ar * br - ai * bi, ar * bi + ai * br))
+
+    def test_requires_grad_uses_op(self, handles):
+        D = handles
+        args = [t.requires_grad_() for t in _dev(*(_rand(128, 512, seed=i) for i in range(4)))]
+        re, im = D._native_call("complex_mul", args)
+        assert D._eager_handles == {}
+        assert re.grad_fn is not None
+
+    def test_native_call_inside_compile_uses_op(self, handles):
+        D = handles
+
+        @torch.compile(backend="neuron", fullgraph=True)
+        def f(a, b, c, d):
+            re, im = D._native_call("complex_gemm", [a, b, c, d])
+            return re * 2.0, im * 2.0
+
+        args = [_rand(128, 128, seed=i) for i in range(4)]
+        eager = torch.ops.trnfft.complex_gemm(*_dev(*args))
+        out = f(*_dev(*args))
+        assert D._eager_handles == {}
+        _assert_pair_close(out, tuple(e.cpu() * 2.0 for e in eager), rtol=1e-4, atol=1e-4)
+
+
 class TestNativeTorchCompile:
     """nki_op ops inside torch.compile(backend="neuron", fullgraph=True)."""
 

@@ -11,6 +11,8 @@ for the "neuron" device, and the kernels are torch reference functions.
 """
 
 import importlib.util
+import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -384,6 +386,171 @@ class TestLaunchRouting:
         fake_xla.device = lambda: torch.device("meta")
         monkeypatch.setitem(sys.modules, "torch_xla", fake_xla)
         assert dispatch._kernel_device() == torch.device("meta")
+
+
+class _FakeKernel:
+    """Stands in for an `@nki.jit` kernel (has `.func`)."""
+
+    func = None
+
+
+class TestEagerHandle:
+    """Eager native calls go through a cached handle, not the custom op."""
+
+    @pytest.fixture
+    def eager(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_dispatch_path", "native")
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "cpu")
+        monkeypatch.setattr(dispatch, "_eager_handles", {})
+        monkeypatch.setattr(dispatch, "_eager_call_ok", lambda tensors: True)
+        built = []
+
+        def wrap(kernel):
+            built.append(kernel)
+            return lambda *t: ("handle", t)
+
+        monkeypatch.setattr(dispatch, "_wrap_nki", wrap)
+
+        def op(*t):
+            return ("op", t)
+
+        monkeypatch.setattr(dispatch, "_native_ops", {"k": op, "k2": op, "composite": op})
+        kernels = {"k": _FakeKernel(), "k2": _FakeKernel()}
+        monkeypatch.setattr(dispatch, "_native_kernel", kernels.get)
+        return built, kernels
+
+    def test_handle_built_once_and_skips_op(self, eager):
+        built, kernels = eager
+        x = torch.ones(1)
+        for _ in range(3):
+            assert dispatch._native_call("k", [x])[0] == "handle"
+        assert built == [kernels["k"]]
+
+    def test_one_handle_per_kernel(self, eager):
+        built, kernels = eager
+        for name in ("k", "k2", "k"):
+            dispatch._native_call(name, [torch.ones(1)])
+        assert built == [kernels["k"], kernels["k2"]]
+
+    def test_composite_op_uses_op(self, eager):
+        built, _ = eager
+        assert dispatch._native_call("composite", [torch.ones(1)])[0] == "op"
+        assert built == []
+
+    def test_non_jit_callable_uses_op(self, eager, monkeypatch):
+        built, _ = eager
+        monkeypatch.setattr(dispatch, "_native_kernel", lambda name: lambda x: x)
+        assert dispatch._native_call("k", [torch.ones(1)])[0] == "op"
+        assert built == []
+
+    def test_no_handle_api_uses_op(self, eager, monkeypatch):
+        monkeypatch.setattr(dispatch, "_wrap_nki", False)
+        assert dispatch._native_call("k", [torch.ones(1)])[0] == "op"
+
+    def test_launch_passes_ints_through_handle(self, eager, monkeypatch):
+        seen = []
+
+        def handle(*args):
+            seen.append(args)
+            return args[0] + args[1], args[0] - args[1]
+
+        monkeypatch.setattr(dispatch, "_wrap_nki", lambda kernel: handle)
+        a, b = torch.ones(2, 1), torch.zeros(2, 1)
+        out = dispatch._launch(None, "k", a, b, 16, 3)
+        assert seen[0][2:] == (16, 3)
+        assert torch.equal(out[0], a) and torch.equal(out[1], a)
+
+    def test_missing_nki_api_resolves_to_unavailable(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_eager_handles", {})
+        monkeypatch.setattr(dispatch, "_wrap_nki", None)
+        monkeypatch.setitem(sys.modules, "torch_neuronx", types.ModuleType("torch_neuronx"))
+        assert dispatch._eager_handle(_FakeKernel()) is None
+        assert dispatch._wrap_nki is False
+
+    def test_torch_neuronx_missing_resolves_to_unavailable(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_eager_handles", {})
+        monkeypatch.setattr(dispatch, "_wrap_nki", None)
+        monkeypatch.setitem(sys.modules, "torch_neuronx", None)
+        assert dispatch._eager_handle(_FakeKernel()) is None
+        assert dispatch._wrap_nki is False
+
+    def test_native_kernel_unloaded_is_none(self, monkeypatch):
+        monkeypatch.delitem(sys.modules, "trnfft.nki._native", raising=False)
+        assert dispatch._native_kernel("complex_gemm") is None
+
+
+class TestEagerKernelTable:
+    """`_native.KERNELS` names exactly the kernel each single-kernel op calls."""
+
+    def test_table_matches_op_bodies(self, native_module):
+        native, _ = native_module
+        src = open(native.__file__).read()
+        assert set(native.KERNELS) <= set(native.OPS)
+        assert "fft" not in native.KERNELS  # composite: keeps the op
+        for name, (module, attr) in native.KERNELS.items():
+            body = re.search(rf"\ndef {name}\(.*?\n    return (\w+)\.(\w+)\(", src, re.S)
+            assert body is not None, name
+            alias, called = body.groups()
+            assert called == attr, name
+            assert getattr(native, alias) is module, name
+
+    def test_every_single_kernel_op_is_listed(self, native_module):
+        native, _ = native_module
+        assert set(native.OPS) - set(native.KERNELS) == {"fft"}
+
+    def test_lookup_follows_the_module_attribute(self, monkeypatch, native_module):
+        native, _ = native_module
+        monkeypatch.setitem(sys.modules, "trnfft.nki._native", native)
+        k = _FakeKernel()
+        monkeypatch.setattr(dispatch, "_complex_mul_kernel", k, raising=False)
+        assert dispatch._native_kernel("complex_mul") is k
+        assert dispatch._native_kernel("fft") is None
+
+
+class TestEagerCallOk:
+    """Only plain, grad-free, non-int64 neuron tensors outside compile qualify."""
+
+    @pytest.fixture
+    def cpu_is_kernel_device(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "cpu")
+
+    def test_plain_tensors_accepted(self, cpu_is_kernel_device):
+        assert dispatch._eager_call_ok([torch.ones(2), torch.ones(3, dtype=torch.bfloat16)])
+
+    def test_requires_grad_rejected(self, cpu_is_kernel_device):
+        assert not dispatch._eager_call_ok([torch.ones(2), torch.ones(2, requires_grad=True)])
+
+    def test_int64_rejected(self, cpu_is_kernel_device):
+        assert not dispatch._eager_call_ok([torch.ones(2, dtype=torch.int64)])
+
+    def test_subclass_rejected(self, cpu_is_kernel_device):
+        assert not dispatch._eager_call_ok([torch.nn.Parameter(torch.ones(2), False)])
+
+    def test_cpu_tensors_rejected(self):
+        assert not dispatch._eager_call_ok([torch.ones(1)])
+
+    def test_flag_off(self, monkeypatch):
+        monkeypatch.setattr(dispatch, "_EAGER_HANDLE_ENABLED", False)
+        assert not dispatch._eager_call_ok([])
+
+    def test_compiling(self, monkeypatch):
+        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+        assert not dispatch._eager_call_ok([])
+
+    def test_no_tensors_outside_compile(self):
+        assert dispatch._eager_call_ok([])
+
+    def test_flag_parsed_from_env(self):
+        code = "import trnfft.nki.dispatch as d; print(d._EAGER_HANDLE_ENABLED)"
+        for value, expect in (("0", "False"), ("off", "False"), ("1", "True"), ("", "True")):
+            out = subprocess.run(
+                [sys.executable, "-c", code],
+                env={**os.environ, "TRNFFT_NKI_EAGER_HANDLE": value},
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            assert out.splitlines()[-1] == expect, value
 
 
 # ── Lazy registration ────────────────────────────────────────────────────────
