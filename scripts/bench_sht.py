@@ -397,9 +397,14 @@ def main() -> int:
                             torch.from_numpy(alm.real.copy()).float().to(device),
                             torch.from_numpy(alm.imag.copy()).float().to(device),
                         )
+                        # The first inverse is the cold one (it makes the forward's input).
+                        _sync(device)
+                        t0 = time.perf_counter()
                         f_t = run.inverse(a_ct)
+                        _sync(device)
+                        c_i = time.perf_counter() - t0
                         c_f, t_f = _median(lambda: run.forward(f_t), args.reps, device)
-                        c_i, t_i = _median(lambda: run.inverse(a_ct), args.reps, device)
+                        t_i = _median(lambda: run.inverse(a_ct), args.reps, device)[1]
                         cf = torch.from_numpy(check_f).float().to(device)
                         ca = s.forward(cf)
                         e_f = _rel(
