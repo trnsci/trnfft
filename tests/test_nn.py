@@ -7,6 +7,8 @@ import torch
 from trnfft import ComplexTensor
 from trnfft.nn import ComplexBatchNorm1d, ComplexConv1d, ComplexLinear, ComplexModReLU
 
+pytestmark = pytest.mark.filterwarnings(r"ignore:trnfft\.stft\(window=None\):DeprecationWarning")
+
 
 class TestComplexLinear:
     def test_output_shape(self):

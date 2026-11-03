@@ -6,6 +6,10 @@ import torch
 
 import trnfft
 
+# Most cases below exercise the window=None default on purpose; its
+# DeprecationWarning (#106) is asserted in TestDefaultWindowDeprecation.
+pytestmark = pytest.mark.filterwarnings(r"ignore:trnfft\.i?stft\(window=None\):DeprecationWarning")
+
 
 class TestSTFT:
     def test_shape(self):
@@ -186,3 +190,51 @@ class TestNKISTFT:
         S = trnfft.stft(signal, n_fft=128, hop_length=64)
         recovered = trnfft.istft(S, n_fft=128, hop_length=64, length=2048)
         np.testing.assert_allclose(recovered.numpy(), signal.numpy(), atol=1e-3)
+
+
+class TestDefaultWindowDeprecation:
+    """window=None warns that the default becomes torch's ones window in the
+    next minor release; the result is still the Hann window (#106)."""
+
+    def test_stft_warns_and_keeps_hann(self):
+        sig = torch.randn(2, 512, dtype=torch.float64)
+        with pytest.warns(DeprecationWarning, match="next minor release") as rec:
+            got = trnfft.stft(sig, n_fft=64, hop_length=16)
+        assert len(rec) == 1
+        assert rec[0].filename == __file__
+        assert "window=torch.hann_window(win_length)" in str(rec[0].message)
+        want = trnfft.stft(
+            sig, n_fft=64, hop_length=16, window=torch.hann_window(64, dtype=torch.float64)
+        )
+        torch.testing.assert_close(got.real, want.real, rtol=0, atol=0)
+        torch.testing.assert_close(got.imag, want.imag, rtol=0, atol=0)
+
+    def test_stft_win_length_default_hann(self):
+        sig = torch.randn(400, dtype=torch.float64)
+        with pytest.warns(DeprecationWarning):
+            got = trnfft.stft(sig, n_fft=64, win_length=40)
+        want = trnfft.stft(
+            sig, n_fft=64, win_length=40, window=torch.hann_window(40, dtype=torch.float64)
+        )
+        torch.testing.assert_close(got.real, want.real, rtol=0, atol=0)
+
+    def test_istft_warns_and_keeps_hann(self):
+        sig = torch.randn(1024, dtype=torch.float64)
+        w = torch.hann_window(64, dtype=torch.float64)
+        S = trnfft.stft(sig, n_fft=64, hop_length=16, window=w)
+        with pytest.warns(DeprecationWarning, match=r"istft\(window=None\)") as rec:
+            got = trnfft.istft(S, n_fft=64, hop_length=16, length=1024)
+        assert len(rec) == 1
+        assert rec[0].filename == __file__
+        want = trnfft.istft(S, n_fft=64, hop_length=16, window=w, length=1024)
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    def test_explicit_window_does_not_warn(self):
+        import warnings
+
+        sig = torch.randn(512)
+        w = torch.ones(64)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            S = trnfft.stft(sig, n_fft=64, window=w)
+            trnfft.istft(S, n_fft=64, window=w, length=512)

@@ -168,6 +168,22 @@ NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https
   six-step path that is the default from N=8192 (#94; `TRNFFT_SIX_STEP=0` turns it off)
 - SBUF-resident dispatch to reduce small-op overhead
 
+## Known issues in earlier releases
+
+Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Upgrade to the "fixed in" release or later. Details in the [CHANGELOG](CHANGELOG.md).
+
+| Bug | Affected versions | Fixed in |
+|---|---|---|
+| GEMM-family kernels dropped tail tiles when M, K or N is not a whole tile: unwritten rows or columns, lost contraction terms. Hit the small-N DFT-GEMM, the `bf16` / `bf16_refined` / `ozaki` / `ozaki_hq` modes at batches over 128 that are not a multiple of 128, `nn.ComplexLinear`, and `complex_gemm` / `complex_gemm_bf16` (NKI) (#99, #100, #101) | ≤ 0.24.0 | 0.25.0 |
+| `irfft` / `hfft` / `irfft2` / `irfftn` used every input bin instead of the first `n // 2 + 1`, wrong for most `n` (#104) | ≤ 0.25.0 | 0.26.0 |
+| float64 FFTs on the NKI path, and `precision="double"` Bluestein at N > 512, returned inf/NaN (#108) | 0.25.0 (earlier not measured) | 0.26.0 |
+| `ComplexLinear` / `complex_linear` with float64 host tensors on the NKI backend returned inf/NaN (#131) | 0.25.0 – 0.26.0 | 0.27.0 |
+| Integer inputs computed the FFT in the integer dtype (truncated butterflies, 0/±1 Bluestein chirp) (#113) | 0.1.0 – 0.26.0 | 0.27.0 |
+| `stft` with `center=True` dropped the batch dim of a `(1, L)` input (#114) | 0.1.0 – 0.26.0 | 0.27.0 |
+| `nn.ComplexModReLU` applied its bias along the last dim instead of dim 1 for `(B, C, L)` input (#115) | 0.1.0 – 0.26.0 | 0.27.0 |
+| `fftn` / `ifftn` with `dim=()` returned a view of the input, not a copy (#116) | 0.2.0 – 0.26.0 | 0.27.0 |
+| A negative `n` / `s` sliced the input (e.g. `n=-1` dropped the last sample) instead of keeping the size or raising (#123) | ≤ 0.26.0 | 0.27.0 |
+
 ## Related projects in the trnsci suite
 
 All six siblings are on PyPI, along with the umbrella meta-package:

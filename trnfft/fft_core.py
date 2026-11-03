@@ -59,6 +59,12 @@ def fft_core(
             with _torch_route():
                 return fft_core(x, inverse, plan, prec)
 
+    if x.real.dtype in _HALF_DTYPES and prec not in _LOWP_MODES and _use_nki():
+        # float16 / bfloat16 on the NKI path: the whole transform (Bluestein's
+        # chirp products included) runs on fp32 copies, and the result is
+        # rounded once to the input dtype, as torch.fft returns it (#133).
+        return _half_via_fp32(x, lambda xf: fft_core(xf, inverse, plan, precision=prec))
+
     if plan is None:
         plan = create_plan(n, inverse=inverse)
 
@@ -66,6 +72,29 @@ def fft_core(
         return _cooley_tukey(x, inverse, precision=prec)
     else:
         return _bluestein(x, inverse, padded_n=plan.padded_n, precision=prec)
+
+
+_HALF_DTYPES = (torch.float16, torch.bfloat16)
+# Low-precision modes take half input on their own BF16 GEMM paths, and the
+# result is rounded to the input dtype there (trnfft#137 item 2); they are not
+# upcast at the top.
+_LOWP_MODES = ("bf16", "bf16_refined", "ozaki", "ozaki_hq")
+
+
+def _half_via_fp32(x: ComplexTensor, fn) -> ComplexTensor:
+    """Run ``fn`` on fp32 copies of a float16/bfloat16 ``x``; cast back (#133).
+
+    On Trn2 the half-precision kernels failed to lower (``nl.cast`` does not
+    exist in NKI 0.7) and, past the DFT-GEMM range, the Stockham and butterfly
+    stage kernels do not verify in half. Measured with the cast fixed, the
+    native half DFT-GEMM was 0.3 ms faster at N <= 1024 but up to 3x less
+    accurate, and from N = 2048 the fp32 route was both faster (fused
+    four-step) and more accurate. The upcast is exact; the result is rounded
+    once, to the input dtype, which is the dtype torch.fft returns.
+    """
+    dt = x.real.dtype
+    y = fn(ComplexTensor(x.real.float(), x.imag.float()))
+    return ComplexTensor(y.real.to(dt), y.imag.to(dt))
 
 
 def _cooley_tukey(x: ComplexTensor, inverse: bool, precision: str = "fast") -> ComplexTensor:
@@ -1964,6 +1993,13 @@ def _cooley_tukey_nki_nograd(
     # Requires FP32 product precision in nc_matmul; not available on trn1.
     if precision == "ozaki" and n <= min(_DFT_GEMM_THRESHOLD, _LOWP_GEMM_MAX):
         return _in_dtype(_ozaki_or_fallback(x, inverse, hq=False), dt)
+
+    # float16 / bfloat16 past the low-precision modes' ranges (fft_core upcasts
+    # every other half input first): fp32 kernels, result in the input dtype.
+    if x.real.dtype in _HALF_DTYPES:
+        return _half_via_fp32(
+            x, lambda xf: _cooley_tukey_nki_nograd(xf, inverse, precision=precision)
+        )
 
     # Batch-fused four-step (one launch per batch, trnfft#82 follow-up) from
     # _FOUR_STEP_FUSED_MIN to _FOUR_STEP_MAX; it beats the single GEMM there.

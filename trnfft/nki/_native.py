@@ -336,6 +336,27 @@ def _fft_backward(ctx, grad_re, grad_im):
 fft.register_autograd(_fft_backward, setup_context=_fft_setup_context)
 
 
+# The kernel each single-kernel op's body calls, as (module, attribute), for
+# the eager handle in `dispatch._native_call`; resolved there on first use
+# (the attributes exist only when nki is importable). `fft` runs a whole
+# driver and is not listed, so it always goes through the op.
+KERNELS = {
+    "complex_gemm": (_d, "_complex_gemm_kernel"),
+    "complex_gemm_bf16": (_d, "_complex_gemm_kernel_bf16"),
+    "complex_gemm_bf16_t2d": (_d, "_complex_gemm_bf16_t2d_kernel"),
+    "complex_gemm_tn": (_d, "_complex_gemm_tn_kernel"),
+    "complex_gemm_t2d": (_d, "_complex_gemm_t2d_kernel"),
+    "complex_linear": (_d, "_complex_linear_kernel"),
+    "complex_linear_t2d": (_d, "_complex_linear_t2d_kernel"),
+    "complex_mul": (_d, "_complex_mul_kernel"),
+    "butterfly_stage": (_bfly, "butterfly_stage_kernel"),
+    "butterfly_stage_kahan": (_bfly, "butterfly_stage_kernel_kahan"),
+    "stockham_radix4_stage": (_st, "stockham_radix4_stage_kernel"),
+    "stockham_radix8_w8": (_st, "stockham_radix8_w8_kernel"),
+    "stockham_radix8_w8_t2d": (_st, "stockham_radix8_w8_t2d_kernel"),
+    "four_step_fft": (_fs, "four_step_fft_kernel"),
+}
+
 # Keyed by the short op name used in `dispatch._launch`.
 OPS = {
     "complex_gemm": complex_gemm,
