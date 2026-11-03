@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and lnc=2.
   - **Benchmark.** `scripts/bench_sht.py`, with `--device` rows. See
     `docs/api/sht.md`.
+  - **Padded aten baseline.** `legendre="torch-padded"` (`PaddedLegendre`)
+    zero-pads the per-m problems into `buckets` size classes, one `torch.bmm`
+    each: 19 matmul shapes instead of 1023 at L = 1023, for 9.8 % more flops.
+    It is the `device-aten-pad` benchmark row. The unpadded `device-aten` row
+    needs `--allow-unpadded-aten`; `--count-shapes` prints both counts.
 
 ### Deprecated
 
