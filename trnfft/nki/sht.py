@@ -295,6 +295,9 @@ def _run(kernel, op_name: str, table: torch.Tensor, data: torch.Tensor, plan: st
     """One launch: simulator, native TorchNeuron, or XLA."""
     from . import dispatch as _d
 
+    # Structural dtype guard (trnsci#35), on every route (``_launch`` checks
+    # again): the kernels take float32 only.
+    _d._check_kernel_dtypes(op_name, (table, data))
     if _use_simulator():
         import numpy as np
 

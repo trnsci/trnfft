@@ -42,6 +42,10 @@ def _bf16(*shape):
     return _f32(*shape).astype(_np_bf16)
 
 
+def _f16(*shape):
+    return _f32(*shape).astype(np.float16)
+
+
 def _butterfly_inputs(b, n, stage):
     m = 1 << (stage + 1)
     rows = b * (n // m)
@@ -275,6 +279,40 @@ _CASES = {
         "sht",
         "sht_legendre_inverse_kernel",
         lambda: _sht_inputs(255, 64, "inverse", chunk=(100, 256)),
+    ),
+    # Half-precision outputs: PSUM -> SBUF converts in tensor_copy. These
+    # kernels used nl.cast, which NKI 0.7 does not have (trnfft#133).
+    "complex-gemm-bf16-out": (
+        "dispatch",
+        "_complex_gemm_kernel",
+        lambda: ((_bf16(200, 200), _bf16(200, 200), _bf16(200, 600), _bf16(200, 600)), {}),
+    ),
+    "complex-gemm-f16-out": (
+        "dispatch",
+        "_complex_gemm_kernel",
+        lambda: ((_f16(200, 200), _f16(200, 200), _f16(200, 600), _f16(200, 600)), {}),
+    ),
+    "complex-gemm-t2d-f16-out": (
+        "dispatch",
+        "_complex_gemm_t2d_kernel",
+        lambda: ((_f16(200, 200), _f16(200, 200), _f16(200, 600), _f16(200, 600)), {}),
+    ),
+    "complex-gemm-tn-bf16-out": (
+        "dispatch",
+        "_complex_gemm_tn_kernel",
+        lambda: ((_bf16(3 * 64, 128), _bf16(3 * 64, 128), _bf16(64, 64), _bf16(64, 64)), {}),
+    ),
+    # (The PE-transpose variant needs an fp32 transpose dst on trn1, so the
+    # fp16 case uses load_transpose2d.)
+    "stockham-r8-t2d-f16-out": (
+        "stockham",
+        "stockham_radix8_w8_t2d_kernel",
+        lambda: ((_f16(64, 8), _f16(64, 8), _f16(8, 8), _f16(8, 8)), {}),
+    ),
+    "stockham-r8-t2d-bf16-out": (
+        "stockham",
+        "stockham_radix8_w8_t2d_kernel",
+        lambda: ((_bf16(64, 8), _bf16(64, 8), _bf16(8, 8), _bf16(8, 8)), {}),
     ),
 }
 

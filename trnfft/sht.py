@@ -68,6 +68,7 @@ import numpy as np
 import torch
 
 from .complex import ComplexTensor
+from .nki.dispatch import _fp64_host_guard, _kernel_operands
 
 TILE = 128  # Tensor Engine partition tile, for both l and latitude
 
@@ -503,28 +504,46 @@ class SHT:
             return True
         from .nki.dispatch import _use_nki
 
-        return _use_nki() and self.dtype == torch.float32
+        return _use_nki()
+
+    def _latitude(self, direction: str, data: torch.Tensor) -> torch.Tensor:
+        """One latitude stage, on the kernel or in torch.
+
+        The kernels take float32 only, so a float64 plan follows the trnfft
+        float64 policy (#136) through ``dispatch._kernel_operands``: torch at
+        float64 under backend "auto", the kernel on float32 copies (result
+        cast back, one warning) under "nki", ``NotImplementedError`` under
+        ``TRNFFT_REQUIRE_NKI=1``. The torch stage moves float64 operands on
+        the neuron device to the host under "auto" (``_fp64_host_guard``).
+        """
+        torch_fn = legendre_forward_torch if direction == "forward" else legendre_inverse_torch
+        table = self.table
+        if self._use_nki_legendre():
+            from .nki import sht as _nki_sht
+
+            op = f"sht_legendre_{direction}"
+            (table, data), out_dtype, on_kernel = _kernel_operands(
+                table, data, op=op, what=f"SHT.{direction}"
+            )
+            if on_kernel:
+                nki_fn = getattr(_nki_sht, f"legendre_{direction}_nki")
+                out = nki_fn(table, data, self.lmax, self.H, self.plan)
+                return out if out_dtype is None else out.to(out_dtype)
+        return torch_fn(table, data, self.lmax, self.H)
 
     def legendre_forward(self, x: torch.Tensor) -> torch.Tensor:
         """Latitude analysis: ``X (2(L+1) H, 2F)`` -> ``a (n_alm, 2F)``."""
-        if self._use_nki_legendre():
-            from .nki.sht import legendre_forward_nki
-
-            return legendre_forward_nki(self.table, x, self.lmax, self.H, self.plan)
-        return legendre_forward_torch(self.table, x, self.lmax, self.H)
+        return self._latitude("forward", x)
 
     def legendre_inverse(self, a: torch.Tensor) -> torch.Tensor:
         """Latitude synthesis: ``a (n_alm, 2F)`` -> ``Y (2(L+1) H, 2F)``."""
-        if self._use_nki_legendre():
-            from .nki.sht import legendre_inverse_nki
-
-            return legendre_inverse_nki(self.table, a, self.lmax, self.H, self.plan)
-        return legendre_inverse_torch(self.table, a, self.lmax, self.H)
+        return self._latitude("inverse", a)
 
 
 # ── PyTorch latitude stage (the per-m aten GEMM loop) ───────────────────────
 
 
+@_fp64_host_guard("SHT.legendre_forward_torch")
 def legendre_forward_torch(table: torch.Tensor, x: torch.Tensor, lmax: int, H: int):
     """``a[rows(m, q)] = T_p @ X_p`` for every problem ``p = 2m + q``: one
     matmul per problem (the per-m aten loop of trnsci/trnsci#111)."""
@@ -542,6 +561,7 @@ def legendre_forward_torch(table: torch.Tensor, x: torch.Tensor, lmax: int, H: i
     return out
 
 
+@_fp64_host_guard("SHT.legendre_inverse_torch")
 def legendre_inverse_torch(table: torch.Tensor, a: torch.Tensor, lmax: int, H: int):
     """``Y_p = T_p^T @ a[rows(m, q)]`` for every problem ``p = 2m + q``."""
     L = lmax

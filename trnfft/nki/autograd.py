@@ -115,7 +115,9 @@ class _ComplexMulFn(torch.autograd.Function):
         from .dispatch import _complex_mul_kernel, _launch, _simulate_kernel, _use_simulator
 
         if _use_simulator():
-            c_real, c_imag = _simulate_kernel(_complex_mul_kernel, a_real, a_imag, b_real, b_imag)
+            c_real, c_imag = _simulate_kernel(
+                _complex_mul_kernel, a_real, a_imag, b_real, b_imag, op="complex_mul"
+            )
         else:
             c_real, c_imag = _launch(
                 _complex_mul_kernel, "complex_mul", a_real, a_imag, b_real, b_imag
@@ -151,7 +153,7 @@ class _ComplexGEMMFn(torch.autograd.Function):
         kernel_name, op_name = dispatch._gemm_kernel_names()
         kernel = getattr(dispatch, kernel_name)
         if _use_simulator():
-            c_real, c_imag = _simulate_kernel(kernel, a_real, a_imag, b_real, b_imag)
+            c_real, c_imag = _simulate_kernel(kernel, a_real, a_imag, b_real, b_imag, op=op_name)
         else:
             c_real, c_imag = _launch(kernel, op_name, a_real, a_imag, b_real, b_imag)
         ctx.save_for_backward(a_real, a_imag, b_real, b_imag)
@@ -187,7 +189,7 @@ class _ComplexLinearFn(torch.autograd.Function):
         kernel_name, op_name = dispatch._linear_kernel_names()
         kernel = getattr(dispatch, kernel_name)
         if _use_simulator():
-            y_real, y_imag = _simulate_kernel(kernel, x_real, x_imag, w_real, w_imag)
+            y_real, y_imag = _simulate_kernel(kernel, x_real, x_imag, w_real, w_imag, op=op_name)
         else:
             y_real, y_imag = _launch(kernel, op_name, x_real, x_imag, w_real, w_imag)
         ctx.save_for_backward(x_real, x_imag, w_real, w_imag)
