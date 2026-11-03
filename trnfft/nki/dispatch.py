@@ -784,12 +784,98 @@ def _to_host(t: torch.Tensor, device="cpu") -> torch.Tensor:
 _LAUNCH_LOCK = threading.Lock()
 
 
+# ── Eager call handles (native path) ─────────────────────────────────────────
+#
+# Same fix as trnblas#92. A `trnfft::` custom-op call costs ~0.10 ms of host
+# time before the kernel is queued; an aten op costs ~0.02 ms (trn2, SDK 2.33).
+# Most of the gap is per-call work that never changes for a given kernel:
+#   - nki's `Kernel.__call__` rebuilds the torch handle on every call
+#     (`inspect.signature`, a fresh `TorchNativeKernel` hashed into the
+#     registry, LNC resolution): ~0.06 ms;
+#   - the `torch.library` custom-op layer: ~0.01-0.02 ms.
+# So eager calls on plain neuron tensors build a handle once per kernel with
+# the public `torch_neuronx.wrap_nki` and call it directly (~0.02 ms). The
+# handle is gridless, so NKI resolves the LNC grid itself. Python ints (the
+# butterfly `n`, `stage`) pass through it unchanged, as through the op.
+# Only ops whose body is a single kernel call qualify: `_native.KERNELS`
+# names the kernel each one calls, and the handle wraps that kernel (not the
+# caller's), so it runs exactly what the op body runs. Composite ops (`fft`) are
+# not listed and keep the op.
+# Under torch.compile, for tensor subclasses (fake / functional), tensors that
+# require grad (the ops carry `register_autograd` backwards), and int64 inputs
+# (the custom op applies the TorchNeuron int64 policy), the custom op is used
+# as before. `TRNFFT_NKI_EAGER_HANDLE=0` turns the fast path off.
+
+_EAGER_HANDLE_ENABLED: bool = os.environ.get(
+    "TRNFFT_NKI_EAGER_HANDLE", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+# id(kernel) -> (kernel, handle); holding the kernel keeps its id unique.
+_eager_handles: dict[int, tuple[object, object]] = {}
+_wrap_nki: object = None  # torch_neuronx.wrap_nki, resolved on first use; False if absent
+
+
+def _eager_handle(kernel):
+    """Torch call handle for `kernel`, built once; None if unavailable."""
+    entry = _eager_handles.get(id(kernel))
+    if entry is not None:
+        return entry[1]
+    global _wrap_nki
+    if _wrap_nki is None:
+        try:
+            import torch_neuronx
+
+            _wrap_nki = getattr(torch_neuronx, "wrap_nki", False)
+        except ImportError:
+            _wrap_nki = False
+    if _wrap_nki is False or not hasattr(kernel, "func"):
+        return None  # no torch_neuronx.wrap_nki, or not an @nki.jit kernel
+    handle = _wrap_nki(kernel)
+    _eager_handles[id(kernel)] = (kernel, handle)
+    return handle
+
+
+def _eager_call_ok(tensors) -> bool:
+    """True when calling the cached handle is equivalent to the custom op."""
+    if not _EAGER_HANDLE_ENABLED or torch.compiler.is_compiling():
+        return False
+    for t in tensors:
+        if (
+            type(t) is not torch.Tensor
+            or t.device.type != _NEURON_DEVICE
+            or t.requires_grad
+            or t.dtype == torch.int64
+        ):
+            return False
+    return True
+
+
+def _native_call(op_name: str, args):
+    """Run `trnfft::<op_name>` on `args` (already on the device): through the
+    cached handle when that is equivalent (see above), else the custom op."""
+    ops = _get_native_ops()
+    if _eager_call_ok([a for a in args if isinstance(a, torch.Tensor)]):
+        handle = _eager_handle(_native_kernel(op_name))
+        if handle is not None:
+            return handle(*args)
+    return ops[op_name](*args)
+
+
+def _native_kernel(op_name: str):
+    """The kernel the `trnfft::<op_name>` op body calls (looked up now, as the
+    body does), or None for an op that is not a single kernel call."""
+    native = sys.modules.get(__package__ + "._native")  # loaded by _get_native_ops
+    entry = None if native is None else native.KERNELS.get(op_name)
+    return None if entry is None else getattr(entry[0], entry[1], None)
+
+
 def _launch(kernel, op_name: str, *args):
     """Run one kernel launch on the Neuron device; results return to the caller's device.
 
     ``args`` are the kernel's positional arguments: tensors and, for the
     butterfly kernels, Python ints. On the native path the tensors move to
-    ``device="neuron"`` and the ``trnfft::<op_name>`` custom op runs; the XLA
+    ``device="neuron"`` and the ``trnfft::<op_name>`` custom op runs (eager
+    calls on plain tensors skip the op layer through a cached handle, see
+    ``_native_call``); the XLA
     path moves them with ``_to_xla`` and calls ``kernel`` directly. Tensors
     already on the kernel device (the Stockham / butterfly drivers keep them
     there between stages) are not copied, and the result stays there.
@@ -797,14 +883,13 @@ def _launch(kernel, op_name: str, *args):
     tensors = [a for a in args if isinstance(a, torch.Tensor)]
     if _is_native():
         orig = tensors[0].device
-        op = _get_native_ops()[op_name]
         # A tensor already on ``neuron:k`` stays there (``.to("neuron")`` is a
         # no-op), so per-core shards launch on their own core (trnfft#54).
         moved = [a.to(_NEURON_DEVICE) if isinstance(a, torch.Tensor) else a for a in args]
         # NKI tracing on a dispatch-cache miss is not thread-safe (trnsolver#54);
         # the call only enqueues work, so serialising it keeps cores concurrent.
         with _LAUNCH_LOCK:
-            out = op(*moved)
+            out = _native_call(op_name, moved)
     else:
         moved, orig = _to_xla(*tensors)
         it = iter(moved)
