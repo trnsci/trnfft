@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Multicore host split with more cores than visible returned garbage
+  (#159).** On the native TorchNeuron path, `_batch_split_fft(x,
+  num_cores=k)` with host operands (also reached through `multi_core_fft`
+  with `set_multicore(True, num_cores=k)`, and through
+  `_stage_parallel_fft`) cut the batch into `k` shards but ran only the
+  shards that had a visible NeuronCore; the rows of the other shards were
+  never written, and there was no error. A request above the visible count
+  (`NEURON_RT_VISIBLE_CORES`) is now clamped to the visible cores with a
+  one-time `UserWarning`, as the rest of the suite clamps (trnsparse,
+  trnblas, trnrand, trnsolver), and `_neuron_dp_dispatch` raises rather
+  than drop a shard. Affected: 0.25.0 through 0.28.0 (the per-core host
+  split arrived in 0.25.0, #54). The CPU tests in `tests/test_multicore.py`
+  now take the CPU split on any host, so they no longer fail on a Neuron
+  host with few visible cores.
+
 ## [0.28.0] - 2026-11-04
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

@@ -6,8 +6,12 @@ CPU-runnable tests validate:
   - Core count clamping (batch < num_cores → uses batch count)
   - API surface: set_multicore, get_multicore, multi_core_fft
 
-Hardware-only tests (marked @pytest.mark.neuron) will be added once
-torch_neuronx.DataParallel dispatch is validated on trn1/trn2.
+The CPU tests run the sequential CPU split, also on a Neuron host: the
+autouse ``cpu_split_path`` fixture hides torch_neuronx from the module, so
+they never depend on how many NeuronCores are visible (trnfft#159).
+``TestVisibleCoreClamp`` fakes the native path with a chosen visible count.
+
+Hardware-only tests are marked ``@pytest.mark.neuron``.
 """
 
 import numpy as np
@@ -15,6 +19,8 @@ import pytest
 import torch
 
 from trnfft.complex import ComplexTensor
+from trnfft.nki import dispatch
+from trnfft.nki import multicore as mc
 from trnfft.nki.multicore import (
     _batch_split_fft,
     _factorize,
@@ -32,6 +38,19 @@ def reset_multicore():
     was_enabled = get_multicore()
     yield
     set_multicore(was_enabled)
+
+
+@pytest.fixture(autouse=True)
+def cpu_split_path(request, monkeypatch):
+    """CPU tests take the sequential CPU split, whatever the host.
+
+    On a Neuron host ``HAS_TORCH_NEURONX`` is True and the split would go to
+    the visible NeuronCores, so the results (and ``_resolve_num_cores``)
+    would depend on ``NEURON_RT_VISIBLE_CORES``. Neuron-marked tests keep
+    the real path.
+    """
+    if "neuron" not in request.keywords:
+        monkeypatch.setattr(mc, "HAS_TORCH_NEURONX", False)
 
 
 class TestMulticoreAPI:
@@ -326,3 +345,139 @@ class TestSixStepMulticore:
         from trnfft.nki.multicore import _split_range
 
         assert _split_range(total, parts) == expected
+
+
+@pytest.fixture
+def visible(monkeypatch):
+    """Fake native host path with ``visible(k)`` logical cores (CPU devices stand in)."""
+
+    def make(k: int) -> None:
+        monkeypatch.setattr(mc, "HAS_TORCH_NEURONX", True)
+        monkeypatch.setattr(dispatch, "_dispatch_path", "native")
+        monkeypatch.setattr(dispatch, "_use_simulator", lambda: False)
+        monkeypatch.setattr(dispatch, "_neuron_host_allocator", lambda: False)
+        monkeypatch.setattr(
+            mc, "_core_devices", lambda src, n: [torch.device("cpu")] * max(1, min(n, k))
+        )
+        mc._WARM.clear()
+        mc._CLAMP_WARNED.clear()
+
+    return make
+
+
+def _rel_to_torch(y, xr, xi, inverse=False):
+    xc = torch.complex(xr.double(), xi.double())
+    ref = torch.fft.ifft(xc) if inverse else torch.fft.fft(xc)
+    got = torch.complex(y.real.double(), y.imag.double())
+    return (torch.linalg.vector_norm(got - ref) / torch.linalg.vector_norm(ref)).item()
+
+
+class TestVisibleCoreClamp:
+    """More cores requested than visible (trnfft#159): clamp with one warning.
+
+    Before the fix the native host split made one shard per requested core
+    but only ran the shards that had a visible core, so the other rows of
+    the output were never written.
+    """
+
+    @pytest.mark.parametrize("batch,cores,vis", [(8, 4, 2), (6, 4, 3), (5, 8, 2), (4, 4, 1)])
+    def test_batch_split_clamped(self, visible, batch, cores, vis):
+        visible(vis)
+        g = torch.Generator().manual_seed(batch * 10 + cores)
+        xr, xi = torch.randn(batch, 64, generator=g), torch.randn(batch, 64, generator=g)
+        with pytest.warns(UserWarning, match=f"{cores} NeuronCores requested but {vis} visible"):
+            y = _batch_split_fft(ComplexTensor(xr, xi), inverse=False, num_cores=cores)
+        assert y.real.shape == (batch, 64)
+        assert _rel_to_torch(y, xr, xi) < 1e-5
+
+    def test_warns_once(self, visible, recwarn):
+        visible(2)
+        x = ComplexTensor(torch.randn(8, 64), torch.randn(8, 64))
+        for _ in range(3):
+            _batch_split_fft(x, inverse=False, num_cores=4)
+        assert sum("NeuronCores requested" in str(w.message) for w in recwarn.list) == 1
+
+    def test_within_visible_no_warning(self, visible, recwarn):
+        visible(4)
+        x = ComplexTensor(torch.randn(8, 64), torch.randn(8, 64))
+        _batch_split_fft(x, inverse=False, num_cores=4)
+        assert not any("NeuronCores requested" in str(w.message) for w in recwarn.list)
+
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_stage_parallel_clamped(self, visible, inverse):
+        visible(2)
+        g = torch.Generator().manual_seed(159)
+        xr, xi = torch.randn(1024, generator=g), torch.randn(1024, generator=g)
+        with pytest.warns(UserWarning, match="NeuronCores requested"):
+            y = _stage_parallel_fft(ComplexTensor(xr, xi), num_cores=8, inverse=inverse)
+        assert _rel_to_torch(y, xr, xi, inverse) < 1e-5
+
+    def test_dispatch_rejects_more_shards_than_cores(self, visible):
+        visible(2)
+        shards = torch.randn(6, 64).chunk(3)
+        with pytest.raises(ValueError, match="3 shards for 2 visible"):
+            mc._neuron_dp_dispatch(shards, shards, 64, False, 3)
+
+    def test_batch_within_visible_no_warning(self, visible, recwarn):
+        """8 requested, 2 visible, but a batch of 2 needs only 2 shards."""
+        visible(2)
+        x = ComplexTensor(torch.randn(2, 64), torch.randn(2, 64))
+        _batch_split_fft(x, inverse=False, num_cores=8)
+        assert not any("NeuronCores requested" in str(w.message) for w in recwarn.list)
+
+
+@pytest.mark.neuron
+class TestVisibleCoreClampNeuron:
+    """On hardware: request more cores than ``NEURON_RT_VISIBLE_CORES`` exposes
+    and check host-operand results against torch.fft (trnfft#159)."""
+
+    @pytest.mark.parametrize("batch,n", [(16, 256), (7, 1024), (64, 4096)])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_batch_split_over_visible(self, nki_backend, batch, n, inverse):
+        import torch_neuronx
+
+        vis = torch_neuronx.device_count()
+        cores = vis + 3
+        g = torch.Generator().manual_seed(batch + n)
+        xr, xi = torch.randn(batch, n, generator=g), torch.randn(batch, n, generator=g)
+        mc._CLAMP_WARNED.clear()
+        for _ in range(2):  # first call runs the shards in turn, then concurrently
+            with pytest.warns(UserWarning, match=f"{cores} NeuronCores requested but {vis}"):
+                mc._CLAMP_WARNED.clear()
+                y = _batch_split_fft(ComplexTensor(xr, xi), inverse=inverse, num_cores=cores)
+            assert y.real.device.type == "cpu" and y.real.shape == (batch, n)
+            assert _rel_to_torch(y, xr, xi, inverse) < 1e-5
+
+    @pytest.mark.parametrize("n", [1024, 4096])
+    @pytest.mark.parametrize("inverse", [False, True])
+    def test_stage_parallel_over_visible(self, nki_backend, n, inverse):
+        import torch_neuronx
+
+        cores = torch_neuronx.device_count() + 3
+        g = torch.Generator().manual_seed(n)
+        xr, xi = torch.randn(n, generator=g), torch.randn(n, generator=g)
+        mc._CLAMP_WARNED.clear()
+        with pytest.warns(UserWarning, match="NeuronCores requested"):
+            y = _stage_parallel_fft(ComplexTensor(xr, xi), num_cores=cores, inverse=inverse)
+        assert y.real.device.type == "cpu"
+        assert _rel_to_torch(y, xr, xi, inverse) < 1e-5
+
+    @pytest.mark.parametrize("cores", [2, 3, 4])
+    def test_batch_split_within_visible(self, nki_backend, cores):
+        """k <= visible on host operands: every shard on its own core, no warning."""
+        import warnings
+
+        import torch_neuronx
+
+        if torch_neuronx.device_count() < cores:
+            pytest.skip(f"needs >= {cores} visible NeuronCores (NEURON_RT_VISIBLE_CORES)")
+        g = torch.Generator().manual_seed(cores)
+        xr, xi = torch.randn(37, 1024, generator=g), torch.randn(37, 1024, generator=g)
+        for inverse in (False, True):
+            for _ in range(2):
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("error", message=".*NeuronCores requested.*")
+                    y = _batch_split_fft(ComplexTensor(xr, xi), inverse=inverse, num_cores=cores)
+                assert _rel_to_torch(y, xr, xi, inverse) < 1e-5
+            y = _stage_parallel_fft(ComplexTensor(xr[0], xi[0]), num_cores=cores, inverse=inverse)
+            assert _rel_to_torch(y, xr[0], xi[0], inverse) < 1e-5

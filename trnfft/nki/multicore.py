@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import warnings
 from typing import TYPE_CHECKING
 
 import torch
@@ -230,7 +231,9 @@ def _batch_split_fft(x: ComplexTensor, inverse: bool, num_cores: int) -> Complex
 
     On the native TorchNeuron path a host-resident batch is split into
     ``num_cores`` shards, shard ``i`` on ``neuron:i`` with its own host thread
-    (:func:`_neuron_dp_dispatch`). A batch already on a NeuronCore is not
+    (:func:`_neuron_dp_dispatch`). ``num_cores`` above the visible
+    NeuronCores is clamped to the visible count, with a one-time
+    ``UserWarning`` (trnfft#159). A batch already on a NeuronCore is not
     split: the other cores could only be reached through the host, and on
     Trn2 that staging cost 15-20x the single-core transform (trnfft#54). To
     use several cores, place the shards on ``neuron:0..k-1`` yourself and call
@@ -252,14 +255,28 @@ def _batch_split_fft(x: ComplexTensor, inverse: bool, num_cores: int) -> Complex
     if actual_cores <= 1 or real.device.type == "neuron":
         return fft_core(x, inverse=inverse)
 
+    native_host = False
+    if HAS_TORCH_NEURONX:
+        from .dispatch import _host_empty, _is_native, _use_simulator
+
+        native_host = real.device.type == "cpu" and _is_native() and not _use_simulator()
+        if native_host:
+            # One shard per visible core: shard i runs on neuron:i, so a
+            # request above the visible count is clamped before the split
+            # (trnfft#159; the extra shards were never computed).
+            visible = len(_core_devices(real.device, num_cores))
+            if actual_cores > visible:
+                _warn_clamped(num_cores, visible)
+                actual_cores = visible
+                if actual_cores <= 1:
+                    return fft_core(x, inverse=inverse)
+
     # Split batch into shards.
     real_shards = real.chunk(actual_cores, dim=0)
     imag_shards = imag.chunk(actual_cores, dim=0)
 
     if HAS_TORCH_NEURONX:
-        from .dispatch import _host_empty, _is_native, _use_simulator
-
-        if real.device.type == "cpu" and _is_native() and not _use_simulator():
+        if native_host:
             # Each shard's result is copied straight into its rows of one host
             # output (from the caching host allocator when large),
             # instead of into fresh pageable shards that are concatenated.
@@ -280,6 +297,27 @@ def _batch_split_fft(x: ComplexTensor, inverse: bool, num_cores: int) -> Complex
     out_real = torch.cat([r.real for r in results], dim=0)
     out_imag = torch.cat([r.imag for r in results], dim=0)
     return ComplexTensor(out_real, out_imag)
+
+
+# Requests above the visible core count that were clamped (warned once each).
+_CLAMP_WARNED: set[tuple[int, int]] = set()
+
+
+def _warn_clamped(requested: int, visible: int) -> None:
+    """Warn once per (requested, visible) that a split uses only the visible cores.
+
+    As the rest of the suite does (trnsparse ``_kmv_core_count``, trnblas and
+    trnrand ``set_cores``, trnsolver ``TRNSOLVER_EIGH_CORES``), a request
+    above the visible count uses every visible core instead of failing.
+    """
+    if (requested, visible) not in _CLAMP_WARNED:
+        _CLAMP_WARNED.add((requested, visible))
+        warnings.warn(
+            f"trnfft multicore: {requested} NeuronCores requested but {visible} visible "
+            f"(NEURON_RT_VISIBLE_CORES); using {visible}.",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 _POOL = None
@@ -344,7 +382,14 @@ def _neuron_dp_dispatch(
 
     src = real_shards[0].device
     devices = _core_devices(src, num_cores)
-    k = min(len(devices), len(real_shards))
+    if len(real_shards) > len(devices):
+        # Each shard needs its own core; a dropped shard would leave its
+        # rows of ``out`` unwritten (trnfft#159). ``_batch_split_fft`` clamps.
+        raise ValueError(
+            f"{len(real_shards)} shards for {len(devices)} visible NeuronCores; "
+            "split into at most one shard per visible core"
+        )
+    k = len(real_shards)
 
     starts = [0]
     for r in real_shards[:k]:
