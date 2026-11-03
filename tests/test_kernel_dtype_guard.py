@@ -154,6 +154,14 @@ class _Composite:
 
 def _fake_torch_neuronx():
     mod = types.ModuleType("torch_neuronx")
+    real = sys.modules.get("torch_neuronx")
+    if real is not None:
+        # On a Neuron host the real runtime keeps reading module state from
+        # `sys.modules["torch_neuronx"]` while the stand-in is installed (e.g.
+        # `torch.manual_seed` -> `torch_neuronx._is_in_bad_fork`), so the
+        # stand-in starts as a copy of the real module; `__spec__`, `nki_op`
+        # and `device_count` are replaced below.
+        mod.__dict__.update({k: v for k, v in vars(real).items() if not k.startswith("__")})
     mod.__spec__ = importlib.machinery.ModuleSpec("torch_neuronx", None)
 
     def nki_op(name, fn=None, mutates_args={}, fake_fn=None):  # noqa: B006
