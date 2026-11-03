@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-11-04
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: spherical harmonic transforms, `trnfft.sht` (#148, trnsci/trnsci#111); float16/bfloat16 input on the NKI path fixed (#133); float64 `ComplexConv1d` on device fixed (#134); cached eager NKI handles; and the trnsci float64 policy with a dtype guard at the kernel boundary. Deprecations: a repeated `dim` in the n-D transforms (#127) and the `stft`/`istft` `window=None` default (#106).
+
 Lands in the next release (0.28.0). Needs device validation on Trn2.
 
 ### Changed
