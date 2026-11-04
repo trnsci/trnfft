@@ -182,7 +182,7 @@ NKI vs PyTorch on the same Trainium instance — see the [benchmarks page](https
 
 ## Known issues in earlier releases
 
-Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Upgrade to the "fixed in" release or later. Details in the [CHANGELOG](CHANGELOG.md).
+Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-04 releases. Upgrade to the "fixed in" release or later. Details in the [CHANGELOG](CHANGELOG.md).
 
 | Bug | Affected versions | Fixed in |
 |---|---|---|
@@ -195,6 +195,8 @@ Silent wrong-result bugs fixed in the 2026-10-31 to 2026-11-02 releases. Upgrade
 | `nn.ComplexModReLU` applied its bias along the last dim instead of dim 1 for `(B, C, L)` input (#115) | 0.1.0 – 0.26.0 | 0.27.0 |
 | `fftn` / `ifftn` with `dim=()` returned a view of the input, not a copy (#116) | 0.2.0 – 0.26.0 | 0.27.0 |
 | A negative `n` / `s` sliced the input (e.g. `n=-1` dropped the last sample) instead of keeping the size or raising (#123) | ≤ 0.26.0 | 0.27.0 |
+| `complex_gemm`, `complex_mask_apply` and `complex_gemm_bf16` with float64 operands on the NKI backend passed them to the FP32 kernels and returned inf/NaN (trnsci/trnsci#35) | ≤ 0.27.0 | 0.28.0 |
+| Multicore host split (`multi_core_fft` with `set_multicore(True, num_cores=k)`, `_batch_split_fft`, `_stage_parallel_fft`) with more cores requested than visible left the extra shards' rows unwritten (garbage) on the native TorchNeuron path (#159) | 0.25.0 – 0.28.0 | 0.28.1 |
 
 ## Related projects in the trnsci suite
 
