@@ -14,6 +14,7 @@ FFT stages; measured 1-3e-7 at L = 127..1023).
 
 from __future__ import annotations
 
+import gc
 import math
 
 import numpy as np
@@ -549,8 +550,18 @@ def test_device_kernels_match_fp64(lmax, nfields):
         s = SHT(lmax, legendre="nki", device="neuron")
         alm = _random_alm(lmax, nfields, seed=5)
         ref_f = _ducc_synthesis(alm, lmax, "GL", s.nlat, s.nlon)
-        a = s.forward(torch.from_numpy(ref_f).float().to("neuron"))
+        x = torch.from_numpy(ref_f).float().to("neuron")
+        a = s.forward(x)
         assert _rel(_np(ComplexTensor(a.real.cpu(), a.imag.cpu())), alm) < FP32_TOL
+        # At LNC=1, L = 1023 the forward's operands and the allocator blocks
+        # they leave cached (14 GiB reserved) plus the inverse's 13 GiB peak
+        # exceed one physical core's HBM (NRT_RESOURCE on a 1 GiB alloc), so
+        # release them first (trnfft#152, #156).
+        del x, a
+        gc.collect()
+        empty_cache = getattr(getattr(torch, "neuron", None), "empty_cache", None)
+        if empty_cache is not None:
+            empty_cache()
         re = torch.from_numpy(alm.real.copy()).float().to("neuron")
         im = torch.from_numpy(alm.imag.copy()).float().to("neuron")
         f = s.inverse(ComplexTensor(re, im))
