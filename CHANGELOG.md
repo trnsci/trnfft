@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`irfft` on the neuron device spent ~98 % of its time in `torch.flip`
+  (#156).** The Hermitian fill reversed the one-sided bins with two
+  last-axis `torch.flip`s, and on the device each costs about 1 s (970 ms for
+  one flip of (256, 512, 511) fp32 on Trn2). `irfft` (and so `hfft`,
+  `irfftn` / `irfft2` and the onesided `istft`) now weights the
+  `n // 2 + 1` bins by (1, 2, ..., 2, 1), zero-pads them to `n` and keeps
+  the real part of the inverse: the same linear map, with no flip or
+  gather, so float64 stays exact on every route and the fp64 policy is
+  unchanged. On Trn2 (LNC=2, one logical core, warm) `irfft` of
+  (256, 512, 513) to 1024 goes from 1997 ms to 38 ms, and the SHT inverse
+  at L = 511 from 1002 ms to 34 ms (F = 128) and from 8015 ms to 280 ms
+  (F = 1024 in chunks of 256), now below the forward.
+
 - **`scripts/bench_sht.py` reported a warm time as `inv cold s`.** The first
   inverse call (which makes the forward's input) ran before the timed one; it
   is now the cold measurement.
