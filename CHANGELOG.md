@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-11-04
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: `irfft` on the device no longer calls `torch.flip` (#156, #162): (256, 512, 513) → 1024 drops from 1997 ms to 38 ms, and the SHT inverse at L = 511 drops from 1002 ms to 34 ms. Also new: the padded aten baseline `legendre="torch-padded"` for the SHT latitude stage (#157).
+
 ### Added
 
 - **Padded aten baseline for the SHT latitude stage (#157,
