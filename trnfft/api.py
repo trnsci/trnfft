@@ -128,19 +128,7 @@ def irfft(
         pad = (0, half - re.shape[-1])
         re, im = torch.nn.functional.pad(re, pad), torch.nn.functional.pad(im, pad)
 
-    # Reconstruct full spectrum via Hermitian symmetry
-    full_re = torch.zeros(*x.shape[:-1], n, dtype=x.dtype, device=x.device)
-    full_im = torch.zeros(*x.shape[:-1], n, dtype=x.dtype, device=x.device)
-    full_re[..., :half] = re
-    full_im[..., :half] = im
-    # X[n-k] = conj(X[k]) for k=1..n-half
-    if n > 1:
-        # Indices n-1, n-2, ..., half correspond to conj of indices 1, 2, ..., n-half
-        num_neg = n - half
-        full_re[..., half:] = torch.flip(re[..., 1 : 1 + num_neg], dims=[-1])
-        full_im[..., half:] = -torch.flip(im[..., 1 : 1 + num_neg], dims=[-1])
-
-    result = fft_core(ComplexTensor(full_re, full_im), inverse=True)
+    result = fft_core(_hermitian_onesided(re, im, n), inverse=True)
     return _swap_last(_apply_norm(result.real, norm, n, inverse=True), d)
 
 
@@ -578,24 +566,11 @@ def istft(
     spec_re = input.real.transpose(-2, -1)
     spec_im = input.imag.transpose(-2, -1)
 
-    # Reconstruct full spectrum if onesided
+    # Onesided: weight and zero-pad the n_fft // 2 + 1 bins; the real part of
+    # their inverse is the Hermitian inverse (see _hermitian_onesided, #156).
     if onesided:
-        freq_bins = spec_re.shape[-1]
-        full_n = n_fft
-        full_re = torch.zeros(
-            *spec_re.shape[:-1], full_n, dtype=spec_re.dtype, device=spec_re.device
-        )
-        full_im = torch.zeros(
-            *spec_im.shape[:-1], full_n, dtype=spec_im.dtype, device=spec_im.device
-        )
-        full_re[..., :freq_bins] = spec_re
-        full_im[..., :freq_bins] = spec_im
-        if full_n > 1:
-            num_neg = full_n - freq_bins
-            full_re[..., freq_bins:] = torch.flip(spec_re[..., 1 : 1 + num_neg], dims=[-1])
-            full_im[..., freq_bins:] = -torch.flip(spec_im[..., 1 : 1 + num_neg], dims=[-1])
-        spec_re = full_re
-        spec_im = full_im
+        full = _hermitian_onesided(spec_re, spec_im, n_fft)
+        spec_re, spec_im = full.real, full.imag
 
     # IFFT each frame
     num_frames = spec_re.shape[-2]
@@ -674,6 +649,34 @@ def _promote_real(x: torch.Tensor) -> torch.Tensor:
     if x.is_floating_point() or x.is_complex():
         return x
     return x.to(torch.get_default_dtype())
+
+
+def _hermitian_onesided(re: torch.Tensor, im: torch.Tensor, n: int) -> ComplexTensor:
+    """The length-``n`` spectrum whose inverse DFT has the c2r result as its
+    real part, built from the ``n // 2 + 1`` one-sided bins ``re`` / ``im``
+    (last axis) without reversing them (#156).
+
+    For Hermitian ``X``, ``x[j] = sum_k X[k] e^{2 pi i jk/n}`` is
+    ``Re sum_{k <= n//2} w_k X[k] e^{2 pi i jk/n}`` with ``w_0 = 1``,
+    ``w_{n/2} = 1`` for even ``n`` and ``w_k = 2`` otherwise: bin ``n - k``
+    contributes the conjugate of bin ``k``'s term. So the one-sided bins are
+    weighted and zero-padded to ``n``, and the caller keeps the real part of
+    the inverse. That is the same linear map of ``(re, im)`` as filling the
+    negative frequencies with ``conj(X[k])`` (the imaginary parts of the DC
+    and Nyquist bins drop out either way, as in torch.fft.irfft), but it has
+    no ``torch.flip``: on the neuron device a last-axis flip costs about
+    1 s at (256, 512, 511) fp32, 25x the inverse FFT itself.
+
+    The weights are exact (1 and 2), so float64 stays exact on every route.
+    """
+    half = re.shape[-1]
+    w = torch.full((half,), 2.0, dtype=re.dtype)
+    w[0] = 1.0
+    if n % 2 == 0:
+        w[-1] = 1.0
+    w = w.to(re.device)
+    pad = (0, n - half)
+    return ComplexTensor(torch.nn.functional.pad(re * w, pad), torch.nn.functional.pad(im * w, pad))
 
 
 def _to_complex(x) -> ComplexTensor:

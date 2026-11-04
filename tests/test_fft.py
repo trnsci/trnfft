@@ -2029,3 +2029,109 @@ def test_fftn_empty_dim_returns_copy(op):
     torch.testing.assert_close(y.imag, torch.zeros_like(x))
     y.real.add_(1.0)
     assert torch.equal(x, before)
+
+
+class TestIrfftHermitianFill:
+    """irfft / istft build the c2r input without torch.flip (#156): the
+    one-sided bins are weighted (1, 2, ..., 2, 1) and zero-padded, and the
+    real part of the inverse is kept. On the neuron device each last-axis
+    flip of the old Hermitian fill cost about 1 s at (256, 512, 511)."""
+
+    @staticmethod
+    def _no_flip(monkeypatch):
+        # Batched flips only: Bluestein (odd n) still reverses its 1-D chirp.
+        flip = torch.flip
+
+        def checked(t, *a, **k):
+            if t.dim() > 1:
+                raise AssertionError(f"torch.flip of a {tuple(t.shape)} tensor")
+            return flip(t, *a, **k)
+
+        monkeypatch.setattr(torch, "flip", checked)
+
+    @pytest.mark.parametrize("n", [1, 2, 3, 8, 15, 16, 17, 1024])
+    @pytest.mark.parametrize("norm", [None, "ortho", "forward"])
+    def test_float64_matches_torch_without_flip(self, monkeypatch, n, norm):
+        g = torch.Generator().manual_seed(n)
+        L = n // 2 + 1
+        # Arbitrary (non-Hermitian) DC / Nyquist imaginary parts: torch.fft
+        # ignores them, and so must the weighted fill.
+        X = torch.complex(
+            torch.randn(4, 3, L, generator=g, dtype=torch.float64),
+            torch.randn(4, 3, L, generator=g, dtype=torch.float64),
+        )
+        self._no_flip(monkeypatch)
+        got = trnfft.irfft(ComplexTensor(X.real, X.imag), n=n, norm=norm)
+        monkeypatch.undo()
+        want = torch.fft.irfft(X, n=n, norm=norm)
+        assert got.dtype == torch.float64
+        assert got.shape == want.shape
+        np.testing.assert_allclose(got.numpy(), want.numpy(), rtol=0, atol=1e-12)
+
+    @pytest.mark.parametrize("dim", [0, 1, -1])
+    def test_float32_dim_matches_torch(self, dim):
+        g = torch.Generator().manual_seed(156)
+        X = torch.complex(torch.randn(9, 10, 11, generator=g), torch.randn(9, 10, 11, generator=g))
+        got = trnfft.irfft(ComplexTensor(X.real, X.imag), n=16, dim=dim)
+        want = torch.fft.irfft(X, n=16, dim=dim)
+        np.testing.assert_allclose(got.numpy(), want.numpy(), atol=1e-5)
+
+    def test_issue_shape_1024(self, monkeypatch):
+        # The #156 shape, scaled down in the batch: (F, nlat, 513) -> 1024.
+        g = torch.Generator().manual_seed(1024)
+        X = torch.complex(torch.randn(2, 8, 513, generator=g), torch.randn(2, 8, 513, generator=g))
+        self._no_flip(monkeypatch)
+        got = trnfft.irfft(ComplexTensor(X.real, X.imag), n=1024, norm="forward")
+        monkeypatch.undo()
+        want = torch.fft.irfft(X.to(torch.complex128), n=1024, norm="forward")
+        rel = torch.linalg.vector_norm(got.double() - want) / torch.linalg.vector_norm(want)
+        assert rel < 1e-6
+
+    def test_gradient_matches_torch(self):
+        g = torch.Generator().manual_seed(7)
+        re = torch.randn(3, 9, generator=g, dtype=torch.float64, requires_grad=True)
+        im = torch.randn(3, 9, generator=g, dtype=torch.float64, requires_grad=True)
+        w = torch.randn(3, 16, generator=g, dtype=torch.float64)
+        (trnfft.irfft(ComplexTensor(re, im), n=16) * w).sum().backward()
+        ours = (re.grad.clone(), im.grad.clone())
+        re.grad = im.grad = None
+        (torch.fft.irfft(torch.complex(re, im), n=16) * w).sum().backward()
+        torch.testing.assert_close(ours[0], re.grad, rtol=0, atol=1e-12)
+        torch.testing.assert_close(ours[1], im.grad, rtol=0, atol=1e-12)
+
+    def test_istft_without_flip(self, monkeypatch):
+        g = torch.Generator().manual_seed(3)
+        x = torch.randn(2, 1024, generator=g, dtype=torch.float64)
+        win = torch.hann_window(256, dtype=torch.float64)
+        S = trnfft.stft(x, n_fft=256, hop_length=64, window=win)
+        self._no_flip(monkeypatch)
+        y = trnfft.istft(S, n_fft=256, hop_length=64, window=win, length=1024)
+        monkeypatch.undo()
+        Z = torch.stft(x, n_fft=256, hop_length=64, window=win, return_complex=True)
+        want = torch.istft(Z, n_fft=256, hop_length=64, window=win, length=1024)
+        np.testing.assert_allclose(y.numpy(), want.numpy(), atol=1e-10)
+
+
+@pytest.mark.neuron
+class TestIrfftHermitianFillNeuron:
+    """irfft on the device at the SHT inverse-longitude shapes (#156), against
+    torch.fft.irfft in float64 on the host."""
+
+    @pytest.mark.parametrize(
+        "shape,n", [((256, 512, 513), 1024), ((64, 1024, 1025), 2048), ((16, 300), 598)]
+    )
+    @pytest.mark.parametrize("backend", ["auto", "nki"])
+    def test_irfft_vs_torch(self, backend, shape, n):
+        g = torch.Generator().manual_seed(156)
+        re = torch.randn(*shape, generator=g)
+        im = torch.randn(*shape, generator=g)
+        trnfft.set_backend(backend)
+        try:
+            y = trnfft.irfft(ComplexTensor(re.to("neuron"), im.to("neuron")), n=n, norm="forward")
+            got = y.cpu().double()
+        finally:
+            trnfft.set_backend("auto")
+        want = torch.fft.irfft(torch.complex(re.double(), im.double()), n=n, norm="forward")
+        rel = (torch.linalg.vector_norm(got - want) / torch.linalg.vector_norm(want)).item()
+        assert got.shape == want.shape
+        assert rel < 1e-5, f"irfft {shape} -> {n}: rel err {rel:.2e}"
