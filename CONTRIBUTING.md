@@ -56,6 +56,17 @@ Before opening a PR:
 - [ ] If you added a public symbol, the project's `docs/api.md` lists it
 - [ ] PR description says *what* changed and *why*, not just *what*
 
+## Releasing
+
+`.github/workflows/publish.yml` publishes to PyPI (trusted publishing) when a GitHub Release is published. A tag containing `-` (`vX.Y.Z-rc1`) goes to TestPyPI.
+
+- [ ] Release PR (`release: vX.Y.Z`): bump `version` in `pyproject.toml` and `__version__` in `trnfft/__init__.py`, and move the `[Unreleased]` CHANGELOG entries under `## [X.Y.Z] - YYYY-MM-DD`.
+- [ ] After the merge, run `gh release create vX.Y.Z --target <merge sha>`, then confirm the publish run and the new version on PyPI.
+- [ ] **Update umbrella docs/extras** in one [trnsci/trnsci](https://github.com/trnsci/trnsci) PR:
+  - if users should require this release (always for a fix to silent wrong results), bump `trnfft` in the umbrella `pyproject.toml` `[fft]` and `[all]` extras, and cut a `trnsci` meta-package release;
+  - update the `[[described:trnfft=X.Y.Z]]` rows in `docs/roadmap.md` and `docs/nki_validation_status.md`, with the [#35](https://github.com/trnsci/trnsci/issues/35) Trn2 validation link;
+  - check that `python scripts/check_docs_drift.py` exits 0. The weekly docs-drift workflow opens a `docs-stale` issue for anything missed.
+
 ## Issues
 
 Label each issue one of: `bug`, `feature`, `question`, `docs`, `infra`. Bugs include repro steps and expected-vs-actual output. Features describe the use case.
