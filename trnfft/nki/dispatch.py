@@ -37,7 +37,8 @@ from ..complex import ComplexTensor, complex_matmul
 PMAX = 128  # Max partition dimension (systolic array rows)
 # SBUF bytes per partition the complex linear kernel may spend on keeping
 # W^T resident for the whole launch (``_complex_gemm_tiles``): three planes of
-# ceil(in/128) * out elements. 64 KiB of the 192 KiB: FP32 W of (512, 1024) or
+# ceil(in/128) * out elements. 64 KiB of the 192 KiB per partition on Trn1
+# (224 KiB on Trn2, about 207 KiB allocatable by NKI): FP32 W of (512, 1024) or
 # (1024, 512) fits, (1024, 1024) keeps the per-tile transposes.
 _HOIST_SBUF_BYTES = 64 * 1024
 
