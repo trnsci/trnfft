@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Testing
+
+- **Device conformance runs are signal-only (trnsci/trnsci#35).** Under
+  `--backend nki` with a non-CPU `--conformance-device`, the known platform
+  case `test_complex_conv1d[1-stride=3,padding=2]` (device
+  `aten::convolution`, #155) is marked `xfail(strict=False)` at run time by a
+  rule (length-1 input, stride > 1, padding > 0), so a new failure is the only
+  red and a fix shows as XPASS. CPU runs are unchanged. A device run prints
+  passed, xfailed / XPASS by category and NEW failures;
+  `--conformance-json PATH` writes it, and `scripts/conformance_expect.py`
+  merges chunked runs (exit 1 on NEW failures).
+
 ## [0.29.0] - 2026-11-04
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
