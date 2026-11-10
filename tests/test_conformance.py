@@ -93,6 +93,48 @@ def _conformance_backend(request):
     _STATE["backend"], _STATE["device"] = "pytorch", torch.device("cpu")
 
 
+# ----------------------------------------------------------------- device-known
+# Device conformance runs (``--backend nki --conformance-device neuron``) hit
+# known platform limits. Each category has one tracking issue, and its cases
+# are marked ``xfail(strict=False)`` at run time, on device runs only (the
+# trnsci/trnsolver#146 pattern, trnsci/trnsci#35). A new failure is then the
+# only red; a category that starts passing shows as XPASS, a signal and not a
+# failure. CPU CI (and any CPU run) still runs these cases and must pass them.
+# The reason starts ``[device-known:<category>]``; tests/conftest.py prints a
+# per-category summary, and scripts/conformance_expect.py merges chunked runs.
+DEVICE_KNOWN = {
+    "conv1d-len1-stride-pad": (
+        "trnsci/trnfft#155",
+        "device aten::convolution fails to compile for a length-1 input with "
+        "stride > 1 and padding > 0 (any dtype)",
+    ),
+}
+
+
+def _device_known_category(node) -> str | None:
+    """The DEVICE_KNOWN category of a collected conformance case, or None."""
+    callspec = getattr(node, "callspec", None)
+    params = callspec.params if callspec is not None else {}
+    name = getattr(node, "originalname", node.name)
+    if name == "test_complex_conv1d":
+        kw = params.get("kw", {})
+        if params.get("length") == 1 and kw.get("stride", 1) > 1 and kw.get("padding", 0) > 0:
+            return "conv1d-len1-stride-pad"
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _device_known_xfail(request, _conformance_backend):
+    if _STATE["backend"] != "nki" or _STATE["device"].type == "cpu":
+        return
+    cat = _device_known_category(request.node)
+    if cat is not None:
+        issue, what = DEVICE_KNOWN[cat]
+        request.applymarker(
+            pytest.mark.xfail(strict=False, reason=f"[device-known:{cat}] {issue}: {what}")
+        )
+
+
 def on_reference_path() -> bool:
     return _STATE["backend"] == "pytorch" and _STATE["device"].type == "cpu"
 
