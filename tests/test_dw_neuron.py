@@ -43,7 +43,8 @@ SIZES = [1 << m for m in range(1, 13)]
 def _input(B, n, seed, spread=20):
     rng = np.random.default_rng(seed)
     x = rng.standard_normal((B, n)) + 1j * rng.standard_normal((B, n))
-    x *= 2.0 ** rng.integers(-spread, spread, (B, 1))
+    if spread:  # rng.integers(0, 0) raises (high <= 0)
+        x *= 2.0 ** rng.integers(-spread, spread, (B, 1))
     return dw.to_dw(torch.from_numpy(x))
 
 
