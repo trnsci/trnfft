@@ -210,8 +210,11 @@ if HAS_NKI:
         for m in nl.affine_range(n_partition_tiles):
             m_off = m * groups_chunk
 
-            psum_cr = nl.zeros((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.psum)
-            psum_ci = nl.zeros((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            # Each tile's first matmul opens it (accumulate=False): on
+            # NeuronCore-v3 a matmul must not accumulate onto PSUM that
+            # nl.zeros / memset initialised (trnsci/trnsci#185).
+            psum_cr = nl.ndarray((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            psum_ci = nl.ndarray((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
             # (groups_chunk, 8) plain load, then (8, groups_chunk) on the PE.
             a_r = nl.load(a_re[m_off : m_off + groups_chunk, :TILE_K])
@@ -226,11 +229,11 @@ if HAS_NKI:
             nisa.tensor_copy(dst=ai_t, src=pt_i)
 
             # C_real = A_real @ W_8_real - A_imag @ W_8_imag
-            nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=w8_r, accumulate=True)
+            nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=w8_r, accumulate=False)
             nisa.nc_matmul(dst=psum_cr, stationary=ai_t, moving=neg_w8_i, accumulate=True)
 
             # C_imag = A_real @ W_8_imag + A_imag @ W_8_real
-            nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=w8_i, accumulate=True)
+            nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=w8_i, accumulate=False)
             nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=w8_r, accumulate=True)
 
             # PSUM (FP32) -> SBUF in the output dtype: tensor_copy converts on the
@@ -281,8 +284,11 @@ if HAS_NKI:
         for m in nl.affine_range(n_partition_tiles):
             m_off = m * groups_chunk
 
-            psum_cr = nl.zeros((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.psum)
-            psum_ci = nl.zeros((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            # Each tile's first matmul opens it (accumulate=False): on
+            # NeuronCore-v3 a matmul must not accumulate onto PSUM that
+            # nl.zeros / memset initialised (trnsci/trnsci#185).
+            psum_cr = nl.ndarray((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            psum_ci = nl.ndarray((groups_chunk, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
             # Load pre-twiddled input with transpose: (groups_chunk, K=8) → (K=8, groups_chunk)
             # nl.load_transpose2d works on external HBM function arguments.
@@ -290,11 +296,11 @@ if HAS_NKI:
             ai_t = nl.load_transpose2d(a_im[m_off : m_off + groups_chunk, :TILE_K])
 
             # C_real = A_real @ W_8_real − A_imag @ W_8_imag
-            nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=w8_r, accumulate=True)
+            nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=w8_r, accumulate=False)
             nisa.nc_matmul(dst=psum_cr, stationary=ai_t, moving=neg_w8_i, accumulate=True)
 
             # C_imag = A_real @ W_8_imag + A_imag @ W_8_real
-            nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=w8_i, accumulate=True)
+            nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=w8_i, accumulate=False)
             nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=w8_r, accumulate=True)
 
             # PSUM (FP32) -> SBUF in the output dtype: tensor_copy converts on the

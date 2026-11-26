@@ -657,8 +657,11 @@ if HAS_NKI:
                 )
 
         def _tile(m_off, tm, n_off, tn):
-            psum_cr = nl.zeros((tm, tn), dtype=nl.float32, buffer=nl.psum)
-            psum_ci = nl.zeros((tm, tn), dtype=nl.float32, buffer=nl.psum)
+            # The first K tile's matmuls open the accumulation groups
+            # (accumulate=False): on NeuronCore-v3 a matmul must not accumulate
+            # onto PSUM that nl.zeros / memset initialised (trnsci/trnsci#185).
+            psum_cr = nl.ndarray((tm, tn), dtype=nl.float32, buffer=nl.psum)
+            psum_ci = nl.ndarray((tm, tn), dtype=nl.float32, buffer=nl.psum)
 
             def _acc(k_off, tk, kt):
                 ar_t = _load_t(a_real, m_off, tm, k_off, tk)
@@ -675,13 +678,13 @@ if HAS_NKI:
                     # negate B_imag on the Vector engine, then accumulate with +=.
                     neg_bi = nl.negative(bi)
                 # C_real += A_real @ B_real  +  A_imag @ (-B_imag)
-                nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=br, accumulate=True)
+                nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=br, accumulate=kt > 0)
                 nisa.nc_matmul(dst=psum_cr, stationary=ai_t, moving=neg_bi, accumulate=True)
                 # C_imag += A_real @ B_imag  +  A_imag @ B_real
-                nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=bi, accumulate=True)
+                nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=bi, accumulate=kt > 0)
                 nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=br, accumulate=True)
 
-            for k in nl.affine_range(k_full):
+            for k in range(k_full):
                 _acc(k * TILE_K, TILE_K, k)
             if k_tail:
                 _acc(k_full * TILE_K, k_tail, k_full)
@@ -788,10 +791,11 @@ if HAS_NKI:
                     n_off = n * TILE_N
                     c_off = g * M + m_off
 
-                    psum_cr = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-                    psum_ci = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                    # k = 0 opens the accumulation groups (trnsci/trnsci#185).
+                    psum_cr = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                    psum_ci = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
-                    for k in nl.affine_range(K // TILE_K):
+                    for k in range(K // TILE_K):
                         r_off = g * K + k * TILE_K
                         k_off = k * TILE_K
                         # (TILE_K, TILE_M), partition dim = K: no transpose.
@@ -800,9 +804,9 @@ if HAS_NKI:
                         br = nl.load(b_real[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
                         bi = nl.load(b_imag[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
                         neg_bi = nl.negative(bi)
-                        nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=br, accumulate=True)
+                        nisa.nc_matmul(dst=psum_cr, stationary=ar_t, moving=br, accumulate=k > 0)
                         nisa.nc_matmul(dst=psum_cr, stationary=ai_t, moving=neg_bi, accumulate=True)
-                        nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=bi, accumulate=True)
+                        nisa.nc_matmul(dst=psum_ci, stationary=ar_t, moving=bi, accumulate=k > 0)
                         nisa.nc_matmul(dst=psum_ci, stationary=ai_t, moving=br, accumulate=True)
 
                     # PSUM (FP32) -> SBUF in the output dtype: tensor_copy converts on the
