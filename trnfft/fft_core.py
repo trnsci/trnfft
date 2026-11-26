@@ -47,6 +47,15 @@ def fft_core(
         # any kernel: NKI lowering rejects zero-size shapes (#130).
         return x.clone()
 
+    if prec == "dw":
+        # Double-word FFT (trnfft#172): power-of-two N <= 4096, kernel or CPU
+        # reference (same bits); other sizes take the host FP64 "double" route.
+        from .dw import supported
+
+        if supported(n):
+            return _fft_dw(x, inverse)
+        prec = "double"
+
     if x.real.dtype == torch.float64 and prec != "double" and _use_nki():
         # float64 policy (trnfft#136): backend "auto" computes the whole
         # transform as the pytorch backend does, at float64 accuracy, with no
@@ -79,6 +88,21 @@ _HALF_DTYPES = (torch.float16, torch.bfloat16)
 # result is rounded to the input dtype there (trnfft#137 item 2); they are not
 # upcast at the top.
 _LOWP_MODES = ("bf16", "bf16_refined", "ozaki", "ozaki_hq")
+
+
+def _fft_dw(x: ComplexTensor, inverse: bool) -> ComplexTensor:
+    """``precision="dw"``: the double-word FFT (``trnfft.dw.fft_dw``), result
+    in ``x``'s dtype on ``x``'s device. float64 parts are split exactly on the
+    host; float32 parts enter as (x, 0) without a host round trip."""
+    from . import dw
+
+    if x.real.requires_grad or x.imag.requires_grad:
+        raise NotImplementedError("trnfft: precision='dw' is forward-only (no autograd)")
+    dev, dt = x.real.device, x.real.dtype
+    if not dt.is_floating_point:
+        raise TypeError(f"trnfft: precision='dw' takes floating-point parts, got {dt}")
+    z = dw.fft_dw(x, inverse)
+    return ComplexTensor(z.real.to(dtype=dt, device=dev), z.imag.to(dtype=dt, device=dev))
 
 
 def _half_via_fp32(x: ComplexTensor, fn) -> ComplexTensor:

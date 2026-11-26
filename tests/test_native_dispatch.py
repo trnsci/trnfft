@@ -48,10 +48,16 @@ EXPECTED_NKI_OPS = {
     "four_step_fft",
     "sht_legendre_forward",
     "sht_legendre_inverse",
+    "dw_fft_accurate",
+    "dw_fft_sloppy",
+    "dw_fft_accurate_split",
 }
 # SHT latitude kernels (#148): two tensors and the static plan string in, one
 # tensor out.
 SHT_OPS = {"trnfft::sht_legendre_forward", "trnfft::sht_legendre_inverse"}
+# Double-word FFT kernels (trnfft#172): four planes and the twiddle table in,
+# four planes out.
+DW_OPS = {"trnfft::dw_fft_accurate", "trnfft::dw_fft_sloppy", "trnfft::dw_fft_accurate_split"}
 # Plus the composite FFT op (torch.library.custom_op) that carries the adjoint.
 EXPECTED_OPS = EXPECTED_NKI_OPS | {"fft"}
 
@@ -626,6 +632,10 @@ class TestLazyRegistration:
                 assert schema.endswith("-> Tensor"), (name, schema)
                 assert schema.split("->")[0].count("Tensor") == 2, (name, schema)
                 assert "str plan" in schema, (name, schema)
+                continue
+            if name in DW_OPS:
+                assert schema.endswith("-> (Tensor, Tensor, Tensor, Tensor)"), (name, schema)
+                assert schema.split("->")[0].count("Tensor") == 5, (name, schema)
                 continue
             assert schema.endswith("-> (Tensor, Tensor)"), (name, schema)
             n_in = 7 if name == "trnfft::four_step_fft" else 4

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`precision="dw"`: an fp64-class FFT from fp32 arithmetic, on the device
+  (#172, first arm).** Power-of-two N from 2 to 4096 run a double-word
+  (float-float) Stockham FFT, radix 4 with one leading radix-2 stage: every
+  value is hi + lo in fp32, and every butterfly is built from error-free fp32
+  transformations (TwoSum, FMA-free Dekker TwoProd, double-word addition and
+  multiplication of Joldes, Muller and Popescu 2017; complex double-word
+  products after Stloukal and Jézéquel, arXiv:2611.08371). Twiddles are
+  computed in fp64 on the host (octant reduction, exact symmetries) and
+  split exactly into hi + lo. One NKI launch per call runs every stage in
+  SBUF on the Vector engine (`trnfft/nki/dw_fft.py`; `engines="split"` puts
+  the imaginary-part chains on GpSimd); elsewhere the CPU reference issues
+  the same fp32 operations in the same order and gives the same bits. On
+  CPU, against an mpmath reference, it gives 48.9 correct bits at N = 4 to
+  47.5 at N = 4096 (host fp64: 53.0 to 51.9; fp32: 24.0 to 22.8). Other N
+  take the `"double"` route; there is no autograd. `trnfft.dw` also exposes
+  `fft_dw` (complex128 out) and `fft_dw_raw` (double-word in and out, so
+  transforms can chain on the device), with `add="accurate"` (default) or
+  `"sloppy"`. The device accuracy and timing against host fp64 come from the
+  hardware window (`tests/test_dw_neuron.py`, `scripts/bench_dw_fft.py`).
+  The error-free primitives are vendored (about 60 lines) rather than taken
+  from `trnblas.fp64`: trnfft does not depend on trnblas, and the kernel
+  issues them on its own tile layout; a test pins them bit for bit to
+  `trnblas.fp64` when it is installed.
+
 ### Testing
 
 - **Device conformance runs are signal-only (trnsci/trnsci#35).** Under
