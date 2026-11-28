@@ -42,6 +42,7 @@ from torch_neuronx import nki_op
 from . import autograd as _ag
 from . import butterfly as _bfly
 from . import dispatch as _d
+from . import dw_fft as _dwk
 from . import four_step as _fs
 from . import sht as _sht
 from . import stockham as _st
@@ -322,6 +323,51 @@ def sht_legendre_inverse(table: torch.Tensor, alm: torch.Tensor, plan: str) -> t
     return _sht.sht_legendre_inverse_kernel(table, alm, plan)
 
 
+# ── Double-word FFT (trnfft#172): four fp32 planes in, four out ─────────────
+
+Quad = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+def _fake_quad(x: torch.Tensor) -> Quad:
+    return tuple(torch.empty_like(x) for _ in range(4))
+
+
+@nki_op(
+    "trnfft::dw_fft_accurate",
+    mutates_args={},
+    fake_fn=lambda xrh, xrl, xih, xil, tw: _fake_quad(xrh),
+)
+def dw_fft_accurate(
+    xrh: torch.Tensor, xrl: torch.Tensor, xih: torch.Tensor, xil: torch.Tensor, tw: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("dw_fft_accurate", (xrh, xrl, xih, xil, tw))
+    return _dwk.dw_fft_accurate_kernel(xrh, xrl, xih, xil, tw)
+
+
+@nki_op(
+    "trnfft::dw_fft_sloppy",
+    mutates_args={},
+    fake_fn=lambda xrh, xrl, xih, xil, tw: _fake_quad(xrh),
+)
+def dw_fft_sloppy(
+    xrh: torch.Tensor, xrl: torch.Tensor, xih: torch.Tensor, xil: torch.Tensor, tw: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("dw_fft_sloppy", (xrh, xrl, xih, xil, tw))
+    return _dwk.dw_fft_sloppy_kernel(xrh, xrl, xih, xil, tw)
+
+
+@nki_op(
+    "trnfft::dw_fft_accurate_split",
+    mutates_args={},
+    fake_fn=lambda xrh, xrl, xih, xil, tw: _fake_quad(xrh),
+)
+def dw_fft_accurate_split(
+    xrh: torch.Tensor, xrl: torch.Tensor, xih: torch.Tensor, xil: torch.Tensor, tw: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _d._check_kernel_dtypes("dw_fft_accurate_split", (xrh, xrl, xih, xil, tw))
+    return _dwk.dw_fft_accurate_split_kernel(xrh, xrl, xih, xil, tw)
+
+
 # ── Composite FFT (carries the FFT-level adjoint) ────────────────────────────
 
 
@@ -390,6 +436,9 @@ KERNELS = {
     "stockham_radix8_w8": (_st, "stockham_radix8_w8_kernel"),
     "stockham_radix8_w8_t2d": (_st, "stockham_radix8_w8_t2d_kernel"),
     "four_step_fft": (_fs, "four_step_fft_kernel"),
+    "dw_fft_accurate": (_dwk, "dw_fft_accurate_kernel"),
+    "dw_fft_sloppy": (_dwk, "dw_fft_sloppy_kernel"),
+    "dw_fft_accurate_split": (_dwk, "dw_fft_accurate_split_kernel"),
 }
 
 # Keyed by the short op name used in `dispatch._launch`.
@@ -408,6 +457,9 @@ OPS = {
     "stockham_radix8_w8": stockham_radix8_w8,
     "stockham_radix8_w8_t2d": stockham_radix8_w8_t2d,
     "four_step_fft": four_step_fft,
+    "dw_fft_accurate": dw_fft_accurate,
+    "dw_fft_sloppy": dw_fft_sloppy,
+    "dw_fft_accurate_split": dw_fft_accurate_split,
     "fft": fft,
     "sht_legendre_forward": sht_legendre_forward,
     "sht_legendre_inverse": sht_legendre_inverse,

@@ -38,6 +38,20 @@ Three modes trade off speed vs numerical accuracy:
      the "fast" NKI path, but "double" is explicitly the accuracy-first mode.
      For N > 1024, falls through to NKI Stockham (~1e-4 FP32 rel error).
 
+* ``"dw"`` — double-word (float-float) FFT for power-of-two N in [2, 4096]
+  (trnfft#172, ``trnfft/dw.py``): every value is hi + lo in fp32 and every
+  butterfly is built from error-free fp32 transformations (TwoSum, Dekker
+  TwoProd, double-word add and multiply), so it reaches fp64-class accuracy
+  on fp32 engines. On the NKI path it is one kernel launch on the Vector
+  engine (``trnfft/nki/dw_fft.py``); elsewhere the CPU reference, which
+  issues the same fp32 operations and gives the same bits. CPU, against an
+  mpmath reference on double-word-exact inputs (normwise, worst of 8 rows):
+  48.9 correct bits at N=4 falling to 47.5 at N=4096, against 53.0-51.9 for
+  host FP64 and 24.0-22.8 for FP32 (``scripts/dw_accuracy.py``). The
+  result is returned in the input dtype (float64 input: complex128-class).
+  Other sizes take the ``"double"`` route.
+  Forward-only (no autograd). Device accuracy and timing: trnfft#172.
+
 * ``"bf16"`` — BF16 DFT-GEMM for N ≤ 256 on NKI hardware. W and x computed
   in BF16 on the Tensor Engine; the FP32 PSUM accumulator is preserved as
   output rather than rounded back to BF16 ("PSUM is a free FP32 accumulator").
@@ -99,7 +113,7 @@ residual reconstruction.
 
 from __future__ import annotations
 
-_VALID = ("fast", "kahan", "double", "bf16", "bf16_refined", "ozaki", "ozaki_hq")
+_VALID = ("fast", "kahan", "double", "dw", "bf16", "bf16_refined", "ozaki", "ozaki_hq")
 
 _precision: str = "fast"
 

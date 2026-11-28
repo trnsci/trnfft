@@ -71,6 +71,9 @@ ALLOWED = {
     "four_step_fft": _FP32,
     "sht_legendre_forward": _FP32,
     "sht_legendre_inverse": _FP32,
+    "dw_fft_accurate": _FP32,
+    "dw_fft_sloppy": _FP32,
+    "dw_fft_accurate_split": _FP32,
 }
 
 # Where each kernel object lives (the drivers import them by name).
@@ -91,6 +94,9 @@ KERNEL_ATTRS = {
     "four_step_fft": ("four_step", "four_step_fft_kernel"),
     "sht_legendre_forward": ("sht", "sht_legendre_forward_kernel"),
     "sht_legendre_inverse": ("sht", "sht_legendre_inverse_kernel"),
+    "dw_fft_accurate": ("dw_fft", "dw_fft_accurate_kernel"),
+    "dw_fft_sloppy": ("dw_fft", "dw_fft_sloppy_kernel"),
+    "dw_fft_accurate_split": ("dw_fft", "dw_fft_accurate_split_kernel"),
 }
 
 DTYPES = [
@@ -217,11 +223,12 @@ def native(monkeypatch):
     monkeypatch.delenv("TRNFFT_REQUIRE_NKI", raising=False)
     monkeypatch.delenv("TRNFFT_PE_TRANSPOSE", raising=False)
     # Off-NKI the kernel objects are undefined; the drivers import them.
-    from trnfft.nki import butterfly, four_step, sht, stockham
+    from trnfft.nki import butterfly, dw_fft, four_step, sht, stockham
 
     mods = {"dispatch": dispatch, "butterfly": butterfly, "stockham": stockham}
     mods["four_step"] = four_step
     mods["sht"] = sht
+    mods["dw_fft"] = dw_fft
     for mod_name, attr in KERNEL_ATTRS.values():
         if getattr(mods[mod_name], attr, None) is None:
             # One distinct object per kernel (_simulate_kernel looks them up).
@@ -304,6 +311,9 @@ def test_op_bodies_refuse_float64(native, op):
     """A direct `torch.ops.trnfft.<op>` call checks dtypes before the kernel."""
     stub = native.OPS[op]
     n_tensors = {"four_step_fft": 7, "sht_legendre_forward": 2, "sht_legendre_inverse": 2}
+    n_tensors.update(
+        dict.fromkeys(("dw_fft_accurate", "dw_fft_sloppy", "dw_fft_accurate_split"), 5)
+    )
     args = [torch.ones(4, 4, dtype=torch.float64) for _ in range(n_tensors.get(op, 4))]
     if op.startswith("butterfly"):
         args += [4, 0]
@@ -320,6 +330,25 @@ def test_launch_refuses(native, dtype):
         dispatch._launch(_raw_kernel, "complex_gemm", t, t, t, t)
     with pytest.raises(TypeError, match="no KERNEL_DTYPES entry"):
         dispatch._launch(_raw_kernel, "not_a_kernel", t)
+
+
+@pytest.mark.parametrize("dtype", FLOAT_DTYPES)
+def test_dw_fft_ops_take_fp32_planes(native, dtype):
+    """precision="dw" (trnfft#172) reaches its kernels with float32 planes and
+    a float32 twiddle table only, whatever the input dtype; the result has
+    the input dtype, as on the pytorch backend."""
+    from trnfft import dw
+    from trnfft.nki import dw_fft
+
+    x = torch.randn(3, 64, dtype=torch.float64).to(dtype)
+    ct = ComplexTensor(x, torch.zeros_like(x))
+    y = _same_outcome(lambda c: fc.fft_core(c, precision="dw").real, ct)
+    assert y is not None and y.dtype == dtype
+    d = dw.to_dw(torch.randn(2, 16, dtype=torch.complex128))
+    dw.fft_dw_raw(d, add="sloppy")
+    dw_fft.run(d, engines="split")
+    assert {op for op, _ in CALLS} == {"dw_fft_accurate", "dw_fft_sloppy", "dw_fft_accurate_split"}
+    assert all(dts == {torch.float32} for _, dts in CALLS)
 
 
 def test_xla_launch_refuses(native, monkeypatch):
