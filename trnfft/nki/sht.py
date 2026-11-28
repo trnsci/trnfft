@@ -165,10 +165,11 @@ if HAS_NKI:
                         hv = [h for h in range(ht_n) if live[kt][h]]
                         sb = nl.ndarray((ks, ns), dtype=nl.float32, buffer=nl.sbuf)
                         if hv:
-                            ps = nl.zeros((ks, ns), dtype=nl.float32, buffer=nl.psum)
-                            for h in hv:
+                            # the first matmul opens the group (trnsci/trnsci#185)
+                            ps = nl.ndarray((ks, ns), dtype=nl.float32, buffer=nl.psum)
+                            for i, h in enumerate(hv):
                                 nisa.nc_matmul(
-                                    dst=ps, stationary=tt[(kt, h)], moving=xs[h], accumulate=True
+                                    dst=ps, stationary=tt[(kt, h)], moving=xs[h], accumulate=i > 0
                                 )
                             nisa.tensor_copy(dst=sb, src=ps)
                         else:
@@ -238,13 +239,14 @@ if HAS_NKI:
                         kv = [kt for kt in used_k if live[kt][h]]
                         sb = nl.ndarray((hs, ns), dtype=nl.float32, buffer=nl.sbuf)
                         if kv:
-                            ps = nl.zeros((hs, ns), dtype=nl.float32, buffer=nl.psum)
-                            for kt in kv:
+                            # the first matmul opens the group (trnsci/trnsci#185)
+                            ps = nl.ndarray((hs, ns), dtype=nl.float32, buffer=nl.psum)
+                            for i, kt in enumerate(kv):
                                 nisa.nc_matmul(
                                     dst=ps,
                                     stationary=tiles[(kt, h)],
                                     moving=a_t[kt],
-                                    accumulate=True,
+                                    accumulate=i > 0,
                                 )
                             nisa.tensor_copy(dst=sb, src=ps)
                         else:
