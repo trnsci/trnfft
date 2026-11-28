@@ -133,16 +133,21 @@ if HAS_NKI:
                 dst=xs[n1 : 2 * n1], src=x_im_v[pack0 : pack0 + packs].permute((2, 0, 1, 3))
             )
 
-            # PSUM tiles are zeroed and every matmul accumulates, the pattern of
-            # _complex_gemm_kernel. Starting groups with accumulate=False on
-            # column slices of one PSUM tile lost accumulated terms on Trn2
-            # (only the last row of each group was right).
-            y = nl.zeros((PN2, packs, 2, n1), dtype=nl.float32, buffer=nl.psum)
+            # The first matmul into a PSUM location writes it (accumulate=False)
+            # and later ones accumulate: on NeuronCore-v3 a matmul must not
+            # accumulate onto PSUM that nl.zeros / memset initialised
+            # (trnsci/trnsci#185). Each slice yq of y takes exactly one matmul
+            # (K = 2*N1 in one pass), so it only overwrites; o_r and o_i take
+            # two each. The tiles used to be zeroed because, during development
+            # of this kernel, starting groups with accumulate=False on column
+            # slices of one PSUM tile lost accumulated terms on Trn2 (only the
+            # last row of each group was right); recheck on the device.
+            y = nl.ndarray((PN2, packs, 2, n1), dtype=nl.float32, buffer=nl.psum)
             for q in nl.affine_range(packs):
                 st = xs[:, q, :, :].reshape((2 * n1, PN2))  # (2*N1, P*N2) stationary
                 yq = y[:, q, :, :].reshape((PN2, 2 * n1))
                 # Step 1: [Y_re | Y_im] = X^T W1 for P rows, K = 2*N1.
-                nisa.nc_matmul(dst=yq, stationary=st, moving=w1b, accumulate=True)
+                nisa.nc_matmul(dst=yq, stationary=st, moving=w1b, accumulate=False)
             y_r = y[:, :, 0, :]
             y_i = y[:, :, 1, :]
 
@@ -155,11 +160,11 @@ if HAS_NKI:
             ai = ai3.reshape((PN2, width))
 
             # Step 2: O = blockdiag(W2)^T A (contraction over the P*N2 partitions).
-            o_r = nl.zeros((PN2, width), dtype=nl.float32, buffer=nl.psum)
-            o_i = nl.zeros((PN2, width), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=o_r, stationary=w2r, moving=ar, accumulate=True)
+            o_r = nl.ndarray((PN2, width), dtype=nl.float32, buffer=nl.psum)
+            o_i = nl.ndarray((PN2, width), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=o_r, stationary=w2r, moving=ar, accumulate=False)
             nisa.nc_matmul(dst=o_r, stationary=w2n, moving=ai, accumulate=True)
-            nisa.nc_matmul(dst=o_i, stationary=w2r, moving=ai, accumulate=True)
+            nisa.nc_matmul(dst=o_i, stationary=w2r, moving=ai, accumulate=False)
             nisa.nc_matmul(dst=o_i, stationary=w2i, moving=ar, accumulate=True)
 
             or_sb = nl.ndarray((PN2, packs, n1), dtype=nl.float32, buffer=nl.sbuf)

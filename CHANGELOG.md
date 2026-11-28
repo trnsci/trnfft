@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **PSUM accumulation groups now open with a matmul write
+  (trnsci/trnsci#185).** The complex GEMM tiles (`_complex_gemm_tiles`:
+  the FP32 and BF16 GEMM kernels, their load-transpose variants and the
+  complex linear kernels; and `_complex_gemm_tn_kernel`),
+  the Stockham radix-8 W_8 kernels, the batch-fused four-step kernel and the
+  SHT Legendre stages zeroed their fp32 PSUM tiles with
+  `nl.zeros(..., buffer=nl.psum)` and then accumulated with
+  `nc_matmul(..., accumulate=True)`. The `nc_matmul` documentation calls a
+  matmul accumulating onto PSUM that a non-matmul instruction initialised
+  undefined behaviour on NeuronCore-v3 (Trn2): the first matmul into a PSUM
+  location must use `accumulate=False`. Device results have matched
+  references so far, but the pattern could break with a compiler or runtime
+  change. Now the first matmul of each group overwrites (`accumulate=False`,
+  or `accumulate=k > 0` over a Python `range`). In the four-step kernel each
+  column slice of the step-1 PSUM tile takes exactly one matmul, which now
+  overwrites. Simulator outputs are bitwise equal to the previous ones at
+  every simulator test shape. `tests/test_psum_accumulate_lint.py` fails on
+  the pattern.
+
 ### Testing
 
 - **Device conformance runs are signal-only (trnsci/trnsci#35).** Under

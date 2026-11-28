@@ -66,12 +66,12 @@ def kernel_with_local_scratch(x_in, w_mat):
     # This is the line that fails NEFF compilation.
     for m in nl.affine_range(n_tiles):
         m_off = m * PMAX
-        psum = nl.zeros((PMAX, N), dtype=nl.float32, buffer=nl.psum)
+        psum = nl.ndarray((PMAX, N), dtype=nl.float32, buffer=nl.psum)
 
         # FAILS HERE on hardware: scratch is kernel-local, not a function arg.
         x_t = nl.load_transpose2d(scratch[m_off : m_off + PMAX, :K])
 
-        nisa.nc_matmul(dst=psum, stationary=x_t, moving=w, accumulate=True)
+        nisa.nc_matmul(dst=psum, stationary=x_t, moving=w, accumulate=False)
 
         result = nl.ndarray((PMAX, N), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=result, src=psum)
@@ -102,12 +102,12 @@ def kernel_with_external_arg(x_in, w_mat):
 
     for m in nl.affine_range(n_tiles):
         m_off = m * PMAX
-        psum = nl.zeros((PMAX, N), dtype=nl.float32, buffer=nl.psum)
+        psum = nl.ndarray((PMAX, N), dtype=nl.float32, buffer=nl.psum)
 
         # Works: x_in is a function argument, not a kernel-local allocation.
         x_t = nl.load_transpose2d(x_in[m_off : m_off + PMAX, :K])
 
-        nisa.nc_matmul(dst=psum, stationary=x_t, moving=w, accumulate=True)
+        nisa.nc_matmul(dst=psum, stationary=x_t, moving=w, accumulate=False)
 
         result = nl.ndarray((PMAX, N), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=result, src=psum)

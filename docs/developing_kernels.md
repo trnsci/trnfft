@@ -65,8 +65,12 @@ attached to the registered ops with `torch.library.register_autograd`
 
 ## NKI 0.3.0 calling convention (since this is the floor)
 
-- `nisa.nc_matmul(dst=, stationary=, moving=, accumulate=True)` — all kwargs,
-  in-place accumulation into the PSUM tile.
+- `nisa.nc_matmul(dst=, stationary=, moving=, accumulate=...)` — all kwargs.
+  The first matmul into a PSUM location opens its accumulation group with
+  `accumulate=False` and later ones accumulate (`accumulate=k > 0` over a
+  Python `range`). Do not zero a PSUM accumulator with `nl.zeros` or `memset`
+  and then accumulate onto it: on NeuronCore-v3 (Trn2) that is undefined
+  behaviour (trnsci/trnsci#185). `tests/test_psum_accumulate_lint.py` checks.
 - `nisa.tensor_copy` to materialize PSUM→SBUF. `nl.copy` now returns a view.
 - Tensor-tensor `nl.divide` is gone; use `nl.multiply(x, nl.reciprocal(y))`.
 - Partition-dim broadcasting is stricter on tensor-tensor arith — matching
