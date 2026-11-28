@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-11-28
+
 ### Added
 
 - **`precision="dw"`: an fp64-class FFT from fp32 arithmetic, on the device
@@ -32,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from `trnblas.fp64`: trnfft does not depend on trnblas, and the kernel
   issues them on its own tile layout; a test pins them bit for bit to
   `trnblas.fp64` when it is installed.
+
 ### Fixed
 
 - **PSUM accumulation groups now open with a matmul write
